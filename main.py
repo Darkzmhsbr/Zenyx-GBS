@@ -368,6 +368,25 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
     except Exception as e:
         logger.error(f"Erro webhook: {e}")
         return {"status": "error"}
+# =========================================================
+# 👥 ROTAS DE CRM (BASE DE CONTATOS)
+# =========================================================
+@app.get("/api/admin/contacts")
+def listar_contatos(status: str = "todos", db: Session = Depends(get_db)):
+    """
+    Lista usuários com base nos pedidos gerados.
+    Filtros: 'todos', 'pagantes' (paid), 'pendentes' (pending)
+    """
+    query = db.query(Pedido)
+    
+    if status == "pagantes":
+        query = query.filter(Pedido.status == "paid")
+    elif status == "pendentes":
+        query = query.filter(Pedido.status == "pending")
+    
+    # Ordena pelos mais recentes
+    contatos = query.order_by(Pedido.created_at.desc()).all()
+    return contatos
 
 @app.get("/")
 def home():
