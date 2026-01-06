@@ -143,3 +143,38 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
 @app.get("/")
 def home():
     return {"status": "Zenyx SaaS Online", "mode": "Webhook Optimized"}
+
+# =========================================================
+# 💎 ROTAS DE PLANOS (Fase #02)
+# Conforme PDF: Planos de pagamento [cite: 32, 33]
+# =========================================================
+
+class PlanoCreate(BaseModel):
+    bot_id: int
+    nome_exibicao: str  # Ex: "Acesso Semanal"
+    preco: float        # Ex: 9.90
+    dias_duracao: int   # Ex: 7
+
+@app.post("/api/admin/plans")
+def criar_plano(plano: PlanoCreate, db: Session = Depends(get_db)):
+    # Verifica se o bot existe
+    bot = db.query(Bot).filter(Bot.id == plano.bot_id).first()
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot não encontrado")
+
+    novo_plano = PlanoConfig(
+        bot_id=plano.bot_id,
+        key_id=f"plan_{plano.bot_id}_{plano.dias_duracao}d", # ID interno automático
+        nome_exibicao=plano.nome_exibicao,
+        descricao=f"Acesso de {plano.dias_duracao} dias",
+        preco_cheio=plano.preco * 2, # Simulando um dobro para mostrar desconto
+        preco_atual=plano.preco,
+        dias_duracao=plano.dias_duracao
+    )
+    db.add(novo_plano)
+    db.commit()
+    return {"status": "ok", "msg": "Plano criado com sucesso"}
+
+@app.get("/api/admin/plans/{bot_id}")
+def listar_planos(bot_id: int, db: Session = Depends(get_db)):
+    return db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
