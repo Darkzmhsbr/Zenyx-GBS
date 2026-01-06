@@ -3,6 +3,7 @@ import logging
 import telebot
 import requests
 import uuid
+from sqlalchemy import text  # <--- ADICIONE ESTE IMPORT NO TOPO
 from telebot import types
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -337,7 +338,28 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
     except Exception as e:
         logger.error(f"Erro webhook: {e}")
         return {"status": "error"}
-
+# =========================================================
+# 🛠️ ROTA DE EMERGÊNCIA (PARA ATUALIZAR O BANCO)
+# =========================================================
+@app.get("/api/fix-db-columns")
+def fix_db_columns(db: Session = Depends(get_db)):
+    try:
+        # Comandos SQL para adicionar as colunas que faltam na força bruta
+        sql_commands = [
+            "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
+            "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
+            "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
+            "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;"
+        ]
+        
+        for command in sql_commands:
+            db.execute(text(command))
+            
+        db.commit()
+        return {"status": "sucesso", "msg": "Colunas adicionadas com sucesso! Agora o banco está atualizado."}
+    except Exception as e:
+        return {"status": "erro", "msg": str(e)}
+        
 @app.get("/")
 def home():
     return {"status": "Zenyx SaaS Online"}
