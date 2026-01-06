@@ -1,22 +1,22 @@
 import os
 import logging
 import telebot
+from telebot import types # Importante para os botões
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from typing import List, Optional  # 👈 CORREÇÃO AQUI: Adicionado Optional
+from typing import List, Optional
 
 # Importa banco de dados
 from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow
 
-# Configuração de Log (Essencial para debugar sem gastar RAM com print)
+# Configuração de Log
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Zenyx Gbot SaaS")
 
-# CORS (Para o React conversar com a API)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,7 +24,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inicializa DB
 @app.on_event("startup")
 def on_startup():
     init_db()
@@ -36,7 +35,7 @@ def get_db():
     finally:
         db.close()
 
-# --- MODELOS Pydantic ---
+# --- MODELOS ---
 class BotCreate(BaseModel):
     nome: str
     token: str
@@ -46,38 +45,41 @@ class BotResponse(BotCreate):
     id: int
     status: str
     class Config:
-        # Atualizado para Pydantic V2 (remove o aviso do log)
-        from_attributes = True 
+        from_attributes = True
 
-# =========================================================
-# ⚙️ GESTÃO DE BOTS (CRUD)
-# =========================================================
+class PlanoCreate(BaseModel):
+    bot_id: int
+    nome_exibicao: str
+    preco: float
+    dias_duracao: int
+
+class FlowUpdate(BaseModel):
+    msg_boas_vindas: str
+    media_url: Optional[str] = None
+    btn_text_1: str
+    msg_oferta: str
+
+# ===========================
+# ⚙️ GESTÃO DE BOTS
+# ===========================
 
 @app.post("/api/admin/bots", response_model=BotResponse)
 def criar_bot(bot_data: BotCreate, db: Session = Depends(get_db)):
-    # 1. Verifica duplicidade
     if db.query(Bot).filter(Bot.token == bot_data.token).first():
         raise HTTPException(status_code=400, detail="Token já cadastrado.")
 
-    # 2. Verifica se o token é real no Telegram
     try:
         tb = telebot.TeleBot(bot_data.token)
-        me = tb.get_me()
-        status = "conectado"
-        
-        # 3. AUTOMAGIA: Define o Webhook automaticamente
-        # Pega a URL pública do Railway
+        # Define Webhook
         public_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
         if public_url:
             webhook_url = f"https://{public_url}/webhook/{bot_data.token}"
             tb.set_webhook(url=webhook_url)
-            logger.info(f"Webhook definido para: {webhook_url}")
-            
+        status = "conectado"
     except Exception as e:
-        logger.error(f"Erro ao validar token: {e}")
-        raise HTTPException(status_code=400, detail="Token inválido no Telegram.")
+        logger.error(f"Erro: {e}")
+        raise HTTPException(status_code=400, detail="Token inválido.")
 
-    # 4. Salva no Banco
     novo_bot = Bot(
         nome=bot_data.nome,
         token=bot_data.token,
@@ -93,70 +95,12 @@ def criar_bot(bot_data: BotCreate, db: Session = Depends(get_db)):
 def listar_bots(db: Session = Depends(get_db)):
     return db.query(Bot).all()
 
-# =========================================================
-# 🚀 O SEGREDO DA ECONOMIA: ROTA WEBHOOK UNIVERSAL
-# Esta única rota processa mensagens de 10, 100 ou 1000 bots
-# =========================================================
-@app.post("/webhook/{bot_token}")
-async def receber_update_telegram(bot_token: str, request: Request, db: Session = Depends(get_db)):
-    """
-    Recebe updates do Telegram.
-    Não carrega nada na memória se não tiver mensagem.
-    """
-    # 1. Valida se o bot existe no nosso banco (Segurança)
-    bot_db = db.query(Bot).filter(Bot.token == bot_token).first()
-    
-    if not bot_db:
-        return {"status": "ignored", "reason": "unknown_bot"}
-
-    # 2. Processa a mensagem
-    try:
-        json_str = await request.json()
-        update = telebot.types.Update.de_json(json_str)
-        
-        # Instancia o bot TEMPORARIAMENTE apenas para responder
-        bot_temp = telebot.TeleBot(bot_token)
-        
-        if update.message:
-            chat_id = update.message.chat.id
-            
-            # --- LÓGICA DE RESPOSTA SIMPLES ---
-            if update.message.text == "/start":
-                # Busca se tem fluxo personalizado
-                fluxo = bot_db.fluxo
-                msg = fluxo.msg_boas_vindas if (fluxo and fluxo.msg_boas_vindas) else f"Olá! Eu sou o {bot_db.nome}."
-                
-                bot_temp.send_message(chat_id, msg)
-            
-            elif update.message.text == "/id":
-                bot_temp.send_message(chat_id, f"Seu ID: {chat_id}")
-
-        return {"status": "processed"}
-        
-    except Exception as e:
-        logger.error(f"Erro no webhook: {e}")
-        return {"status": "error"}
-
-@app.get("/")
-def home():
-    return {"status": "Zenyx SaaS Online", "mode": "Webhook Optimized"}
-
-# =========================================================
-# 💎 ROTAS DE PLANOS (Fase #02)
-# =========================================================
-
-class PlanoCreate(BaseModel):
-    bot_id: int
-    nome_exibicao: str
-    preco: float
-    dias_duracao: int
+# ===========================
+# 💎 PLANOS & FLUXO
+# ===========================
 
 @app.post("/api/admin/plans")
 def criar_plano(plano: PlanoCreate, db: Session = Depends(get_db)):
-    bot = db.query(Bot).filter(Bot.id == plano.bot_id).first()
-    if not bot:
-        raise HTTPException(status_code=404, detail="Bot não encontrado")
-
     novo_plano = PlanoConfig(
         bot_id=plano.bot_id,
         key_id=f"plan_{plano.bot_id}_{plano.dias_duracao}d",
@@ -168,21 +112,11 @@ def criar_plano(plano: PlanoCreate, db: Session = Depends(get_db)):
     )
     db.add(novo_plano)
     db.commit()
-    return {"status": "ok", "msg": "Plano criado com sucesso"}
+    return {"status": "ok"}
 
 @app.get("/api/admin/plans/{bot_id}")
 def listar_planos(bot_id: int, db: Session = Depends(get_db)):
     return db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
-
-# =========================================================
-# 💬 ROTAS DE FLUXO (CHAT FLOW)
-# =========================================================
-
-class FlowUpdate(BaseModel):
-    msg_boas_vindas: str
-    media_url: Optional[str] = None # Agora o Optional vai funcionar!
-    btn_text_1: str
-    msg_oferta: str
 
 @app.get("/api/admin/bots/{bot_id}/flow")
 def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
@@ -191,18 +125,14 @@ def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
         return {
             "msg_boas_vindas": "Olá! Seja bem-vindo(a). Clique abaixo para entrar.",
             "media_url": "",
-            "btn_text_1": "🔥 Ver Conteúdo",
-            "msg_oferta": "Escolha um dos planos abaixo para liberar seu acesso imediato:"
+            "btn_text_1": "🔥 Liberar Acesso",
+            "msg_oferta": "Escolha um dos planos abaixo:"
         }
     return fluxo
 
 @app.post("/api/admin/bots/{bot_id}/flow")
 def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
-    if not db.query(Bot).filter(Bot.id == bot_id).first():
-        raise HTTPException(404, "Bot não encontrado")
-
     fluxo_db = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
-    
     if not fluxo_db:
         fluxo_db = BotFlow(bot_id=bot_id)
         db.add(fluxo_db)
@@ -214,3 +144,84 @@ def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
     
     db.commit()
     return {"status": "saved"}
+
+# =========================================================
+# 🚀 WEBHOOK INTELIGENTE (AGORA COM FOTO E BOTÕES)
+# =========================================================
+@app.post("/webhook/{bot_token}")
+async def receber_update_telegram(bot_token: str, request: Request, db: Session = Depends(get_db)):
+    
+    bot_db = db.query(Bot).filter(Bot.token == bot_token).first()
+    if not bot_db: return {"status": "ignored"}
+
+    try:
+        json_str = await request.json()
+        update = telebot.types.Update.de_json(json_str)
+        bot_temp = telebot.TeleBot(bot_token)
+        
+        # --- 1. COMANDO /START (BOAS VINDAS) ---
+        if update.message and update.message.text == "/start":
+            chat_id = update.message.chat.id
+            fluxo = bot_db.fluxo
+            
+            # Texto
+            texto = fluxo.msg_boas_vindas if (fluxo and fluxo.msg_boas_vindas) else f"Olá! Eu sou o {bot_db.nome}."
+            
+            # Botão (Se configurado)
+            markup = None
+            if fluxo and fluxo.btn_text_1:
+                markup = types.InlineKeyboardMarkup()
+                # O callback_data="oferta" vai acionar o passo 2
+                btn = types.InlineKeyboardButton(text=fluxo.btn_text_1, callback_data="ver_oferta")
+                markup.add(btn)
+
+            # Envia Foto ou Texto
+            if fluxo and fluxo.media_url:
+                try:
+                    bot_temp.send_photo(chat_id, fluxo.media_url, caption=texto, reply_markup=markup)
+                except Exception as e:
+                    # Fallback se a foto falhar (link quebrado)
+                    logger.error(f"Erro ao enviar foto: {e}")
+                    bot_temp.send_message(chat_id, texto, reply_markup=markup)
+            else:
+                bot_temp.send_message(chat_id, texto, reply_markup=markup)
+
+        # --- 2. CLIQUE NO BOTÃO (OFERTA + PLANOS) ---
+        elif update.callback_query and update.callback_query.data == "ver_oferta":
+            chat_id = update.callback_query.message.chat.id
+            fluxo = bot_db.fluxo
+            
+            # Texto da Oferta
+            texto_oferta = fluxo.msg_oferta if (fluxo and fluxo.msg_oferta) else "Escolha seu plano:"
+            
+            # Busca os Planos do Bot
+            planos = bot_db.planos
+            markup = types.InlineKeyboardMarkup()
+            
+            for p in planos:
+                # Botão do Plano (Ex: "Semanal - R$ 9.90")
+                label = f"{p.nome_exibicao} - R$ {p.preco_atual:.2f}"
+                # Callback ex: "checkout_12" (onde 12 é o ID do plano)
+                btn = types.InlineKeyboardButton(text=label, callback_data=f"checkout_{p.id}")
+                markup.add(btn)
+            
+            bot_temp.send_message(chat_id, texto_oferta, reply_markup=markup)
+            
+            # Confirma o clique para parar o "reloginho" do botão
+            bot_temp.answer_callback_query(update.callback_query.id)
+
+        # --- 3. CLIQUE NO PLANO (CHECKOUT) ---
+        elif update.callback_query and update.callback_query.data.startswith("checkout_"):
+            # AQUI VAI ENTRAR A FASE #04 (Integração Pushin Pay)
+            bot_temp.send_message(update.callback_query.message.chat.id, "🚧 Gerando Pix... (Em breve na Fase #04)")
+            bot_temp.answer_callback_query(update.callback_query.id)
+
+        return {"status": "processed"}
+        
+    except Exception as e:
+        logger.error(f"Erro webhook: {e}")
+        return {"status": "error"}
+
+@app.get("/")
+def home():
+    return {"status": "Zenyx SaaS Online"}
