@@ -15,7 +15,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta
 
 # Importa banco de dados
-from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, Pedido, engine
+from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, Pedido, SystemConfig, RemarketingCampaign, engine
 
 # Configuração de Log
 logging.basicConfig(level=logging.INFO)
@@ -72,15 +72,17 @@ def get_db():
         db.close()
 
 # =========================================================
-# 🔌 INTEGRAÇÃO PUSHIN PAY (DINÂMICA E SEGURA)
+# 🔌 INTEGRAÇÃO PUSHIN PAY (DINÂMICA)
 # =========================================================
 def get_pushin_token():
     """Busca o token no banco, se não achar, tenta variável de ambiente"""
     db = SessionLocal()
     try:
+        # Tenta pegar do banco de dados (Painel de Integrações)
         config = db.query(SystemConfig).filter(SystemConfig.key == "pushin_pay_token").first()
         if config and config.value:
             return config.value
+        # Se não tiver no banco, pega do Railway Variables
         return os.getenv("PUSHIN_PAY_TOKEN")
     finally:
         db.close()
@@ -92,7 +94,7 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         logger.error("❌ Token Pushin Pay não configurado!")
         return None
     
-    # Endpoint oficial de produção (Baseado na documentação PDF)
+    # [cite_start]Endpoint correto conforme Documentação Oficial (Pág 1) [cite: 13]
     url = "https://api.pushinpay.com.br/api/pix/cashIn"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -100,9 +102,9 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         "Accept": "application/json"
     }
     
-    # Valor deve ser em centavos (Inteiro)
+    # [cite_start]Valor em centavos conforme Documentação Oficial (Pág 1) [cite: 24]
     payload = {
-        "value": int(valor_float * 100),
+        "value": int(valor_float * 100), 
         "webhook_url": f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}/webhook/pix",
         "external_reference": transaction_id
     }
@@ -118,7 +120,7 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         logger.error(f"Exceção PushinPay: {e}")
         return None
 
-# --- ROTAS DE API PARA O PAINEL (INTEGRAÇÕES) ---
+# --- ROTAS DE INTEGRAÇÃO (SALVAR TOKEN) ---
 class IntegrationUpdate(BaseModel):
     token: str
 
@@ -130,7 +132,6 @@ def get_pushin_status(db: Session = Depends(get_db)):
     if not token:
         return {"status": "desconectado", "token_mask": ""}
     
-    # Mascara o token para segurança (ex: 1234...ABCD)
     mask = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "****"
     return {"status": "conectado", "token_mask": mask}
 
