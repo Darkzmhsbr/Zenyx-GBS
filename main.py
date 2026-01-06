@@ -178,3 +178,47 @@ def criar_plano(plano: PlanoCreate, db: Session = Depends(get_db)):
 @app.get("/api/admin/plans/{bot_id}")
 def listar_planos(bot_id: int, db: Session = Depends(get_db)):
     return db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
+
+# =========================================================
+# 💬 ROTAS DE FLUXO (CHAT FLOW)
+# =========================================================
+from database import BotFlow
+
+class FlowUpdate(BaseModel):
+    msg_boas_vindas: str
+    media_url: Optional[str] = None
+    btn_text_1: str
+    msg_oferta: str
+
+@app.get("/api/admin/bots/{bot_id}/flow")
+def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
+    fluxo = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
+    if not fluxo:
+        # Se não existir, retorna padrão
+        return {
+            "msg_boas_vindas": "Olá! Seja bem-vindo(a). Clique abaixo para entrar.",
+            "media_url": "",
+            "btn_text_1": "🔥 Ver Conteúdo",
+            "msg_oferta": "Escolha um dos planos abaixo para liberar seu acesso imediato:"
+        }
+    return fluxo
+
+@app.post("/api/admin/bots/{bot_id}/flow")
+def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
+    # Verifica se bot existe
+    if not db.query(Bot).filter(Bot.id == bot_id).first():
+        raise HTTPException(404, "Bot não encontrado")
+
+    fluxo_db = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
+    
+    if not fluxo_db:
+        fluxo_db = BotFlow(bot_id=bot_id)
+        db.add(fluxo_db)
+    
+    fluxo_db.msg_boas_vindas = flow.msg_boas_vindas
+    fluxo_db.media_url = flow.media_url
+    fluxo_db.btn_text_1 = flow.btn_text_1
+    fluxo_db.msg_oferta = flow.msg_oferta
+    
+    db.commit()
+    return {"status": "saved"}
