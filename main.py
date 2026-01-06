@@ -391,106 +391,166 @@ def listar_contatos(status: str = "todos", db: Session = Depends(get_db)):
     return contatos
 
 # =========================================================
-# 📢 ROTAS DE REMARKETING (DISPARADOR)
+# 📢 ROTAS DE REMARKETING (DISPARADOR AVANÇADO)
 # =========================================================
+
+# Memória Global para Status de Envio (Para a barra de progresso)
+# Formato: { "running": bool, "sent": int, "total": int, "blocked": int }
+CAMPAIGN_STATUS = {
+    "running": False,
+    "sent": 0,
+    "total": 0,
+    "blocked": 0
+}
 
 class RemarketingRequest(BaseModel):
     bot_id: int
-    tipo_envio: str # 'todos', 'pendentes', 'pagantes'
+    tipo_envio: str # 'todos', 'leads' (pendentes), 'ex_assinantes' (expirados), 'individual'
     mensagem: str
     media_url: Optional[str] = None
     incluir_oferta: bool = False
+    
+    # Campos Extras do Wizard
+    plano_oferta_id: Optional[str] = None
+    valor_oferta: Optional[float] = 0.0
+    expire_timestamp: Optional[int] = 0
+    is_periodic: bool = False
+    
+    # Controle de Teste
+    is_test: bool = False
+    specific_user_id: Optional[str] = None # Telegram ID para teste
 
 def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Session):
-    """Função que roda em background para não travar o painel"""
+    """Processa o envio e atualiza o status global"""
+    global CAMPAIGN_STATUS
+    
+    # Reseta status
+    CAMPAIGN_STATUS = {"running": True, "sent": 0, "total": 0, "blocked": 0}
+    
     bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
-    if not bot_db: return
+    if not bot_db: 
+        CAMPAIGN_STATUS["running"] = False
+        return
 
-    # 1. Filtra os usuários
-    query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
-    
-    # Remove duplicados (manda apenas 1 vez por telegram_id)
-    # No SQLalchemy simples, pegamos todos e filtramos no python para garantir
-    todos_pedidos = query.all()
-    usuarios_unicos = {} # Dict para remover duplicatas: {telegram_id: dados}
-    
-    for p in todos_pedidos:
-        if payload.tipo_envio == 'pendentes' and p.status != 'pending': continue
-        if payload.tipo_envio == 'pagantes' and p.status != 'paid': continue
+    # 1. Seleciona o Público
+    usuarios_alvo = {} # {telegram_id: dados}
+
+    if payload.is_test and payload.specific_user_id:
+        # Se for teste, pega só o ID específico (ou o admin)
+        usuarios_alvo[payload.specific_user_id] = {"first_name": "Admin Teste"}
+        logger.info(f"🧪 Teste de Remarketing para: {payload.specific_user_id}")
+    else:
+        # Busca usuários reais
+        query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
+        todos_pedidos = query.all()
         
-        # Guarda o usuário (se tiver mais de um pedido, pega o último)
-        usuarios_unicos[p.telegram_id] = p
+        for p in todos_pedidos:
+            # Lógica de Filtros Avançados
+            if payload.tipo_envio == 'leads' and p.status != 'pending': continue
+            if payload.tipo_envio == 'ex_assinantes' and p.status != 'expired': continue
+            # 'todos' pega tudo
+            
+            usuarios_alvo[p.telegram_id] = p
 
-    logger.info(f"📢 Iniciando Remarketing para {len(usuarios_unicos)} usuários do bot {bot_db.nome}")
+    total_users = len(usuarios_alvo)
+    CAMPAIGN_STATUS["total"] = total_users
+    logger.info(f"📢 Iniciando Remarketing para {total_users} usuários (Filtro: {payload.tipo_envio})")
 
-    # 2. Configura o Bot
+    # 2. Configura Bot e Teclado
     bot_sender = telebot.TeleBot(bot_db.token)
-    sucesso = 0
-    bloqueados = 0
+    
+    markup = None
+    if payload.incluir_oferta and payload.plano_oferta_id:
+        markup = types.InlineKeyboardMarkup()
+        # Busca infos do plano para o botão
+        # Obs: Estamos usando o ID do plano padrão para garantir que o checkout funcione
+        # Se quiser preço customizado, precisaria de uma lógica de checkout dinâmica.
+        # Por enquanto, usaremos o ID do plano selecionado.
+        
+        # Tenta achar o plano pelo Key ID (string) ou ID numérico
+        plano = db.query(PlanoConfig).filter(
+            (PlanoConfig.key_id == payload.plano_oferta_id) | 
+            (PlanoConfig.id == int(payload.plano_oferta_id) if payload.plano_oferta_id.isdigit() else False)
+        ).first()
+        
+        if plano:
+            # Texto do botão
+            label_botao = f"🔥 {plano.nome_exibicao} - R$ {payload.valor_oferta if payload.valor_oferta > 0 else plano.preco_atual:.2f}"
+            btn = types.InlineKeyboardButton(label_botao, callback_data=f"checkout_{plano.id}")
+            markup.add(btn)
 
-    # 3. Dispara
-    for chat_id, dados_user in usuarios_unicos.items():
+    # 3. Loop de Envio
+    for chat_id in usuarios_alvo.keys():
         try:
-            markup = None
-            # Se tiver oferta, adiciona botões dos planos
-            if payload.incluir_oferta:
-                markup = types.InlineKeyboardMarkup()
-                for plano in bot_db.planos:
-                    btn = types.InlineKeyboardButton(
-                        f"{plano.nome_exibicao} - R$ {plano.preco_atual:.2f}", 
-                        callback_data=f"checkout_{plano.id}"
-                    )
-                    markup.add(btn)
-
             # Envia Mídia ou Texto
-            if payload.media_url:
+            if payload.media_url and len(payload.media_url) > 5:
                 try:
                     if payload.media_url.lower().endswith(('.mp4', '.mov', '.avi')):
                         bot_sender.send_video(chat_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
                     else:
                         bot_sender.send_photo(chat_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
-                except:
+                except Exception as e:
+                    logger.warning(f"Erro mídia, enviando texto: {e}")
                     bot_sender.send_message(chat_id, payload.mensagem, reply_markup=markup)
             else:
                 bot_sender.send_message(chat_id, payload.mensagem, reply_markup=markup)
             
-            sucesso += 1
-            time.sleep(0.05) # Pequeno delay para evitar flood limits do Telegram
+            CAMPAIGN_STATUS["sent"] += 1
+            time.sleep(0.05) # Delay anti-flood
             
         except Exception as e:
             if "blocked" in str(e) or "kicked" in str(e):
-                bloqueados += 1
-            logger.error(f"Falha ao enviar para {chat_id}: {e}")
+                CAMPAIGN_STATUS["blocked"] += 1
+            logger.error(f"Falha envio {chat_id}: {e}")
 
-    # 4. Salva no Histórico
-    campanha = RemarketingCampaign(
-        bot_id=bot_id,
-        campaign_id=str(uuid.uuid4()),
-        config=payload.mensagem,
-        status="concluido",
-        total_leads=len(usuarios_unicos),
-        sent_success=sucesso,
-        blocked_count=bloqueados
-    )
-    db.add(campanha)
-    db.commit()
-    logger.info(f"📢 Fim do Remarketing. Sucesso: {sucesso}, Bloqueados: {bloqueados}")
+    # 4. Finaliza e Salva Histórico (Só salva se não for teste)
+    CAMPAIGN_STATUS["running"] = False
+    
+    if not payload.is_test:
+        campanha = RemarketingCampaign(
+            bot_id=bot_id,
+            campaign_id=str(uuid.uuid4()),
+            config=payload.mensagem, # Salva a msg como config simples por enquanto
+            status="concluido",
+            total_leads=total_users,
+            sent_success=CAMPAIGN_STATUS["sent"],
+            blocked_count=CAMPAIGN_STATUS["blocked"]
+        )
+        db.add(campanha)
+        db.commit()
 
 @app.post("/api/admin/remarketing/send")
 def enviar_remarketing(payload: RemarketingRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    # Valida bot
-    bot = db.query(Bot).filter(Bot.id == payload.bot_id).first()
-    if not bot: raise HTTPException(404, "Bot não encontrado")
-    
-    # Adiciona na fila de processamento (roda depois de responder 'ok' pro painel)
+    # Se for teste, precisamos de um ID alvo. Vamos pegar o último pedido como cobaia se não vier específico
+    if payload.is_test and not payload.specific_user_id:
+        ultimo = db.query(Pedido).filter(Pedido.bot_id == payload.bot_id).order_by(Pedido.id.desc()).first()
+        if ultimo:
+            payload.specific_user_id = ultimo.telegram_id
+        else:
+            raise HTTPException(400, "Nenhum usuário encontrado para teste. Interaja com o bot primeiro.")
+
     background_tasks.add_task(processar_envio_remarketing, payload.bot_id, payload, db)
-    
-    return {"status": "enviando", "msg": "A campanha começou a ser enviada em segundo plano!"}
+    return {"status": "enviando", "msg": "Campanha iniciada."}
+
+@app.get("/api/admin/remarketing/status")
+def status_remarketing():
+    """Rota para o Frontend atualizar a barra de progresso"""
+    return CAMPAIGN_STATUS
 
 @app.get("/api/admin/remarketing/history/{bot_id}")
 def historico_remarketing(bot_id: int, db: Session = Depends(get_db)):
-    return db.query(RemarketingCampaign).filter(RemarketingCampaign.bot_id == bot_id).order_by(RemarketingCampaign.data_envio.desc()).all()
-
+    history = db.query(RemarketingCampaign).filter(RemarketingCampaign.bot_id == bot_id).order_by(RemarketingCampaign.data_envio.desc()).all()
+    
+    # Formata para o frontend
+    return [{
+        "id": h.id,
+        "data": h.data_envio.strftime("%d/%m/%Y %H:%M"),
+        "total": h.total_leads,
+        "sent": h.sent_success,
+        "blocked": h.blocked_count,
+        "config": { "content_data": h.config } # Adaptação simples para reuso
+    } for h in history]
+    
 @app.get("/")
 def home():
     return {"status": "Zenyx SaaS Online - Banco Atualizado"}
