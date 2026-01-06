@@ -5,10 +5,10 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional  # 👈 CORREÇÃO AQUI: Adicionado Optional
 
 # Importa banco de dados
-from database import SessionLocal, init_db, Bot, PlanoConfig
+from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow
 
 # Configuração de Log (Essencial para debugar sem gastar RAM com print)
 logging.basicConfig(level=logging.INFO)
@@ -46,7 +46,8 @@ class BotResponse(BotCreate):
     id: int
     status: str
     class Config:
-        orm_mode = True
+        # Atualizado para Pydantic V2 (remove o aviso do log)
+        from_attributes = True 
 
 # =========================================================
 # ⚙️ GESTÃO DE BOTS (CRUD)
@@ -65,7 +66,7 @@ def criar_bot(bot_data: BotCreate, db: Session = Depends(get_db)):
         status = "conectado"
         
         # 3. AUTOMAGIA: Define o Webhook automaticamente
-        # Pega a URL pública do Railway (Você vai configurar isso nas variáveis depois)
+        # Pega a URL pública do Railway
         public_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
         if public_url:
             webhook_url = f"https://{public_url}/webhook/{bot_data.token}"
@@ -103,11 +104,9 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
     Não carrega nada na memória se não tiver mensagem.
     """
     # 1. Valida se o bot existe no nosso banco (Segurança)
-    # Usamos o DB para garantir que não estamos processando lixo
     bot_db = db.query(Bot).filter(Bot.token == bot_token).first()
     
     if not bot_db:
-        # Se o bot não existe no nosso banco, ignoramos para economizar processamento
         return {"status": "ignored", "reason": "unknown_bot"}
 
     # 2. Processa a mensagem
@@ -116,28 +115,26 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
         update = telebot.types.Update.de_json(json_str)
         
         # Instancia o bot TEMPORARIAMENTE apenas para responder
-        # Isso libera a memória assim que a função termina
         bot_temp = telebot.TeleBot(bot_token)
-        
-        # --- AQUI ENTRA A LÓGICA DO SEU BOT ---
-        # Por enquanto, vamos colocar apenas um "Eco" para testar
-        # Futuramente, conectaremos com a lógica de Pagamento/Venda
         
         if update.message:
             chat_id = update.message.chat.id
             
+            # --- LÓGICA DE RESPOSTA SIMPLES ---
             if update.message.text == "/start":
-                # Lógica de Boas Vindas
-                bot_temp.send_message(chat_id, f"Olá! Eu sou o {bot_db.nome}. Sistema SaaS Ativo 🚀")
+                # Busca se tem fluxo personalizado
+                fluxo = bot_db.fluxo
+                msg = fluxo.msg_boas_vindas if (fluxo and fluxo.msg_boas_vindas) else f"Olá! Eu sou o {bot_db.nome}."
+                
+                bot_temp.send_message(chat_id, msg)
             
             elif update.message.text == "/id":
-                bot_temp.send_message(chat_id, f"Seu ID é: {chat_id}\nID do Canal VIP Configurado: {bot_db.id_canal_vip}")
+                bot_temp.send_message(chat_id, f"Seu ID: {chat_id}")
 
         return {"status": "processed"}
         
     except Exception as e:
         logger.error(f"Erro no webhook: {e}")
-        # Retorna 200 para o Telegram parar de tentar reenviar a mensagem errada
         return {"status": "error"}
 
 @app.get("/")
@@ -146,28 +143,26 @@ def home():
 
 # =========================================================
 # 💎 ROTAS DE PLANOS (Fase #02)
-# Conforme PDF: Planos de pagamento [cite: 32, 33]
 # =========================================================
 
 class PlanoCreate(BaseModel):
     bot_id: int
-    nome_exibicao: str  # Ex: "Acesso Semanal"
-    preco: float        # Ex: 9.90
-    dias_duracao: int   # Ex: 7
+    nome_exibicao: str
+    preco: float
+    dias_duracao: int
 
 @app.post("/api/admin/plans")
 def criar_plano(plano: PlanoCreate, db: Session = Depends(get_db)):
-    # Verifica se o bot existe
     bot = db.query(Bot).filter(Bot.id == plano.bot_id).first()
     if not bot:
         raise HTTPException(status_code=404, detail="Bot não encontrado")
 
     novo_plano = PlanoConfig(
         bot_id=plano.bot_id,
-        key_id=f"plan_{plano.bot_id}_{plano.dias_duracao}d", # ID interno automático
+        key_id=f"plan_{plano.bot_id}_{plano.dias_duracao}d",
         nome_exibicao=plano.nome_exibicao,
         descricao=f"Acesso de {plano.dias_duracao} dias",
-        preco_cheio=plano.preco * 2, # Simulando um dobro para mostrar desconto
+        preco_cheio=plano.preco * 2,
         preco_atual=plano.preco,
         dias_duracao=plano.dias_duracao
     )
@@ -182,11 +177,10 @@ def listar_planos(bot_id: int, db: Session = Depends(get_db)):
 # =========================================================
 # 💬 ROTAS DE FLUXO (CHAT FLOW)
 # =========================================================
-from database import BotFlow
 
 class FlowUpdate(BaseModel):
     msg_boas_vindas: str
-    media_url: Optional[str] = None
+    media_url: Optional[str] = None # Agora o Optional vai funcionar!
     btn_text_1: str
     msg_oferta: str
 
@@ -194,7 +188,6 @@ class FlowUpdate(BaseModel):
 def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
     fluxo = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
     if not fluxo:
-        # Se não existir, retorna padrão
         return {
             "msg_boas_vindas": "Olá! Seja bem-vindo(a). Clique abaixo para entrar.",
             "media_url": "",
@@ -205,7 +198,6 @@ def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/admin/bots/{bot_id}/flow")
 def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
-    # Verifica se bot existe
     if not db.query(Bot).filter(Bot.id == bot_id).first():
         raise HTTPException(404, "Bot não encontrado")
 
