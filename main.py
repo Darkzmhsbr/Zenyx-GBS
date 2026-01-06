@@ -3,6 +3,8 @@ import logging
 import telebot
 import requests
 import uuid
+from fastapi import BackgroundTasks # <--- IMPORTANTE
+import time
 from sqlalchemy import text  # Importante para o SQL
 from telebot import types
 from fastapi import FastAPI, HTTPException, Depends, Request
@@ -387,6 +389,107 @@ def listar_contatos(status: str = "todos", db: Session = Depends(get_db)):
     # Ordena pelos mais recentes
     contatos = query.order_by(Pedido.created_at.desc()).all()
     return contatos
+
+# =========================================================
+# 📢 ROTAS DE REMARKETING (DISPARADOR)
+# =========================================================
+
+class RemarketingRequest(BaseModel):
+    bot_id: int
+    tipo_envio: str # 'todos', 'pendentes', 'pagantes'
+    mensagem: str
+    media_url: Optional[str] = None
+    incluir_oferta: bool = False
+
+def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Session):
+    """Função que roda em background para não travar o painel"""
+    bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
+    if not bot_db: return
+
+    # 1. Filtra os usuários
+    query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
+    
+    # Remove duplicados (manda apenas 1 vez por telegram_id)
+    # No SQLalchemy simples, pegamos todos e filtramos no python para garantir
+    todos_pedidos = query.all()
+    usuarios_unicos = {} # Dict para remover duplicatas: {telegram_id: dados}
+    
+    for p in todos_pedidos:
+        if payload.tipo_envio == 'pendentes' and p.status != 'pending': continue
+        if payload.tipo_envio == 'pagantes' and p.status != 'paid': continue
+        
+        # Guarda o usuário (se tiver mais de um pedido, pega o último)
+        usuarios_unicos[p.telegram_id] = p
+
+    logger.info(f"📢 Iniciando Remarketing para {len(usuarios_unicos)} usuários do bot {bot_db.nome}")
+
+    # 2. Configura o Bot
+    bot_sender = telebot.TeleBot(bot_db.token)
+    sucesso = 0
+    bloqueados = 0
+
+    # 3. Dispara
+    for chat_id, dados_user in usuarios_unicos.items():
+        try:
+            markup = None
+            # Se tiver oferta, adiciona botões dos planos
+            if payload.incluir_oferta:
+                markup = types.InlineKeyboardMarkup()
+                for plano in bot_db.planos:
+                    btn = types.InlineKeyboardButton(
+                        f"{plano.nome_exibicao} - R$ {plano.preco_atual:.2f}", 
+                        callback_data=f"checkout_{plano.id}"
+                    )
+                    markup.add(btn)
+
+            # Envia Mídia ou Texto
+            if payload.media_url:
+                try:
+                    if payload.media_url.lower().endswith(('.mp4', '.mov', '.avi')):
+                        bot_sender.send_video(chat_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
+                    else:
+                        bot_sender.send_photo(chat_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
+                except:
+                    bot_sender.send_message(chat_id, payload.mensagem, reply_markup=markup)
+            else:
+                bot_sender.send_message(chat_id, payload.mensagem, reply_markup=markup)
+            
+            sucesso += 1
+            time.sleep(0.05) # Pequeno delay para evitar flood limits do Telegram
+            
+        except Exception as e:
+            if "blocked" in str(e) or "kicked" in str(e):
+                bloqueados += 1
+            logger.error(f"Falha ao enviar para {chat_id}: {e}")
+
+    # 4. Salva no Histórico
+    campanha = RemarketingCampaign(
+        bot_id=bot_id,
+        campaign_id=str(uuid.uuid4()),
+        config=payload.mensagem,
+        status="concluido",
+        total_leads=len(usuarios_unicos),
+        sent_success=sucesso,
+        blocked_count=bloqueados
+    )
+    db.add(campanha)
+    db.commit()
+    logger.info(f"📢 Fim do Remarketing. Sucesso: {sucesso}, Bloqueados: {bloqueados}")
+
+@app.post("/api/admin/remarketing/send")
+def enviar_remarketing(payload: RemarketingRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    # Valida bot
+    bot = db.query(Bot).filter(Bot.id == payload.bot_id).first()
+    if not bot: raise HTTPException(404, "Bot não encontrado")
+    
+    # Adiciona na fila de processamento (roda depois de responder 'ok' pro painel)
+    background_tasks.add_task(processar_envio_remarketing, payload.bot_id, payload, db)
+    
+    return {"status": "enviando", "msg": "A campanha começou a ser enviada em segundo plano!"}
+
+@app.get("/api/admin/remarketing/history/{bot_id}")
+def historico_remarketing(bot_id: int, db: Session = Depends(get_db)):
+    return db.query(RemarketingCampaign).filter(RemarketingCampaign.bot_id == bot_id).order_by(RemarketingCampaign.data_envio.desc()).all()
 
 @app.get("/")
 def home():
