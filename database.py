@@ -51,7 +51,7 @@ class Bot(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # =========================================================
-# 🛒 TABELA DE PEDIDOS
+# 🛒 TABELA DE PEDIDOS (CRM)
 # =========================================================
 class Pedido(Base):
     __tablename__ = "pedidos"
@@ -104,24 +104,24 @@ class RemarketingCampaign(Base):
     __tablename__ = "remarketing_campaigns"
 
     id = Column(Integer, primary_key=True, index=True)
+    
+    # Vinculo com o Bot (Importante para saber quem dispara)
     bot_id = Column(Integer, ForeignKey("bots.id"))
     bot = relationship("Bot", back_populates="campanhas")
 
     campaign_id = Column(String, unique=True, index=True)
-    config = Column(Text) 
-    status = Column(String, default="ativo")
+    config = Column(Text) # JSON com a mensagem
+    status = Column(String, default="enviado") # enviado, agendado
     
-    type = Column(String, default="periodico") 
+    type = Column(String, default="imediato") 
     total_leads = Column(Integer, default=0)
     sent_success = Column(Integer, default=0)
     blocked_count = Column(Integer, default=0)
     
-    dia_atual = Column(Integer, default=0)
-    data_inicio = Column(DateTime, default=datetime.utcnow)
-    proxima_execucao = Column(DateTime)
+    data_envio = Column(DateTime, default=datetime.utcnow)
 
 # =========================================================
-# 💬 TABELA DE FLUXO DE CHAT (ATUALIZADA FASE #03.5)
+# 💬 TABELA DE FLUXO DE CHAT
 # =========================================================
 class BotFlow(Base):
     __tablename__ = "bot_flows"
@@ -136,14 +136,14 @@ class BotFlow(Base):
     btn_text_1 = Column(String, default="🔓 DESBLOQUEAR ACESSO")
     
     # Configuração Avançada 1
-    autodestruir_1 = Column(Boolean, default=False) # Deleta a msg 1 ao clicar?
+    autodestruir_1 = Column(Boolean, default=False)
     
     # --- PASSO 2: OFERTA ---
-    msg_2_texto = Column(Text, nullable=True)       # Texto da segunda tela
-    msg_2_media = Column(String, nullable=True)     # Mídia da segunda tela
+    msg_2_texto = Column(Text, nullable=True)
+    msg_2_media = Column(String, nullable=True)
     
     # Configuração Avançada 2
-    mostrar_planos_2 = Column(Boolean, default=True) # Mostrar botões de compra na msg 2?
+    mostrar_planos_2 = Column(Boolean, default=True)
     
-    # Legado (Mantido para evitar erros se houver dados antigos, mas usaremos msg_2_texto)
+    # Legado
     msg_oferta = Column(Text, nullable=True)
