@@ -131,6 +131,24 @@ class FlowUpdate(BaseModel):
     msg_2_media: Optional[str] = None
     mostrar_planos_2: bool
 
+# ✅ MODELO COMPLETO PARA O WIZARD DE REMARKETING
+class RemarketingRequest(BaseModel):
+    bot_id: int
+    tipo_envio: str # 'todos', 'leads', 'ex_assinantes', 'individual'
+    mensagem: str
+    media_url: Optional[str] = None
+    incluir_oferta: bool = False
+    
+    # Campos Extras do Wizard
+    plano_oferta_id: Optional[str] = None
+    valor_oferta: Optional[float] = 0.0
+    expire_timestamp: Optional[int] = 0
+    is_periodic: bool = False
+    
+    # Controle de Teste
+    is_test: bool = False
+    specific_user_id: Optional[str] = None # Telegram ID para teste
+
 # ===========================
 # ⚙️ GESTÃO DE BOTS
 # ===========================
@@ -223,7 +241,7 @@ def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
     return {"status": "saved"}
 
 # =========================================================
-# 🚀 WEBHOOK INTELIGENTE (FLUXO AVANÇADO)
+# 🚀 WEBHOOK PRINCIPAL (HOT FLOW)
 # =========================================================
 @app.post("/webhook/{bot_token}")
 async def receber_update_telegram(bot_token: str, request: Request, db: Session = Depends(get_db)):
@@ -236,20 +254,17 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
         update = telebot.types.Update.de_json(json_str)
         bot_temp = telebot.TeleBot(bot_token)
         
-        # --- 1. COMANDO /START (MENSAGEM 1) ---
+        # --- 1. COMANDO /START ---
         if update.message and update.message.text == "/start":
             chat_id = update.message.chat.id
             fluxo = bot_db.fluxo
             
-            # Dados da Msg 1
             texto = fluxo.msg_boas_vindas if fluxo else f"Olá! Eu sou o {bot_db.nome}."
             btn_txt = fluxo.btn_text_1 if (fluxo and fluxo.btn_text_1) else "🔓 DESBLOQUEAR ACESSO"
             
-            # Botão que leva para o Passo 2
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton(text=btn_txt, callback_data="passo_2"))
 
-            # Envio (Foto/Vídeo/Texto)
             media = fluxo.media_url if (fluxo and fluxo.media_url) else None
             if media:
                 try:
@@ -263,33 +278,28 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             else:
                 bot_temp.send_message(chat_id, texto, reply_markup=markup)
 
-        # --- 2. CLIQUE NO BOTÃO DA MSG 1 (IR PARA MSG 2) ---
+        # --- 2. CLIQUE NO BOTÃO (OFERTA) ---
         elif update.callback_query and update.callback_query.data == "passo_2":
             chat_id = update.callback_query.message.chat.id
             msg_id = update.callback_query.message.message_id
             fluxo = bot_db.fluxo
             
-            # A) Autodestruição (Se ativado)
+            # Autodestruição
             if fluxo and fluxo.autodestruir_1:
                 try:
                     bot_temp.delete_message(chat_id, msg_id)
                 except Exception as e:
-                    logger.warning(f"Falha na autodestruição: {e}")
+                    logger.warning(f"Falha autodestruição: {e}")
 
-            # B) Prepara a Mensagem 2
+            # Mensagem 2
             texto_2 = fluxo.msg_2_texto if (fluxo and fluxo.msg_2_texto) else "Escolha seu plano:"
             media_2 = fluxo.msg_2_media if (fluxo and fluxo.msg_2_media) else None
             
-            # C) Botões de Planos (Se ativado)
             markup = types.InlineKeyboardMarkup()
             if fluxo and fluxo.mostrar_planos_2:
-                planos = bot_db.planos
-                for p in planos:
-                    label = f"{p.nome_exibicao} - R$ {p.preco_atual:.2f}"
-                    # Usa "checkout_" para manter padrão com sua lógica de pagamento
-                    markup.add(types.InlineKeyboardButton(text=label, callback_data=f"checkout_{p.id}"))
+                for p in bot_db.planos:
+                    markup.add(types.InlineKeyboardButton(text=f"{p.nome_exibicao} - R$ {p.preco_atual:.2f}", callback_data=f"checkout_{p.id}"))
             
-            # D) Envio da Mensagem 2
             if media_2:
                 try:
                     if media_2.lower().endswith(('.mp4', '.mov', '.avi')):
@@ -395,30 +405,12 @@ def listar_contatos(status: str = "todos", db: Session = Depends(get_db)):
 # =========================================================
 
 # Memória Global para Status de Envio (Para a barra de progresso)
-# Formato: { "running": bool, "sent": int, "total": int, "blocked": int }
 CAMPAIGN_STATUS = {
     "running": False,
     "sent": 0,
     "total": 0,
     "blocked": 0
 }
-
-class RemarketingRequest(BaseModel):
-    bot_id: int
-    tipo_envio: str # 'todos', 'leads' (pendentes), 'ex_assinantes' (expirados), 'individual'
-    mensagem: str
-    media_url: Optional[str] = None
-    incluir_oferta: bool = False
-    
-    # Campos Extras do Wizard
-    plano_oferta_id: Optional[str] = None
-    valor_oferta: Optional[float] = 0.0
-    expire_timestamp: Optional[int] = 0
-    is_periodic: bool = False
-    
-    # Controle de Teste
-    is_test: bool = False
-    specific_user_id: Optional[str] = None # Telegram ID para teste
 
 def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Session):
     """Processa o envio e atualiza o status global"""
@@ -463,10 +455,6 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
     if payload.incluir_oferta and payload.plano_oferta_id:
         markup = types.InlineKeyboardMarkup()
         # Busca infos do plano para o botão
-        # Obs: Estamos usando o ID do plano padrão para garantir que o checkout funcione
-        # Se quiser preço customizado, precisaria de uma lógica de checkout dinâmica.
-        # Por enquanto, usaremos o ID do plano selecionado.
-        
         # Tenta achar o plano pelo Key ID (string) ou ID numérico
         plano = db.query(PlanoConfig).filter(
             (PlanoConfig.key_id == payload.plano_oferta_id) | 
@@ -550,7 +538,7 @@ def historico_remarketing(bot_id: int, db: Session = Depends(get_db)):
         "blocked": h.blocked_count,
         "config": { "content_data": h.config } # Adaptação simples para reuso
     } for h in history]
-    
+
 @app.get("/")
 def home():
     return {"status": "Zenyx SaaS Online - Banco Atualizado"}
