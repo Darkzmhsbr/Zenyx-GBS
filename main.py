@@ -1,8 +1,8 @@
 import os
 import logging
 import telebot
-import requests  # 👈 Necessário para chamar a Pushin Pay
-import uuid      # Para gerar IDs únicos de transação
+import requests
+import uuid
 from telebot import types
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,18 +54,16 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         "Accept": "application/json"
     }
     
-    # Pushin Pay geralmente trabalha com centavos (int), verifique sua doc. 
-    # Aqui vou mandar em Reais conforme padrão comum, mas se der erro convertemos * 100
     payload = {
-        "value": int(valor_float * 100), # Convertendo para centavos
-        "webhook_url": f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}/webhook/pix", # Webhook de retorno
+        "value": int(valor_float * 100),
+        "webhook_url": f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}/webhook/pix",
         "external_reference": transaction_id
     }
 
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=10)
         if response.status_code in [200, 201]:
-            return response.json() # Retorna o objeto com qr_code e copia_cola
+            return response.json()
         else:
             logger.error(f"Erro PushinPay: {response.text}")
             return None
@@ -95,7 +93,10 @@ class FlowUpdate(BaseModel):
     msg_boas_vindas: str
     media_url: Optional[str] = None
     btn_text_1: str
-    msg_oferta: str
+    autodestruir_1: bool
+    msg_2_texto: Optional[str] = None
+    msg_2_media: Optional[str] = None
+    mostrar_planos_2: bool
 
 # ===========================
 # ⚙️ GESTÃO DE BOTS
@@ -108,7 +109,6 @@ def criar_bot(bot_data: BotCreate, db: Session = Depends(get_db)):
 
     try:
         tb = telebot.TeleBot(bot_data.token)
-        # Define Webhook
         public_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
         if public_url:
             webhook_url = f"https://{public_url}/webhook/{bot_data.token}"
@@ -161,10 +161,13 @@ def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
     fluxo = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
     if not fluxo:
         return {
-            "msg_boas_vindas": "Olá! Seja bem-vindo(a). Clique abaixo para entrar.",
+            "msg_boas_vindas": "Olá! Seja bem-vindo(a).",
             "media_url": "",
-            "btn_text_1": "🔥 Liberar Acesso",
-            "msg_oferta": "Escolha um dos planos abaixo:"
+            "btn_text_1": "🔓 DESBLOQUEAR ACESSO",
+            "autodestruir_1": False,
+            "msg_2_texto": "Escolha seu plano abaixo:",
+            "msg_2_media": "",
+            "mostrar_planos_2": True
         }
     return fluxo
 
@@ -178,13 +181,16 @@ def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
     fluxo_db.msg_boas_vindas = flow.msg_boas_vindas
     fluxo_db.media_url = flow.media_url
     fluxo_db.btn_text_1 = flow.btn_text_1
-    fluxo_db.msg_oferta = flow.msg_oferta
+    fluxo_db.autodestruir_1 = flow.autodestruir_1
+    fluxo_db.msg_2_texto = flow.msg_2_texto
+    fluxo_db.msg_2_media = flow.msg_2_media
+    fluxo_db.mostrar_planos_2 = flow.mostrar_planos_2
     
     db.commit()
     return {"status": "saved"}
 
 # =========================================================
-# 🚀 WEBHOOK INTELIGENTE (FOTO/VÍDEO + PIX)
+# 🚀 WEBHOOK INTELIGENTE (FLUXO AVANÇADO)
 # =========================================================
 @app.post("/webhook/{bot_token}")
 async def receber_update_telegram(bot_token: str, request: Request, db: Session = Depends(get_db)):
@@ -197,56 +203,74 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
         update = telebot.types.Update.de_json(json_str)
         bot_temp = telebot.TeleBot(bot_token)
         
-        # --- 1. COMANDO /START ---
+        # --- 1. COMANDO /START (MENSAGEM 1) ---
         if update.message and update.message.text == "/start":
             chat_id = update.message.chat.id
-            username = update.message.from_user.username
-            first_name = update.message.from_user.first_name
-            
             fluxo = bot_db.fluxo
-            texto = fluxo.msg_boas_vindas if (fluxo and fluxo.msg_boas_vindas) else f"Olá! Eu sou o {bot_db.nome}."
             
-            # Botão
-            markup = None
-            if fluxo and fluxo.btn_text_1:
-                markup = types.InlineKeyboardMarkup()
-                btn = types.InlineKeyboardButton(text=fluxo.btn_text_1, callback_data="ver_oferta")
-                markup.add(btn)
+            # Dados da Msg 1
+            texto = fluxo.msg_boas_vindas if fluxo else f"Olá! Eu sou o {bot_db.nome}."
+            btn_txt = fluxo.btn_text_1 if (fluxo and fluxo.btn_text_1) else "🔓 DESBLOQUEAR ACESSO"
+            
+            # Botão que leva para o Passo 2
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton(text=btn_txt, callback_data="passo_2"))
 
-            # --- CORREÇÃO DO PROBLEMA DE MÍDIA ---
-            if fluxo and fluxo.media_url:
-                media_link = fluxo.media_url.strip()
+            # Envio (Foto/Vídeo/Texto)
+            media = fluxo.media_url if (fluxo and fluxo.media_url) else None
+            if media:
                 try:
-                    # Verifica extensão para decidir se é vídeo ou foto
-                    if media_link.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
-                        bot_temp.send_video(chat_id, media_link, caption=texto, reply_markup=markup)
+                    if media.lower().endswith(('.mp4', '.mov', '.avi')):
+                        bot_temp.send_video(chat_id, media, caption=texto, reply_markup=markup)
                     else:
-                        bot_temp.send_photo(chat_id, media_link, caption=texto, reply_markup=markup)
+                        bot_temp.send_photo(chat_id, media, caption=texto, reply_markup=markup)
                 except Exception as e:
-                    logger.error(f"Erro mídia: {e}")
+                    logger.error(f"Erro mídia 1: {e}")
                     bot_temp.send_message(chat_id, texto, reply_markup=markup)
             else:
                 bot_temp.send_message(chat_id, texto, reply_markup=markup)
 
-        # --- 2. CLIQUE NO BOTÃO "VER OFERTA" ---
-        elif update.callback_query and update.callback_query.data == "ver_oferta":
+        # --- 2. CLIQUE NO BOTÃO DA MSG 1 (IR PARA MSG 2) ---
+        elif update.callback_query and update.callback_query.data == "passo_2":
             chat_id = update.callback_query.message.chat.id
+            msg_id = update.callback_query.message.message_id
             fluxo = bot_db.fluxo
             
-            texto_oferta = fluxo.msg_oferta if (fluxo and fluxo.msg_oferta) else "Escolha seu plano:"
-            planos = bot_db.planos
+            # A) Autodestruição (Se ativado)
+            if fluxo and fluxo.autodestruir_1:
+                try:
+                    bot_temp.delete_message(chat_id, msg_id)
+                except Exception as e:
+                    logger.warning(f"Falha na autodestruição: {e}")
+
+            # B) Prepara a Mensagem 2
+            texto_2 = fluxo.msg_2_texto if (fluxo and fluxo.msg_2_texto) else "Escolha seu plano:"
+            media_2 = fluxo.msg_2_media if (fluxo and fluxo.msg_2_media) else None
             
+            # C) Botões de Planos (Se ativado)
             markup = types.InlineKeyboardMarkup()
-            for p in planos:
-                label = f"{p.nome_exibicao} - R$ {p.preco_atual:.2f}"
-                # Callback carrega o ID do plano
-                btn = types.InlineKeyboardButton(text=label, callback_data=f"checkout_{p.id}")
-                markup.add(btn)
+            if fluxo and fluxo.mostrar_planos_2:
+                planos = bot_db.planos
+                for p in planos:
+                    label = f"{p.nome_exibicao} - R$ {p.preco_atual:.2f}"
+                    # ATENÇÃO: Callback ajustado para checkout_ para bater com sua lógica
+                    markup.add(types.InlineKeyboardButton(text=label, callback_data=f"checkout_{p.id}"))
             
-            bot_temp.send_message(chat_id, texto_oferta, reply_markup=markup)
+            # D) Envio da Mensagem 2
+            if media_2:
+                try:
+                    if media_2.lower().endswith(('.mp4', '.mov', '.avi')):
+                        bot_temp.send_video(chat_id, media_2, caption=texto_2, reply_markup=markup)
+                    else:
+                        bot_temp.send_photo(chat_id, media_2, caption=texto_2, reply_markup=markup)
+                except:
+                    bot_temp.send_message(chat_id, texto_2, reply_markup=markup)
+            else:
+                bot_temp.send_message(chat_id, texto_2, reply_markup=markup)
+            
             bot_temp.answer_callback_query(update.callback_query.id)
 
-        # --- 3. CHECKOUT (GERAR PIX) ---
+        # --- 3. CHECKOUT (GERAR PIX) - LÓGICA CORRIGIDA ---
         elif update.callback_query and update.callback_query.data.startswith("checkout_"):
             chat_id = update.callback_query.message.chat.id
             plano_id = update.callback_query.data.split("_")[1]
