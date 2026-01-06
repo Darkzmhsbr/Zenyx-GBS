@@ -1,15 +1,18 @@
 import os
 import logging
 import telebot
-from telebot import types # Importante para os botões
+import requests  # 👈 Necessário para chamar a Pushin Pay
+import uuid      # Para gerar IDs únicos de transação
+from telebot import types
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import List, Optional
+from datetime import datetime, timedelta
 
 # Importa banco de dados
-from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow
+from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, Pedido
 
 # Configuração de Log
 logging.basicConfig(level=logging.INFO)
@@ -34,6 +37,41 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# --- INTEGRAÇÃO PUSHIN PAY ---
+PUSHIN_PAY_TOKEN = os.getenv("PUSHIN_PAY_TOKEN")
+
+def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
+    """Gera o PIX na API da Pushin Pay"""
+    if not PUSHIN_PAY_TOKEN:
+        logger.error("PUSHIN_PAY_TOKEN não configurado no Railway!")
+        return None
+    
+    url = "https://api.pushinpay.com.br/api/pix/cashIn"
+    headers = {
+        "Authorization": f"Bearer {PUSHIN_PAY_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    # Pushin Pay geralmente trabalha com centavos (int), verifique sua doc. 
+    # Aqui vou mandar em Reais conforme padrão comum, mas se der erro convertemos * 100
+    payload = {
+        "value": int(valor_float * 100), # Convertendo para centavos
+        "webhook_url": f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}/webhook/pix", # Webhook de retorno
+        "external_reference": transaction_id
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        if response.status_code in [200, 201]:
+            return response.json() # Retorna o objeto com qr_code e copia_cola
+        else:
+            logger.error(f"Erro PushinPay: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Exceção PushinPay: {e}")
+        return None
 
 # --- MODELOS ---
 class BotCreate(BaseModel):
@@ -146,7 +184,7 @@ def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
     return {"status": "saved"}
 
 # =========================================================
-# 🚀 WEBHOOK INTELIGENTE (AGORA COM FOTO E BOTÕES)
+# 🚀 WEBHOOK INTELIGENTE (FOTO/VÍDEO + PIX)
 # =========================================================
 @app.post("/webhook/{bot_token}")
 async def receber_update_telegram(bot_token: str, request: Request, db: Session = Depends(get_db)):
@@ -159,61 +197,115 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
         update = telebot.types.Update.de_json(json_str)
         bot_temp = telebot.TeleBot(bot_token)
         
-        # --- 1. COMANDO /START (BOAS VINDAS) ---
+        # --- 1. COMANDO /START ---
         if update.message and update.message.text == "/start":
             chat_id = update.message.chat.id
-            fluxo = bot_db.fluxo
+            username = update.message.from_user.username
+            first_name = update.message.from_user.first_name
             
-            # Texto
+            fluxo = bot_db.fluxo
             texto = fluxo.msg_boas_vindas if (fluxo and fluxo.msg_boas_vindas) else f"Olá! Eu sou o {bot_db.nome}."
             
-            # Botão (Se configurado)
+            # Botão
             markup = None
             if fluxo and fluxo.btn_text_1:
                 markup = types.InlineKeyboardMarkup()
-                # O callback_data="oferta" vai acionar o passo 2
                 btn = types.InlineKeyboardButton(text=fluxo.btn_text_1, callback_data="ver_oferta")
                 markup.add(btn)
 
-            # Envia Foto ou Texto
+            # --- CORREÇÃO DO PROBLEMA DE MÍDIA ---
             if fluxo and fluxo.media_url:
+                media_link = fluxo.media_url.strip()
                 try:
-                    bot_temp.send_photo(chat_id, fluxo.media_url, caption=texto, reply_markup=markup)
+                    # Verifica extensão para decidir se é vídeo ou foto
+                    if media_link.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+                        bot_temp.send_video(chat_id, media_link, caption=texto, reply_markup=markup)
+                    else:
+                        bot_temp.send_photo(chat_id, media_link, caption=texto, reply_markup=markup)
                 except Exception as e:
-                    # Fallback se a foto falhar (link quebrado)
-                    logger.error(f"Erro ao enviar foto: {e}")
+                    logger.error(f"Erro mídia: {e}")
                     bot_temp.send_message(chat_id, texto, reply_markup=markup)
             else:
                 bot_temp.send_message(chat_id, texto, reply_markup=markup)
 
-        # --- 2. CLIQUE NO BOTÃO (OFERTA + PLANOS) ---
+        # --- 2. CLIQUE NO BOTÃO "VER OFERTA" ---
         elif update.callback_query and update.callback_query.data == "ver_oferta":
             chat_id = update.callback_query.message.chat.id
             fluxo = bot_db.fluxo
             
-            # Texto da Oferta
             texto_oferta = fluxo.msg_oferta if (fluxo and fluxo.msg_oferta) else "Escolha seu plano:"
-            
-            # Busca os Planos do Bot
             planos = bot_db.planos
-            markup = types.InlineKeyboardMarkup()
             
+            markup = types.InlineKeyboardMarkup()
             for p in planos:
-                # Botão do Plano (Ex: "Semanal - R$ 9.90")
                 label = f"{p.nome_exibicao} - R$ {p.preco_atual:.2f}"
-                # Callback ex: "checkout_12" (onde 12 é o ID do plano)
+                # Callback carrega o ID do plano
                 btn = types.InlineKeyboardButton(text=label, callback_data=f"checkout_{p.id}")
                 markup.add(btn)
             
             bot_temp.send_message(chat_id, texto_oferta, reply_markup=markup)
-            
-            # Confirma o clique para parar o "reloginho" do botão
             bot_temp.answer_callback_query(update.callback_query.id)
 
-        # --- 3. CLIQUE NO PLANO (CHECKOUT) ---
+        # --- 3. CHECKOUT (GERAR PIX) ---
         elif update.callback_query and update.callback_query.data.startswith("checkout_"):
-            # AQUI VAI ENTRAR A FASE #04 (Integração Pushin Pay)
-            bot_temp.send_message(update.callback_query.message.chat.id, "🚧 Gerando Pix... (Em breve na Fase #04)")
+            chat_id = update.callback_query.message.chat.id
+            plano_id = update.callback_query.data.split("_")[1]
+            
+            # Busca plano no DB
+            plano = db.query(PlanoConfig).filter(PlanoConfig.id == plano_id).first()
+            if not plano:
+                bot_temp.send_message(chat_id, "Plano não encontrado.")
+                return {"status": "error"}
+
+            # Avisa que está gerando
+            msg_aguarde = bot_temp.send_message(chat_id, "⏳ Gerando seu PIX, aguarde...")
+            
+            # Gera ID único para transação
+            tx_id = str(uuid.uuid4())
+            
+            # --- CHAMA PUSHIN PAY ---
+            pix_data = gerar_pix_pushinpay(plano.preco_atual, tx_id)
+            
+            if pix_data:
+                qr_code_text = pix_data.get("qr_code_text") # Ajuste conforme retorno da API
+                if not qr_code_text: qr_code_text = pix_data.get("qr_code") # Tentativa secundária
+                
+                # Salva pedido no Banco
+                novo_pedido = Pedido(
+                    bot_id=bot_db.id,
+                    transaction_id=tx_id,
+                    telegram_id=str(chat_id),
+                    first_name=update.callback_query.from_user.first_name,
+                    username=update.callback_query.from_user.username,
+                    plano_nome=plano.nome_exibicao,
+                    valor=plano.preco_atual,
+                    status="pending",
+                    qr_code=qr_code_text
+                )
+                db.add(novo_pedido)
+                db.commit()
+
+                # Apaga mensagem de "Aguarde"
+                try: bot_temp.delete_message(chat_id, msg_aguarde.message_id)
+                except: pass
+
+                # --- MENSAGEM FINAL IGUAL DO SEU EXEMPLO ---
+                legenda_pix = f"""🌟 Seu pagamento foi gerado com sucesso:
+🎁 Plano: {plano.nome_exibicao}
+💰 Valor: R$ {plano.preco_atual:.2f}
+🔐 Pague via Pix Copia e Cola:
+
+```
+{qr_code_text}
+```
+
+👆 Toque na chave PIX acima para copiá-la
+‼️ Após o pagamento, o acesso será liberado automaticamente!"""
+
+                bot_temp.send_message(chat_id, legenda_pix, parse_mode="Markdown")
+            else:
+                bot_temp.send_message(chat_id, "❌ Erro ao gerar PIX. Tente novamente ou contate o suporte.")
+
             bot_temp.answer_callback_query(update.callback_query.id)
 
         return {"status": "processed"}
