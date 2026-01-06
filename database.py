@@ -30,6 +30,16 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 # =========================================================
+# ⚙️ TABELA DE CONFIGURAÇÕES GERAIS (INTEGRAÇÕES)
+# =========================================================
+class SystemConfig(Base):
+    __tablename__ = "system_config"
+    
+    key = Column(String, primary_key=True, index=True) # Ex: 'pushin_pay_token'
+    value = Column(String)                             # O Token em si
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+# =========================================================
 # 🤖 TABELA MESTRA: BOTS
 # =========================================================
 class Bot(Base):
@@ -51,7 +61,7 @@ class Bot(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # =========================================================
-# 🛒 TABELA DE PEDIDOS (CRM)
+# 🛒 TABELA DE PEDIDOS
 # =========================================================
 class Pedido(Base):
     __tablename__ = "pedidos"
@@ -62,17 +72,13 @@ class Pedido(Base):
 
     transaction_id = Column(String, unique=True, index=True)
     telegram_id = Column(String, index=True)
-    
     first_name = Column(String, nullable=True)
     username = Column(String, nullable=True)
-    
     role = Column(String, default="user") 
     custom_expiration = Column(DateTime, nullable=True) 
-    
     plano_nome = Column(String)
     valor = Column(Float)
     created_at = Column(DateTime, default=datetime.utcnow)
-    
     status = Column(String, default="pending") 
     qr_code = Column(String, nullable=True)
     mensagem_enviada = Column(Boolean, default=False)
@@ -93,7 +99,6 @@ class PlanoConfig(Base):
     preco_cheio = Column(Float)
     preco_atual = Column(Float)
     dias_duracao = Column(Integer)
-    
     oculto = Column(Boolean, default=False)
     tag = Column(String, nullable=True) 
 
@@ -104,20 +109,16 @@ class RemarketingCampaign(Base):
     __tablename__ = "remarketing_campaigns"
 
     id = Column(Integer, primary_key=True, index=True)
-    
-    # Vinculo com o Bot (Importante para saber quem dispara)
     bot_id = Column(Integer, ForeignKey("bots.id"))
     bot = relationship("Bot", back_populates="campanhas")
 
     campaign_id = Column(String, unique=True, index=True)
-    config = Column(Text) # JSON com a mensagem
-    status = Column(String, default="enviado") # enviado, agendado
-    
+    config = Column(Text) 
+    status = Column(String, default="enviado")
     type = Column(String, default="imediato") 
     total_leads = Column(Integer, default=0)
     sent_success = Column(Integer, default=0)
     blocked_count = Column(Integer, default=0)
-    
     data_envio = Column(DateTime, default=datetime.utcnow)
 
 # =========================================================
@@ -130,20 +131,11 @@ class BotFlow(Base):
     bot_id = Column(Integer, ForeignKey("bots.id"), unique=True)
     bot = relationship("Bot", back_populates="fluxo")
     
-    # --- PASSO 1: BOAS VINDAS ---
     msg_boas_vindas = Column(Text, default="Olá! Bem-vindo.")
     media_url = Column(String, nullable=True)
     btn_text_1 = Column(String, default="🔓 DESBLOQUEAR ACESSO")
-    
-    # Configuração Avançada 1
     autodestruir_1 = Column(Boolean, default=False)
-    
-    # --- PASSO 2: OFERTA ---
     msg_2_texto = Column(Text, nullable=True)
     msg_2_media = Column(String, nullable=True)
-    
-    # Configuração Avançada 2
     mostrar_planos_2 = Column(Boolean, default=True)
-    
-    # Legado
     msg_oferta = Column(Text, nullable=True)
