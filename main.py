@@ -638,6 +638,85 @@ def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db))
         "sales_today": sales_today
     }
 
+# =========================================================
+# 💸 WEBHOOK DE PAGAMENTO (RECEBE O PIX E LIBERA ACESSO)
+# =========================================================
+@app.post("/webhook/pix")
+async def webhook_pix(request: Request, db: Session = Depends(get_db)):
+    try:
+        data = await request.json()
+        logger.info(f"💰 Webhook PIX Recebido: {data}")
+
+        # PushinPay manda o ID da transação no 'external_reference' ou 'id'
+        # Ajuste conforme o JSON real que o PushinPay manda. 
+        # Geralmente é external_reference se você enviou na criação.
+        tx_id = data.get("external_reference") 
+        status_pix = data.get("status") # paid, approved, etc.
+
+        if not tx_id or status_pix != "paid":
+            return {"status": "ignored", "reason": "not_paid_or_no_ref"}
+
+        # 1. Busca o Pedido e JA CARREGA O BOT (Evita o erro DetachedInstanceError)
+        # O .join(Bot) garante que os dados do bot venham juntos na memória
+        pedido = db.query(Pedido).join(Bot).filter(Pedido.transaction_id == tx_id).first()
+
+        if not pedido:
+            logger.error(f"❌ Pedido não encontrado para TX: {tx_id}")
+            return {"status": "error", "msg": "Order not found"}
+
+        if pedido.status == "paid":
+            return {"status": "ok", "msg": "Already paid"}
+
+        # 2. Atualiza Status para PAGO
+        pedido.status = "paid"
+        pedido.mensagem_enviada = True # Marca que tentamos enviar
+        db.commit() # Salva no banco "Está Pago"
+        
+        # 3. Liberação do Acesso (Telegram)
+        # Como já fizemos join/refresh, podemos acessar pedido.bot com segurança
+        bot_data = pedido.bot 
+        
+        try:
+            tb = telebot.TeleBot(bot_data.token)
+            chat_id_user = int(pedido.telegram_id)
+            canal_vip = bot_data.id_canal_vip
+
+            # A) Tenta Desbanir (caso tenha sido expulso antes)
+            try:
+                tb.unban_chat_member(canal_vip, chat_id_user, only_if_banned=True)
+            except:
+                pass # Se não der, segue o jogo
+
+            # B) Gera Link Único (Para evitar compartilhamento)
+            # member_limit=1 faz o link expirar assim que 1 pessoa entra
+            convite = tb.create_chat_invite_link(canal_vip, member_limit=1, name=f"Acesso {pedido.first_name}")
+            link_acesso = convite.invite_link
+
+            # C) Envia Mensagem de Sucesso
+            msg_sucesso = f"""
+✅ **Pagamento Confirmado!**
+
+Seu acesso ao **{bot_data.nome}** foi liberado.
+Toque no link abaixo para entrar no Canal VIP:
+
+👉 {link_acesso}
+
+⚠️ *Este link é único e válido apenas para você.*
+"""
+            tb.send_message(chat_id_user, msg_sucesso, parse_mode="Markdown")
+            logger.info(f"✅ Acesso enviado para {pedido.first_name}")
+
+        except Exception as e_telegram:
+            logger.error(f"❌ Erro ao liberar Telegram: {e_telegram}")
+            # Não retornamos erro 500 para o PushinPay não ficar tentando reenviar, 
+            # pois o dinheiro já caiu. Apenas logamos o erro.
+
+        return {"status": "received"}
+
+    except Exception as e:
+        logger.error(f"❌ Erro Crítico Webhook PIX: {e}")
+        return {"status": "error"}
+
 @app.get("/")
 def home():
     return {"status": "Zenyx SaaS Online - Banco Atualizado"}
