@@ -39,25 +39,30 @@ def on_startup():
     # 1. Cria tabelas que não existem
     init_db()
     
-    # 2. FORÇA A CRIAÇÃO DAS COLUNAS NOVAS (Correção do Erro)
+    # 2. FORÇA A CRIAÇÃO DAS COLUNAS NOVAS (Correção Crítica)
     try:
         with engine.connect() as conn:
             logger.info("🔧 Verificando integridade do banco de dados...")
             
-            # Lista de comandos para garantir que as colunas existam
             comandos = [
+                # Correções de Fluxo
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
-                "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;"
+                "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;",
+                
+                # 🔴 CORREÇÃO DO ERRO DE REMARKETING (AQUI ESTÁ A MÁGICA)
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS data_envio TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS campaign_id VARCHAR;",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS config TEXT;"
             ]
             
             for cmd in comandos:
                 try:
                     conn.execute(text(cmd))
                 except Exception as e:
-                    # Ignora erros se a coluna já existir, mas loga o aviso
-                    logger.warning(f"Aviso SQL: {e}")
+                    # Ignora se já existir, mas registra
+                    logger.warning(f"Aviso SQL na migração: {e}")
             
             conn.commit()
             logger.info("✅ BANCO DE DADOS ATUALIZADO E PRONTO!")
@@ -287,6 +292,76 @@ def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
     
     db.commit()
     return {"status": "saved"}
+
+# =========================================================
+# 💰 ROTA WEBHOOK PIX (ESSENCIAL PARA LIBERAR ACESSO)
+# =========================================================
+@app.post("/webhook/pix")
+async def webhook_pix(request: Request, db: Session = Depends(get_db)):
+    try:
+        # 1. LOG DETALHADO DO QUE CHEGOU
+        data = await request.json()
+        logger.info(f"💰 JSON RECEBIDO PUSHINPAY: {data}")
+
+        tx_id = data.get("external_reference") or data.get("id")
+        status_pix = str(data.get("status", "")).lower()
+        
+        # Aceita vários status de sucesso
+        if status_pix not in ["paid", "approved", "completed", "succeeded"]:
+            return {"status": "ignored", "reason": f"status_{status_pix}"}
+
+        # 2. BUSCA PEDIDO + BOT (CARREGAMENTO FORÇADO)
+        # O .join(Bot) é crucial para evitar o erro de conexão perdida
+        pedido = db.query(Pedido).join(Bot).filter(Pedido.transaction_id == tx_id).first()
+
+        if not pedido:
+            logger.error(f"❌ Pedido não encontrado: {tx_id}")
+            return {"status": "ok", "msg": "Order not found"}
+
+        if pedido.status == "paid":
+            return {"status": "ok", "msg": "Already paid"}
+
+        # 3. ATUALIZA BANCO
+        pedido.status = "paid"
+        pedido.mensagem_enviada = True
+        db.commit()
+        
+        # 4. LIBERA ACESSO TELEGRAM
+        bot_data = pedido.bot 
+        try:
+            tb = telebot.TeleBot(bot_data.token)
+            chat_id_user = int(pedido.telegram_id)
+            
+            # Tenta limpar o ID do canal
+            try:
+                canal_id = int(str(bot_data.id_canal_vip).strip())
+            except:
+                canal_id = bot_data.id_canal_vip
+
+            # Gera Link Único
+            convite = tb.create_chat_invite_link(
+                chat_id=canal_id, 
+                member_limit=1, 
+                name=f"Venda {pedido.first_name}"
+            )
+            
+            msg_sucesso = f"✅ **Pagamento Confirmado!**\n\nToque para entrar:\n👉 {convite.invite_link}"
+            tb.send_message(chat_id_user, msg_sucesso, parse_mode="Markdown")
+            logger.info(f"🏆 Link enviado para {pedido.first_name}")
+
+        except Exception as e_tg:
+            logger.error(f"❌ Erro Telegram: {e_tg}")
+            # Tenta avisar o usuário mesmo se falhar o link
+            try:
+                tb.send_message(chat_id_user, "✅ Pagamento recebido! Houve um erro ao gerar o link. Contate o suporte.")
+            except:
+                pass
+
+        return {"status": "received"}
+
+    except Exception as e:
+        logger.error(f"❌ Erro Webhook: {e}")
+        return {"status": "error"}
 
 # =========================================================
 # 🚀 WEBHOOK PRINCIPAL (HOT FLOW & CHECKOUT)
