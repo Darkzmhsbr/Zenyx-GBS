@@ -8,7 +8,7 @@ import urllib.parse
 import time
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from telebot import types  # <--- A LINHA QUE ESTAVA FALTANDO!
+from telebot import types  # <--- CORRIGIDO: IMPORT NECESSÁRIO PRO BOT
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func
@@ -106,7 +106,7 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         logger.error(f"Exceção PushinPay: {e}")
         return None
 
-# --- MODELOS ---
+# --- MODELOS (EXPANDIDOS PARA EVITAR ERRO DE SINTAXE) ---
 class IntegrationUpdate(BaseModel):
     token: str
 
@@ -150,7 +150,7 @@ class RemarketingRequest(BaseModel):
     specific_user_id: Optional[str] = None
 
 # =========================================================
-# 💰 ROTA WEBHOOK PIX (HÍBRIDA: JSON + FORM DATA)
+# 💰 ROTA WEBHOOK PIX (CORRIGIDA: LOWERCASE + POLYGLOT)
 # =========================================================
 @app.post("/webhook/pix")
 async def webhook_pix(request: Request, db: Session = Depends(get_db)):
@@ -179,8 +179,11 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
                 print(f"❌ Falha ao ler dados: {e_parse}")
                 return {"status": "error", "reason": "invalid_format"}
 
-        # Extrai dados com flexibilidade
+        # Extrai dados e FORÇA MINÚSCULO NO ID
         tx_id = data.get("external_reference") or data.get("id") or data.get("uuid")
+        if tx_id:
+            tx_id = str(tx_id).lower() # <--- AQUI ESTAVA O ERRO (CORRIGIDO)
+            
         status_pix = str(data.get("status", "")).lower()
         
         print(f"🔎 Processando: ID={tx_id} | Status={status_pix}")
@@ -255,6 +258,7 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             fluxo = bot_db.fluxo
             texto = fluxo.msg_boas_vindas if fluxo else f"Olá! Eu sou o {bot_db.nome}."
             btn_txt = fluxo.btn_text_1 if (fluxo and fluxo.btn_text_1) else "🔓 DESBLOQUEAR ACESSO"
+            
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton(text=btn_txt, callback_data="passo_2"))
             
@@ -272,7 +276,16 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
 
         elif update.callback_query and update.callback_query.data == "passo_2":
             chat_id = update.callback_query.message.chat.id
+            msg_id = update.callback_query.message.message_id # ID para apagar
             fluxo = bot_db.fluxo
+            
+            # --- 🔥 AUTODESTRUIÇÃO DA MENSAGEM ANTERIOR (MANTIDA) ---
+            if fluxo and fluxo.autodestruir_1:
+                try:
+                    bot_temp.delete_message(chat_id, msg_id)
+                except Exception as e:
+                    logger.warning(f"Erro ao apagar msg: {e}")
+
             texto_2 = fluxo.msg_2_texto if (fluxo and fluxo.msg_2_texto) else "Escolha seu plano:"
             markup = types.InlineKeyboardMarkup()
             
@@ -280,7 +293,7 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                 for p in bot_db.planos:
                     markup.add(types.InlineKeyboardButton(text=f"{p.nome_exibicao} - R$ {p.preco_atual:.2f}", callback_data=f"checkout_{p.id}"))
             
-            # Input de mídia secundária (vídeo de oferta)
+            # Mídia 2 (Vídeo/Foto da Oferta)
             media_2 = fluxo.msg_2_media if (fluxo and fluxo.msg_2_media) else None
             
             if media_2:
@@ -296,31 +309,24 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             
             bot_temp.answer_callback_query(update.callback_query.id)
 
-        # --- 3. CHECKOUT (GERAR PIX) --- [MANTIDO EXATAMENTE COMO SOLICITADO]
+        # --- CHECKOUT (MANTIDO INTACTO) ---
         elif update.callback_query and update.callback_query.data.startswith("checkout_"):
             chat_id = update.callback_query.message.chat.id
             plano_id = update.callback_query.data.split("_")[1]
             
-            # Busca plano no DB
             plano = db.query(PlanoConfig).filter(PlanoConfig.id == plano_id).first()
             if not plano:
                 bot_temp.send_message(chat_id, "Plano não encontrado.")
                 return {"status": "error"}
 
-            # Avisa que está gerando
             msg_aguarde = bot_temp.send_message(chat_id, "⏳ Gerando seu PIX, aguarde...")
             
-            # Gera ID único para transação
             tx_id = str(uuid.uuid4())
-            
-            # --- CHAMA PUSHIN PAY ---
             pix_data = gerar_pix_pushinpay(plano.preco_atual, tx_id)
             
             if pix_data:
-                qr_code_text = pix_data.get("qr_code_text") # Ajuste conforme retorno da API
-                if not qr_code_text: qr_code_text = pix_data.get("qr_code") # Tentativa secundária
+                qr_code_text = pix_data.get("qr_code_text") or pix_data.get("qr_code")
                 
-                # Salva pedido no Banco
                 novo_pedido = Pedido(
                     bot_id=bot_db.id,
                     transaction_id=tx_id,
@@ -335,11 +341,9 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                 db.add(novo_pedido)
                 db.commit()
 
-                # Apaga mensagem de "Aguarde"
                 try: bot_temp.delete_message(chat_id, msg_aguarde.message_id)
                 except: pass
 
-                # --- MENSAGEM FINAL IGUAL DO SEU EXEMPLO ---
                 legenda_pix = f"""🌟 Seu pagamento foi gerado com sucesso:
 🎁 Plano: {plano.nome_exibicao}
 💰 Valor: R$ {plano.preco_atual:.2f}
