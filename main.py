@@ -639,60 +639,72 @@ def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db))
     }
 
 # =========================================================
-# 💸 WEBHOOK DE PAGAMENTO (RECEBE O PIX E LIBERA ACESSO)
+# 💸 WEBHOOK DE PAGAMENTO (BLINDADO E TAGARELA)
 # =========================================================
 @app.post("/webhook/pix")
 async def webhook_pix(request: Request, db: Session = Depends(get_db)):
     try:
+        # 1. Lê e Loga TUDO que chegou (Pra gente ver no Railway)
+        raw_body = await request.body()
         data = await request.json()
-        logger.info(f"💰 Webhook PIX Recebido: {data}")
+        logger.info(f"💰 JSON RECEBIDO PUSHINPAY: {data}")
 
-        # PushinPay manda o ID da transação no 'external_reference' ou 'id'
-        # Ajuste conforme o JSON real que o PushinPay manda. 
-        # Geralmente é external_reference se você enviou na criação.
-        tx_id = data.get("external_reference") 
-        status_pix = data.get("status") # paid, approved, etc.
+        # 2. Flexibilidade nos Campos
+        # PushinPay pode mandar 'id', 'external_reference', 'uuid' dependendo da versão
+        tx_id = data.get("external_reference") or data.get("id") or data.get("uuid")
+        status_pix = str(data.get("status", "")).lower()
 
-        if not tx_id or status_pix != "paid":
-            return {"status": "ignored", "reason": "not_paid_or_no_ref"}
+        # 3. Validação Flexível de Status
+        status_validos = ["paid", "approved", "completed", "succeeded"]
+        
+        if not tx_id:
+            logger.warning("⚠️ Webhook ignorado: Sem ID de transação.")
+            return {"status": "ignored", "reason": "no_tx_id"}
+            
+        if status_pix not in status_validos:
+            logger.warning(f"⚠️ Webhook ignorado: Status '{status_pix}' não é de pagamento aprovado.")
+            return {"status": "ignored", "reason": f"status_{status_pix}"}
 
-        # 1. Busca o Pedido e JA CARREGA O BOT (Evita o erro DetachedInstanceError)
-        # O .join(Bot) garante que os dados do bot venham juntos na memória
+        # 4. Busca Pedido + Bot
         pedido = db.query(Pedido).join(Bot).filter(Pedido.transaction_id == tx_id).first()
 
         if not pedido:
-            logger.error(f"❌ Pedido não encontrado para TX: {tx_id}")
-            return {"status": "error", "msg": "Order not found"}
+            logger.error(f"❌ Pedido não encontrado no banco para TX: {tx_id}")
+            # Retorna 200 para o PushinPay parar de mandar, mas loga erro
+            return {"status": "ok", "msg": "Order not found internally"}
 
         if pedido.status == "paid":
+            logger.info(f"ℹ️ Pedido {tx_id} já estava pago.")
             return {"status": "ok", "msg": "Already paid"}
 
-        # 2. Atualiza Status para PAGO
+        # 5. Atualiza Banco
         pedido.status = "paid"
-        pedido.mensagem_enviada = True # Marca que tentamos enviar
-        db.commit() # Salva no banco "Está Pago"
+        pedido.mensagem_enviada = True
+        db.commit()
+        logger.info(f"✅ Pedido {tx_id} atualizado para PAID no banco.")
         
-        # 3. Liberação do Acesso (Telegram)
-        # Como já fizemos join/refresh, podemos acessar pedido.bot com segurança
+        # 6. Liberação no Telegram
         bot_data = pedido.bot 
-        
         try:
             tb = telebot.TeleBot(bot_data.token)
             chat_id_user = int(pedido.telegram_id)
-            canal_vip = bot_data.id_canal_vip
-
-            # A) Tenta Desbanir (caso tenha sido expulso antes)
+            
+            # Tenta converter ID do canal (remove espaços)
             try:
-                tb.unban_chat_member(canal_vip, chat_id_user, only_if_banned=True)
+                canal_vip_id = int(str(bot_data.id_canal_vip).strip())
             except:
-                pass # Se não der, segue o jogo
+                canal_vip_id = bot_data.id_canal_vip # Tenta como string se for @canal
 
-            # B) Gera Link Único (Para evitar compartilhamento)
-            # member_limit=1 faz o link expirar assim que 1 pessoa entra
-            convite = tb.create_chat_invite_link(canal_vip, member_limit=1, name=f"Acesso {pedido.first_name}")
+            logger.info(f"🚀 Tentando gerar link no canal {canal_vip_id} para user {chat_id_user}...")
+
+            # GERA O LINK ÚNICO
+            convite = tb.create_chat_invite_link(
+                chat_id=canal_vip_id, 
+                member_limit=1, 
+                name=f"Venda {pedido.first_name}"
+            )
             link_acesso = convite.invite_link
 
-            # C) Envia Mensagem de Sucesso
             msg_sucesso = f"""
 ✅ **Pagamento Confirmado!**
 
@@ -704,17 +716,17 @@ Toque no link abaixo para entrar no Canal VIP:
 ⚠️ *Este link é único e válido apenas para você.*
 """
             tb.send_message(chat_id_user, msg_sucesso, parse_mode="Markdown")
-            logger.info(f"✅ Acesso enviado para {pedido.first_name}")
+            logger.info(f"🏆 SUCESSO! Link enviado para {pedido.first_name}")
 
         except Exception as e_telegram:
-            logger.error(f"❌ Erro ao liberar Telegram: {e_telegram}")
-            # Não retornamos erro 500 para o PushinPay não ficar tentando reenviar, 
-            # pois o dinheiro já caiu. Apenas logamos o erro.
+            logger.error(f"❌ ERRO TELEGRAM: {e_telegram}")
+            # DICA: Se der erro aqui, verifique se o bot é ADMIN no canal
+            tb.send_message(chat_id_user, "✅ Pagamento recebido! \n\n⚠️ Houve um erro ao gerar seu link automático. Um administrador entrará em contato em breve.")
 
         return {"status": "received"}
 
     except Exception as e:
-        logger.error(f"❌ Erro Crítico Webhook PIX: {e}")
+        logger.error(f"❌ ERRO CRÍTICO NO WEBHOOK: {e}")
         return {"status": "error"}
 
 @app.get("/")
