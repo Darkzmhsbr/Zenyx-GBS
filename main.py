@@ -8,6 +8,7 @@ import urllib.parse
 import time
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from telebot import types  # <--- A LINHA QUE ESTAVA FALTANDO!
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func
@@ -105,7 +106,7 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         logger.error(f"Exceção PushinPay: {e}")
         return None
 
-# --- MODELOS (CLASSES EXPANDIDAS PARA EVITAR ERRO DE SINTAXE) ---
+# --- MODELOS ---
 class IntegrationUpdate(BaseModel):
     token: str
 
