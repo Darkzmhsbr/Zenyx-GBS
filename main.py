@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
+from sqlalchemy import func
 
 # Importa banco de dados
 from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, Pedido, SystemConfig, RemarketingCampaign, engine
@@ -602,6 +603,34 @@ def historico_remarketing(bot_id: int, db: Session = Depends(get_db)):
         "blocked": h.blocked_count,
         "config": { "content_data": h.config }
     } for h in history]
+
+# =========================================================
+# 📊 ROTA DE DASHBOARD (KPIs REAIS)
+# =========================================================
+@app.get("/api/admin/dashboard/stats")
+def dashboard_stats(db: Session = Depends(get_db)):
+    """Calcula métricas reais baseadas nos pedidos"""
+    
+    # 1. Faturamento Total (Soma de todos os 'paid')
+    total_revenue = db.query(func.sum(Pedido.valor)).filter(Pedido.status == "paid").scalar() or 0.0
+    
+    # 2. Assinantes (Total de pagantes únicos ou ativos)
+    active_users = db.query(Pedido.telegram_id).filter(Pedido.status == "paid").distinct().count()
+    
+    # 3. Vendas Hoje
+    today = datetime.utcnow().date()
+    start_of_day = datetime.combine(today, datetime.min.time())
+    
+    sales_today = db.query(func.sum(Pedido.valor)).filter(
+        Pedido.status == "paid", 
+        Pedido.created_at >= start_of_day
+    ).scalar() or 0.0
+
+    return {
+        "total_revenue": total_revenue,
+        "active_users": active_users,
+        "sales_today": sales_today
+    }
 
 @app.get("/")
 def home():
