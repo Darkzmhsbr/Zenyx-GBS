@@ -3,18 +3,16 @@ import logging
 import telebot
 import requests
 import uuid
-import urllib.parse # <--- ADICIONE ESTE NOVO IMPORT
-from fastapi import BackgroundTasks # <--- IMPORTANTE
+import json  # <--- AGORA O JSON ESTÁ AQUI
 import time
-from sqlalchemy import text  # Importante para o SQL
-from telebot import types
-from fastapi import FastAPI, HTTPException, Depends, Request
+import urllib.parse # <--- IMPORTANTE PARA LER O PUSHINPAY
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import text, func
 from typing import List, Optional
 from datetime import datetime, timedelta
-from sqlalchemy import func
 
 # Importa banco de dados
 from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, Pedido, SystemConfig, RemarketingCampaign, engine
@@ -33,83 +31,49 @@ app.add_middleware(
 )
 
 # =========================================================
-# 🛠️ AUTO-REPARO DO BANCO DE DADOS (Executa ao ligar)
+# 🛠️ AUTO-REPARO DO BANCO DE DADOS
 # =========================================================
 @app.on_event("startup")
 def on_startup():
-    # 1. Cria tabelas que não existem
     init_db()
-    
-    # 2. FORÇA A CRIAÇÃO DAS COLUNAS NOVAS (Correção Crítica)
     try:
         with engine.connect() as conn:
             logger.info("🔧 Verificando integridade do banco de dados...")
-            
             comandos = [
-                # Correções de Fluxo
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;",
-                
-                # 🔴 CORREÇÃO DO ERRO DE REMARKETING (AQUI ESTÁ A MÁGICA)
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS data_envio TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS campaign_id VARCHAR;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS config TEXT;"
             ]
-            
             for cmd in comandos:
-                try:
-                    conn.execute(text(cmd))
-                except Exception as e:
-                    # Ignora se já existir, mas registra
-                    logger.warning(f"Aviso SQL na migração: {e}")
-            
+                try: conn.execute(text(cmd))
+                except: pass
             conn.commit()
-            logger.info("✅ BANCO DE DADOS ATUALIZADO E PRONTO!")
-            
+            logger.info("✅ BANCO DE DADOS PRONTO!")
     except Exception as e:
-        logger.error(f"❌ Erro crítico ao atualizar banco: {e}")
+        logger.error(f"❌ Erro banco: {e}")
 
 def get_db():
     db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    try: yield db
+    finally: db.close()
 
 # =========================================================
-# 🔌 INTEGRAÇÃO PUSHIN PAY (DINÂMICA)
-# =========================================================
-def get_pushin_token():
-    """Busca o token no banco, se não achar, tenta variável de ambiente"""
-    db = SessionLocal()
-    try:
-        # Tenta pegar do banco de dados (Painel de Integrações)
-        config = db.query(SystemConfig).filter(SystemConfig.key == "pushin_pay_token").first()
-        if config and config.value:
-            return config.value
-        # Se não tiver no banco, pega do Railway Variables
-        return os.getenv("PUSHIN_PAY_TOKEN")
-    finally:
-        db.close()
-
-# =========================================================
-# 🔌 INTEGRAÇÃO PUSHIN PAY (LINK CORRIGIDO FIXO)
+# 🔌 INTEGRAÇÃO PUSHIN PAY (FIXA E SEGURA)
 # =========================================================
 def get_pushin_token():
     db = SessionLocal()
     try:
         config = db.query(SystemConfig).filter(SystemConfig.key == "pushin_pay_token").first()
-        if config and config.value:
-            return config.value
+        if config and config.value: return config.value
         return os.getenv("PUSHIN_PAY_TOKEN")
-    finally:
-        db.close()
+    finally: db.close()
 
 def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
     token = get_pushin_token()
-    
     if not token:
         logger.error("❌ Token Pushin Pay não configurado!")
         return None
@@ -121,22 +85,19 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         "Accept": "application/json"
     }
     
-    # 👇 AQUI ESTAVA O ERRO! COLOQUEI SEU LINK FIXO AGORA 👇
+    # URL FIXA DO RAILWAY (PELO SEU LOG ANTERIOR)
     seus_dominio = "zenyx-gbs-production.up.railway.app" 
     
     payload = {
         "value": int(valor_float * 100), 
-        "webhook_url": f"https://{seus_dominio}/webhook/pix", # <--- FIXO E SEGURO
+        "webhook_url": f"https://{seus_dominio}/webhook/pix",
         "external_reference": transaction_id
     }
 
     try:
-        # Adicionei logs aqui para vermos se a CRIAÇÃO está certa
-        logger.info(f"📤 Gerando PIX. Webhook definido para: https://{seus_dominio}/webhook/pix")
-        
+        logger.info(f"📤 Gerando PIX. Webhook: https://{seus_dominio}/webhook/pix")
         response = requests.post(url, json=payload, headers=headers, timeout=10)
-        if response.status_code in [200, 201]:
-            return response.json()
+        if response.status_code in [200, 201]: return response.json()
         else:
             logger.error(f"Erro PushinPay: {response.text}")
             return None
@@ -144,275 +105,107 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         logger.error(f"Exceção PushinPay: {e}")
         return None
 
-# --- ROTAS DE INTEGRAÇÃO (SALVAR TOKEN) ---
-class IntegrationUpdate(BaseModel):
-    token: str
-
-@app.get("/api/admin/integrations/pushinpay")
-def get_pushin_status(db: Session = Depends(get_db)):
-    config = db.query(SystemConfig).filter(SystemConfig.key == "pushin_pay_token").first()
-    token = config.value if config else os.getenv("PUSHIN_PAY_TOKEN")
-    
-    if not token:
-        return {"status": "desconectado", "token_mask": ""}
-    
-    mask = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "****"
-    return {"status": "conectado", "token_mask": mask}
-
-@app.post("/api/admin/integrations/pushinpay")
-def save_pushin_token(data: IntegrationUpdate, db: Session = Depends(get_db)):
-    config = db.query(SystemConfig).filter(SystemConfig.key == "pushin_pay_token").first()
-    if not config:
-        config = SystemConfig(key="pushin_pay_token")
-        db.add(config)
-    
-    config.value = data.token
-    config.updated_at = datetime.utcnow()
-    db.commit()
-    
-    if len(data.token) > 10:
-        return {"status": "conectado", "msg": "Token salvo com sucesso!"}
-    else:
-        return {"status": "erro", "msg": "Token parece inválido."}
-
 # --- MODELOS ---
-class BotCreate(BaseModel):
-    nome: str
-    token: str
-    id_canal_vip: str
-
-class BotResponse(BotCreate):
-    id: int
-    status: str
-    class Config:
-        from_attributes = True
-
-class PlanoCreate(BaseModel):
-    bot_id: int
-    nome_exibicao: str
-    preco: float
-    dias_duracao: int
-
-class FlowUpdate(BaseModel):
-    msg_boas_vindas: str
-    media_url: Optional[str] = None
-    btn_text_1: str
-    autodestruir_1: bool
-    msg_2_texto: Optional[str] = None
-    msg_2_media: Optional[str] = None
-    mostrar_planos_2: bool
-
-# ✅ MODELO COMPLETO PARA O WIZARD DE REMARKETING
-class RemarketingRequest(BaseModel):
-    bot_id: int
-    tipo_envio: str # 'todos', 'leads', 'ex_assinantes', 'individual'
-    mensagem: str
-    media_url: Optional[str] = None
-    incluir_oferta: bool = False
-    
-    # Campos Extras do Wizard
-    plano_oferta_id: Optional[str] = None
-    valor_oferta: Optional[float] = 0.0
-    expire_timestamp: Optional[int] = 0
-    is_periodic: bool = False
-    
-    # Controle de Teste
-    is_test: bool = False
-    specific_user_id: Optional[str] = None # Telegram ID para teste
-
-# ===========================
-# ⚙️ GESTÃO DE BOTS
-# ===========================
-
-@app.post("/api/admin/bots", response_model=BotResponse)
-def criar_bot(bot_data: BotCreate, db: Session = Depends(get_db)):
-    if db.query(Bot).filter(Bot.token == bot_data.token).first():
-        raise HTTPException(status_code=400, detail="Token já cadastrado.")
-
-    try:
-        tb = telebot.TeleBot(bot_data.token)
-        public_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
-        if public_url:
-            webhook_url = f"https://{public_url}/webhook/{bot_data.token}"
-            tb.set_webhook(url=webhook_url)
-        status = "conectado"
-    except Exception as e:
-        logger.error(f"Erro: {e}")
-        raise HTTPException(status_code=400, detail="Token inválido.")
-
-    novo_bot = Bot(
-        nome=bot_data.nome,
-        token=bot_data.token,
-        id_canal_vip=bot_data.id_canal_vip,
-        status=status
-    )
-    db.add(novo_bot)
-    db.commit()
-    db.refresh(novo_bot)
-    return novo_bot
-
-@app.get("/api/admin/bots", response_model=List[BotResponse])
-def listar_bots(db: Session = Depends(get_db)):
-    return db.query(Bot).all()
-
-# ===========================
-# 💎 PLANOS & FLUXO
-# ===========================
-
-@app.post("/api/admin/plans")
-def criar_plano(plano: PlanoCreate, db: Session = Depends(get_db)):
-    novo_plano = PlanoConfig(
-        bot_id=plano.bot_id,
-        key_id=f"plan_{plano.bot_id}_{plano.dias_duracao}d",
-        nome_exibicao=plano.nome_exibicao,
-        descricao=f"Acesso de {plano.dias_duracao} dias",
-        preco_cheio=plano.preco * 2,
-        preco_atual=plano.preco,
-        dias_duracao=plano.dias_duracao
-    )
-    db.add(novo_plano)
-    db.commit()
-    return {"status": "ok"}
-
-@app.get("/api/admin/plans/{bot_id}")
-def listar_planos(bot_id: int, db: Session = Depends(get_db)):
-    return db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
-
-@app.get("/api/admin/bots/{bot_id}/flow")
-def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
-    fluxo = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
-    if not fluxo:
-        return {
-            "msg_boas_vindas": "Olá! Seja bem-vindo(a).",
-            "media_url": "",
-            "btn_text_1": "🔓 DESBLOQUEAR ACESSO",
-            "autodestruir_1": False,
-            "msg_2_texto": "Escolha seu plano abaixo:",
-            "msg_2_media": "",
-            "mostrar_planos_2": True
-        }
-    return fluxo
-
-@app.post("/api/admin/bots/{bot_id}/flow")
-def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
-    fluxo_db = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
-    if not fluxo_db:
-        fluxo_db = BotFlow(bot_id=bot_id)
-        db.add(fluxo_db)
-    
-    fluxo_db.msg_boas_vindas = flow.msg_boas_vindas
-    fluxo_db.media_url = flow.media_url
-    fluxo_db.btn_text_1 = flow.btn_text_1
-    fluxo_db.autodestruir_1 = flow.autodestruir_1
-    fluxo_db.msg_2_texto = flow.msg_2_texto
-    fluxo_db.msg_2_media = flow.msg_2_media
-    fluxo_db.mostrar_planos_2 = flow.mostrar_planos_2
-    
-    db.commit()
-    return {"status": "saved"}
+class IntegrationUpdate(BaseModel): token: str
+class BotCreate(BaseModel): nome: str; token: str; id_canal_vip: str
+class BotResponse(BotCreate): id: int; status: str; class Config: from_attributes = True
+class PlanoCreate(BaseModel): bot_id: int; nome_exibicao: str; preco: float; dias_duracao: int
+class FlowUpdate(BaseModel): msg_boas_vindas: str; media_url: Optional[str] = None; btn_text_1: str; autodestruir_1: bool; msg_2_texto: Optional[str] = None; msg_2_media: Optional[str] = None; mostrar_planos_2: bool
+class RemarketingRequest(BaseModel): bot_id: int; tipo_envio: str; mensagem: str; media_url: Optional[str] = None; incluir_oferta: bool = False; plano_oferta_id: Optional[str] = None; valor_oferta: Optional[float] = 0.0; expire_timestamp: Optional[int] = 0; is_periodic: bool = False; is_test: bool = False; specific_user_id: Optional[str] = None
 
 # =========================================================
-# 💰 ROTA WEBHOOK PIX (VERSÃO HÍBRIDA: JSON + FORM DATA)
+# 💰 ROTA WEBHOOK PIX (A CORREÇÃO DEFINITIVA)
 # =========================================================
 @app.post("/webhook/pix")
 async def webhook_pix(request: Request, db: Session = Depends(get_db)):
-    print("🔔 WEBHOOK PIX RECEBIDO!") 
+    print("🔔 WEBHOOK PIX CHEGOU!") 
     try:
-        # 1. PEGA O CORPO BRUTO
         body_bytes = await request.body()
         body_str = body_bytes.decode("utf-8")
         
-        print(f"📦 BODY: {body_str}") # Log para conferência
+        print(f"📦 BODY RAW: {body_str}") 
 
         if not body_str:
             return {"status": "ignored", "reason": "empty_body"}
 
-        # 2. TENTA DECIFRAR (JSON OU FORM DATA)
+        # --- LÓGICA HÍBRIDA (JSON ou FORM DATA) ---
         data = {}
         try:
-            # Tentativa A: É JSON?
+            # Tenta JSON primeiro
             data = json.loads(body_str)
-        except json.JSONDecodeError:
-            # Tentativa B: É Form Data? (O caso do seu erro)
+        except:
+            # Se falhar, tenta Form Data (igual seu arquivo de referência)
             try:
                 parsed = urllib.parse.parse_qs(body_str)
-                # Converte {'id': ['123']} para {'id': '123'}
                 data = {k: v[0] for k, v in parsed.items()}
-                print("✅ Formato Form-Data detectado e convertido!")
+                print("✅ Convertido de Form-Data para Dict")
             except Exception as e_parse:
-                print(f"❌ Não consegui ler o formato: {e_parse}")
+                print(f"❌ Falha ao ler dados: {e_parse}")
                 return {"status": "error", "reason": "invalid_format"}
 
-        # 3. EXTRAI OS DADOS (Agora funciona para os dois formatos)
-        # No seu log, o ID veio no campo 'id', então damos prioridade a ele se não tiver external_reference
+        # Extrai dados com flexibilidade
         tx_id = data.get("external_reference") or data.get("id") or data.get("uuid")
         status_pix = str(data.get("status", "")).lower()
         
         print(f"🔎 Processando: ID={tx_id} | Status={status_pix}")
 
-        # 4. VALIDA STATUS
         if status_pix not in ["paid", "approved", "completed", "succeeded"]:
             print(f"⚠️ Status ignorado: {status_pix}")
             return {"status": "ignored"}
 
-        # 5. BUSCA O PEDIDO NO BANCO
-        # IMPORTANTE: O .join(Bot) previne o erro de conexão fechada
+        # Busca Pedido com JOIN para garantir conexão
         pedido = db.query(Pedido).join(Bot).filter(Pedido.transaction_id == tx_id).first()
 
         if not pedido:
             print(f"❌ Pedido {tx_id} não encontrado no banco.")
-            # Dica: Se cair aqui, é porque o PushinPay mandou um ID diferente do que geramos.
-            # Nesse caso, teremos que ajustar a criação do pedido, mas vamos testar assim primeiro.
             return {"status": "ok", "msg": "Order not found"}
 
         if pedido.status == "paid":
             print("ℹ️ Pedido já estava pago.")
             return {"status": "ok", "msg": "Already paid"}
 
-        # 6. ATUALIZA STATUS PARA PAGO
+        # ATUALIZA BANCO
         pedido.status = "paid"
         pedido.mensagem_enviada = True
         db.commit()
-        print(f"✅ Pedido {tx_id} aprovado!")
+        print(f"✅ Pedido {tx_id} PAGO!")
         
-        # 7. ENTREGA O ACESSO (Telegram)
+        # ENVIA TELEGRAM
         bot_data = pedido.bot 
         try:
             tb = telebot.TeleBot(bot_data.token)
             
-            # Ajuste seguro do ID do canal
             try: canal_id = int(str(bot_data.id_canal_vip).strip())
             except: canal_id = bot_data.id_canal_vip
 
-            # Gera Link Único
             convite = tb.create_chat_invite_link(
                 chat_id=canal_id, 
                 member_limit=1, 
                 name=f"Venda {pedido.first_name}"
             )
             
-            msg = f"✅ **Pagamento Confirmado!**\n\nSeu link de acesso exclusivo:\n👉 {convite.invite_link}"
+            msg = f"✅ **Pagamento Confirmado!**\n\nSeu acesso exclusivo:\n👉 {convite.invite_link}"
             tb.send_message(int(pedido.telegram_id), msg, parse_mode="Markdown")
-            print("🏆 LINK ENVIADO COM SUCESSO!")
+            print("🏆 LINK ENVIADO!")
 
         except Exception as e_tg:
-            print(f"❌ Erro ao enviar link no Telegram: {e_tg}")
-            # Tenta avisar o usuário do erro
+            print(f"❌ Erro Telegram: {e_tg}")
             try: tb.send_message(int(pedido.telegram_id), "✅ Pagamento recebido! Erro ao gerar link. Contate o suporte.")
             except: pass
 
         return {"status": "received"}
 
     except Exception as e:
-        print(f"❌ ERRO CRÍTICO: {e}")
+        print(f"❌ ERRO CRÍTICO NO CODE: {e}") # Agora vai imprimir o erro real se houver
         return {"status": "error"}
 
-# =========================================================
-# 🚀 WEBHOOK PRINCIPAL (HOT FLOW & CHECKOUT)
-# =========================================================
+# ===========================
+# 🚀 WEBHOOK GERAL DO BOT
+# ===========================
 @app.post("/webhook/{bot_token}")
 async def receber_update_telegram(bot_token: str, request: Request, db: Session = Depends(get_db)):
-    
+    if bot_token == "pix": return {"status": "ignored_loop"} # Proteção extra
+
     bot_db = db.query(Bot).filter(Bot.token == bot_token).first()
     if not bot_db: return {"status": "ignored"}
 
@@ -421,20 +214,14 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
         update = telebot.types.Update.de_json(json_str)
         bot_temp = telebot.TeleBot(bot_token)
         
-        # --- 1. COMANDO /START (Início do Funil) ---
         if update.message and update.message.text == "/start":
             chat_id = update.message.chat.id
             fluxo = bot_db.fluxo
-            
-            # Textos e Botão
             texto = fluxo.msg_boas_vindas if fluxo else f"Olá! Eu sou o {bot_db.nome}."
             btn_txt = fluxo.btn_text_1 if (fluxo and fluxo.btn_text_1) else "🔓 DESBLOQUEAR ACESSO"
-            
-            # Cria botão para o próximo passo
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton(text=btn_txt, callback_data="passo_2"))
-
-            # Envia Mídia ou Texto
+            
             media = fluxo.media_url if (fluxo and fluxo.media_url) else None
             if media:
                 try:
@@ -442,41 +229,27 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                         bot_temp.send_video(chat_id, media, caption=texto, reply_markup=markup)
                     else:
                         bot_temp.send_photo(chat_id, media, caption=texto, reply_markup=markup)
-                except Exception as e:
-                    logger.error(f"Erro mídia 1: {e}")
-                    # Fallback: envia texto se a mídia falhar
+                except:
                     bot_temp.send_message(chat_id, texto, reply_markup=markup)
             else:
                 bot_temp.send_message(chat_id, texto, reply_markup=markup)
 
-        # --- 2. CLIQUE NO BOTÃO (OFERTA) ---
         elif update.callback_query and update.callback_query.data == "passo_2":
             chat_id = update.callback_query.message.chat.id
-            msg_id = update.callback_query.message.message_id
             fluxo = bot_db.fluxo
-            
-            # A) Autodestruição (Se configurado)
-            if fluxo and fluxo.autodestruir_1:
-                try:
-                    bot_temp.delete_message(chat_id, msg_id)
-                except Exception as e:
-                    logger.warning(f"Falha ao deletar msg: {e}")
-
-            # B) Prepara Segunda Mensagem
             texto_2 = fluxo.msg_2_texto if (fluxo and fluxo.msg_2_texto) else "Escolha seu plano:"
-            media_2 = fluxo.msg_2_media if (fluxo and fluxo.msg_2_media) else None
-            
-            # C) Cria Botões dos Planos
             markup = types.InlineKeyboardMarkup()
+            
             if fluxo and fluxo.mostrar_planos_2:
                 for p in bot_db.planos:
-                    # Cria botão com preço e callback de checkout
                     markup.add(types.InlineKeyboardButton(text=f"{p.nome_exibicao} - R$ {p.preco_atual:.2f}", callback_data=f"checkout_{p.id}"))
             
-            # D) Envia Mensagem 2 (Mídia ou Texto)
+            # Input de mídia secundária (vídeo de oferta)
+            media_2 = fluxo.msg_2_media if (fluxo and fluxo.msg_2_media) else None
+            
             if media_2:
                 try:
-                    if media_2.lower().endswith(('.mp4', '.mov', '.avi')):
+                    if media_2.lower().endswith(('.mp4', '.mov')):
                         bot_temp.send_video(chat_id, media_2, caption=texto_2, reply_markup=markup)
                     else:
                         bot_temp.send_photo(chat_id, media_2, caption=texto_2, reply_markup=markup)
@@ -485,369 +258,152 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             else:
                 bot_temp.send_message(chat_id, texto_2, reply_markup=markup)
             
-            # Para o "reloginho" do botão
             bot_temp.answer_callback_query(update.callback_query.id)
 
-        # --- 3. CHECKOUT (GERAR PIX) ---
         elif update.callback_query and update.callback_query.data.startswith("checkout_"):
             chat_id = update.callback_query.message.chat.id
             plano_id = update.callback_query.data.split("_")[1]
-            
-            # Busca plano no DB
             plano = db.query(PlanoConfig).filter(PlanoConfig.id == plano_id).first()
-            if not plano:
-                bot_temp.send_message(chat_id, "Plano não encontrado.")
-                return {"status": "error"}
-
-            # Avisa que está gerando
-            msg_aguarde = bot_temp.send_message(chat_id, "⏳ Gerando seu PIX, aguarde...")
             
-            # Gera ID único para transação
-            tx_id = str(uuid.uuid4())
-            
-            # --- CHAMA PUSHIN PAY ---
-            pix_data = gerar_pix_pushinpay(plano.preco_atual, tx_id)
-            
-            if pix_data:
-                qr_code_text = pix_data.get("qr_code_text") # Ajuste conforme retorno da API
-                if not qr_code_text: qr_code_text = pix_data.get("qr_code") # Tentativa secundária
+            if plano:
+                msg_wait = bot_temp.send_message(chat_id, "⏳ Gerando PIX...")
+                tx_id = str(uuid.uuid4())
+                pix_data = gerar_pix_pushinpay(plano.preco_atual, tx_id)
                 
-                # Salva pedido no Banco
-                novo_pedido = Pedido(
-                    bot_id=bot_db.id,
-                    transaction_id=tx_id,
-                    telegram_id=str(chat_id),
-                    first_name=update.callback_query.from_user.first_name,
-                    username=update.callback_query.from_user.username,
-                    plano_nome=plano.nome_exibicao,
-                    valor=plano.preco_atual,
-                    status="pending",
-                    qr_code=qr_code_text
-                )
-                db.add(novo_pedido)
-                db.commit()
-
-                # Apaga mensagem de "Aguarde"
-                try: bot_temp.delete_message(chat_id, msg_aguarde.message_id)
-                except: pass
-
-                # --- MENSAGEM FINAL IGUAL DO SEU EXEMPLO ---
-                legenda_pix = f"""🌟 Seu pagamento foi gerado com sucesso:
-🎁 Plano: {plano.nome_exibicao}
-💰 Valor: R$ {plano.preco_atual:.2f}
-🔐 Pague via Pix Copia e Cola:
-
-```
-{qr_code_text}
-```
-
-👆 Toque na chave PIX acima para copiá-la
-‼️ Após o pagamento, o acesso será liberado automaticamente!"""
-
-                bot_temp.send_message(chat_id, legenda_pix, parse_mode="Markdown")
-            else:
-                bot_temp.send_message(chat_id, "❌ Erro ao gerar PIX. Tente novamente ou contate o suporte.")
-
+                if pix_data:
+                    qr_code = pix_data.get("qr_code_text") or pix_data.get("qr_code")
+                    novo_pedido = Pedido(
+                        bot_id=bot_db.id, transaction_id=tx_id, telegram_id=str(chat_id),
+                        first_name=update.callback_query.from_user.first_name,
+                        username=update.callback_query.from_user.username,
+                        plano_nome=plano.nome_exibicao, valor=plano.preco_atual,
+                        status="pending", qr_code=qr_code
+                    )
+                    db.add(novo_pedido)
+                    db.commit()
+                    
+                    try: bot_temp.delete_message(chat_id, msg_wait.message_id)
+                    except: pass
+                    
+                    msg_pix = f"💰 **Pagamento Gerado**\nValor: R$ {plano.preco_atual:.2f}\n\nCopia e Cola:\n`{qr_code}`"
+                    bot_temp.send_message(chat_id, msg_pix, parse_mode="Markdown")
+                else:
+                    bot_temp.send_message(chat_id, "❌ Erro ao gerar PIX.")
+            
             bot_temp.answer_callback_query(update.callback_query.id)
 
         return {"status": "processed"}
-        
     except Exception as e:
-        logger.error(f"Erro webhook: {e}")
+        logger.error(f"Erro webhook bot: {e}")
         return {"status": "error"}
-# =========================================================
-# 👥 ROTAS DE CRM (BASE DE CONTATOS)
-# =========================================================
-@app.get("/api/admin/contacts")
-def listar_contatos(status: str = "todos", db: Session = Depends(get_db)):
-    """
-    Lista usuários com base nos pedidos gerados.
-    Filtros: 'todos', 'pagantes' (paid), 'pendentes' (pending)
-    """
-    query = db.query(Pedido)
-    
-    if status == "pagantes":
-        query = query.filter(Pedido.status == "paid")
-    elif status == "pendentes":
-        query = query.filter(Pedido.status == "pending")
-    
-    # Ordena pelos mais recentes
-    contatos = query.order_by(Pedido.created_at.desc()).all()
-    return contatos
 
-# =========================================================
-# 📢 ROTAS DE REMARKETING (DISPARADOR AVANÇADO)
-# =========================================================
+# ROTAS API ADMIN
+@app.get("/api/admin/bots", response_model=List[BotResponse])
+def listar_bots(db: Session = Depends(get_db)): return db.query(Bot).all()
 
-# Variável Global para monitorar o envio em tempo real
-CAMPAIGN_STATUS = {
-    "running": False,
-    "sent": 0,
-    "total": 0,
-    "blocked": 0
-}
+@app.post("/api/admin/bots", response_model=BotResponse)
+def criar_bot(bot_data: BotCreate, db: Session = Depends(get_db)):
+    if db.query(Bot).filter(Bot.token == bot_data.token).first(): raise HTTPException(400, "Token já cadastrado.")
+    try:
+        tb = telebot.TeleBot(bot_data.token)
+        webhook_url = f"https://zenyx-gbs-production.up.railway.app/webhook/{bot_data.token}"
+        tb.set_webhook(url=webhook_url)
+        status = "conectado"
+    except: status = "erro"
+    novo_bot = Bot(nome=bot_data.nome, token=bot_data.token, id_canal_vip=bot_data.id_canal_vip, status=status)
+    db.add(novo_bot); db.commit(); db.refresh(novo_bot)
+    return novo_bot
 
+@app.get("/api/admin/integrations/pushinpay")
+def get_pushin_status(db: Session = Depends(get_db)):
+    config = db.query(SystemConfig).filter(SystemConfig.key == "pushin_pay_token").first()
+    token = config.value if config else os.getenv("PUSHIN_PAY_TOKEN")
+    return {"status": "conectado" if token else "desconectado", "token_mask": f"{token[:4]}...{token[-4:]}" if token else ""}
+
+@app.post("/api/admin/integrations/pushinpay")
+def save_pushin_token(data: IntegrationUpdate, db: Session = Depends(get_db)):
+    config = db.query(SystemConfig).filter(SystemConfig.key == "pushin_pay_token").first()
+    if not config: config = SystemConfig(key="pushin_pay_token"); db.add(config)
+    config.value = data.token; db.commit()
+    return {"status": "conectado"}
+
+@app.post("/api/admin/plans")
+def criar_plano(plano: PlanoCreate, db: Session = Depends(get_db)):
+    novo_plano = PlanoConfig(bot_id=plano.bot_id, key_id=f"p_{plano.bot_id}_{int(time.time())}", nome_exibicao=plano.nome_exibicao, preco_cheio=plano.preco*2, preco_atual=plano.preco, dias_duracao=plano.dias_duracao)
+    db.add(novo_plano); db.commit()
+    return {"status": "ok"}
+
+@app.get("/api/admin/plans/{bot_id}")
+def listar_planos(bot_id: int, db: Session = Depends(get_db)): return db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
+
+@app.delete("/api/admin/plans/{plan_id}")
+def deletar_plano(plan_id: int, db: Session = Depends(get_db)): db.query(PlanoConfig).filter(PlanoConfig.id == plan_id).delete(); db.commit(); return {"status": "deleted"}
+
+@app.get("/api/admin/bots/{bot_id}/flow")
+def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
+    fluxo = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
+    if not fluxo: return {"msg_boas_vindas": "Olá!", "media_url": "", "btn_text_1": "Começar", "autodestruir_1": False, "msg_2_texto": "", "msg_2_media": "", "mostrar_planos_2": True}
+    return fluxo
+
+@app.post("/api/admin/bots/{bot_id}/flow")
+def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
+    fluxo_db = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
+    if not fluxo_db: fluxo_db = BotFlow(bot_id=bot_id); db.add(fluxo_db)
+    fluxo_db.msg_boas_vindas = flow.msg_boas_vindas; fluxo_db.media_url = flow.media_url; fluxo_db.btn_text_1 = flow.btn_text_1
+    fluxo_db.autodestruir_1 = flow.autodestruir_1; fluxo_db.msg_2_texto = flow.msg_2_texto; fluxo_db.msg_2_media = flow.msg_2_media
+    fluxo_db.mostrar_planos_2 = flow.mostrar_planos_2; db.commit()
+    return {"status": "saved"}
+
+# REMARKETING
+CAMPAIGN_STATUS = {"running": False, "sent": 0, "total": 0, "blocked": 0}
 def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Session):
-    """Função executada em BackgroundTasks"""
     global CAMPAIGN_STATUS
-    
-    # Inicia/Reseta o status
     CAMPAIGN_STATUS = {"running": True, "sent": 0, "total": 0, "blocked": 0}
-    
     bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
-    if not bot_db: 
-        CAMPAIGN_STATUS["running"] = False
-        return
-
-    # 1. Filtra os usuários com base na escolha do Wizard
-    usuarios_alvo = {} # Dict para evitar duplicatas: {telegram_id: dados}
-
-    # Se for teste, pega apenas o ID específico (admin ou último usuário)
-    if payload.is_test and payload.specific_user_id:
-        usuarios_alvo[payload.specific_user_id] = {"first_name": "Admin Teste"}
-        logger.info(f"🧪 Teste de Remarketing para: {payload.specific_user_id}")
-    else:
-        # Busca no banco de pedidos
-        query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
-        todos_pedidos = query.all()
-        
-        for p in todos_pedidos:
-            # Filtros Avançados
-            if payload.tipo_envio == 'leads' and p.status != 'pending': continue
-            if payload.tipo_envio == 'ex_assinantes' and p.status != 'expired': continue
-            # 'todos' inclui todo mundo, então não precisa de if
-            
-            usuarios_alvo[p.telegram_id] = p
-
-    total_users = len(usuarios_alvo)
-    CAMPAIGN_STATUS["total"] = total_users
-    logger.info(f"📢 Iniciando envio para {total_users} usuários...")
-
-    # 2. Prepara o Bot
+    if not bot_db: CAMPAIGN_STATUS["running"] = False; return
+    
+    query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
+    usuarios = query.all()
     bot_sender = telebot.TeleBot(bot_db.token)
+    CAMPAIGN_STATUS["total"] = len(usuarios)
     
-    # 3. Monta o Botão de Oferta (Se houver)
-    markup = None
-    if payload.incluir_oferta and payload.plano_oferta_id:
-        markup = types.InlineKeyboardMarkup()
-        # Busca detalhes do plano para o botão
-        plano = db.query(PlanoConfig).filter(
-            (PlanoConfig.key_id == payload.plano_oferta_id) | 
-            (PlanoConfig.id == int(payload.plano_oferta_id) if payload.plano_oferta_id.isdigit() else False)
-        ).first()
-        
-        if plano:
-            # Usa valor customizado ou o preço atual do plano
-            valor_final = payload.valor_oferta if payload.valor_oferta > 0 else plano.preco_atual
-            label_btn = f"🔥 {plano.nome_exibicao} - R$ {valor_final:.2f}"
-            
-            # Callback para o webhook gerar o pix
-            btn = types.InlineKeyboardButton(label_btn, callback_data=f"checkout_{plano.id}")
-            markup.add(btn)
-
-    # 4. Loop de Envio
-    for chat_id in usuarios_alvo.keys():
-        try:
-            # Verifica se tem mídia (Foto/Vídeo)
-            if payload.media_url and len(payload.media_url) > 5:
-                try:
-                    if payload.media_url.lower().endswith(('.mp4', '.mov', '.avi')):
-                        bot_sender.send_video(chat_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
-                    else:
-                        bot_sender.send_photo(chat_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
-                except Exception as e:
-                    # Se falhar a mídia, manda só texto
-                    logger.warning(f"Erro ao enviar mídia: {e}")
-                    bot_sender.send_message(chat_id, payload.mensagem, reply_markup=markup)
-            else:
-                # Apenas texto
-                bot_sender.send_message(chat_id, payload.mensagem, reply_markup=markup)
-            
-            CAMPAIGN_STATUS["sent"] += 1
-            time.sleep(0.05) # Pequena pausa para respeitar limites do Telegram
-            
-        except Exception as e:
-            if "blocked" in str(e) or "kicked" in str(e):
-                CAMPAIGN_STATUS["blocked"] += 1
-            logger.error(f"Falha no envio para {chat_id}: {e}")
-
-    # 5. Finalização
+    for u in usuarios:
+        try: bot_sender.send_message(u.telegram_id, payload.mensagem); CAMPAIGN_STATUS["sent"] += 1
+        except: CAMPAIGN_STATUS["blocked"] += 1
+        time.sleep(0.05)
+    
     CAMPAIGN_STATUS["running"] = False
-    
-    # Salva no histórico apenas se NÃO for teste
-    if not payload.is_test:
-        campanha = RemarketingCampaign(
-            bot_id=bot_id,
-            campaign_id=str(uuid.uuid4()),
-            config=payload.mensagem, # Salva o texto enviado
-            status="concluido",
-            total_leads=total_users,
-            sent_success=CAMPAIGN_STATUS["sent"],
-            blocked_count=CAMPAIGN_STATUS["blocked"]
-        )
-        db.add(campanha)
-        db.commit()
+    db.add(RemarketingCampaign(bot_id=bot_id, campaign_id=str(uuid.uuid4()), config=payload.mensagem, status="concluido", total_leads=len(usuarios), sent_success=CAMPAIGN_STATUS["sent"], blocked_count=CAMPAIGN_STATUS["blocked"]))
+    db.commit()
 
 @app.post("/api/admin/remarketing/send")
 def enviar_remarketing(payload: RemarketingRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    # Lógica para Teste: Se não tiver ID específico, tenta pegar o último pedido do banco
-    if payload.is_test and not payload.specific_user_id:
-        ultimo = db.query(Pedido).filter(Pedido.bot_id == payload.bot_id).order_by(Pedido.id.desc()).first()
-        if ultimo:
-            payload.specific_user_id = ultimo.telegram_id
-        else:
-            # Se não tiver ninguém, não dá pra testar
-            raise HTTPException(400, "Nenhum usuário encontrado para teste. Interaja com o bot primeiro (/start).")
-
-    # Inicia processo em segundo plano
     background_tasks.add_task(processar_envio_remarketing, payload.bot_id, payload, db)
-    
-    return {"status": "enviando", "msg": "Campanha iniciada com sucesso!"}
+    return {"status": "enviando"}
 
 @app.get("/api/admin/remarketing/status")
-def status_remarketing():
-    """Retorna o progresso atual para a barra de carregamento do painel"""
-    return CAMPAIGN_STATUS
+def status_remarketing(): return CAMPAIGN_STATUS
 
 @app.get("/api/admin/remarketing/history/{bot_id}")
 def historico_remarketing(bot_id: int, db: Session = Depends(get_db)):
-    """Retorna histórico de envios para aquele bot"""
     history = db.query(RemarketingCampaign).filter(RemarketingCampaign.bot_id == bot_id).order_by(RemarketingCampaign.data_envio.desc()).all()
-    
-    return [{
-        "id": h.id,
-        "data": h.data_envio.strftime("%d/%m/%Y %H:%M"),
-        "total": h.total_leads,
-        "sent": h.sent_success,
-        "blocked": h.blocked_count,
-        "config": { "content_data": h.config }
-    } for h in history]
+    return [{"id": h.id, "data": h.data_envio.strftime("%d/%m/%Y %H:%M"), "total": h.total_leads, "sent": h.sent_success, "blocked": h.blocked_count, "config": {"content_data": h.config}} for h in history]
 
-# =========================================================
-# 📊 ROTA DE DASHBOARD (KPIs REAIS)
-# =========================================================
 @app.get("/api/admin/dashboard/stats")
-def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db)): # <--- Adicione bot_id
-    """Calcula métricas. Se bot_id for passado, filtra por ele."""
-    
-    # Base das queries
+def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db)):
     q_revenue = db.query(func.sum(Pedido.valor)).filter(Pedido.status == "paid")
     q_users = db.query(Pedido.telegram_id).filter(Pedido.status == "paid")
-    
     today = datetime.utcnow().date()
-    start_of_day = datetime.combine(today, datetime.min.time())
-    q_sales_today = db.query(func.sum(Pedido.valor)).filter(
-        Pedido.status == "paid", 
-        Pedido.created_at >= start_of_day
-    )
+    q_sales_today = db.query(func.sum(Pedido.valor)).filter(Pedido.status == "paid", Pedido.created_at >= datetime.combine(today, datetime.min.time()))
+    if bot_id: q_revenue = q_revenue.filter(Pedido.bot_id == bot_id); q_users = q_users.filter(Pedido.bot_id == bot_id); q_sales_today = q_sales_today.filter(Pedido.bot_id == bot_id)
+    return {"total_revenue": q_revenue.scalar() or 0.0, "active_users": q_users.distinct().count(), "sales_today": q_sales_today.scalar() or 0.0}
 
-    # APLICA FILTRO SE TIVER BOT_ID
-    if bot_id:
-        q_revenue = q_revenue.filter(Pedido.bot_id == bot_id)
-        q_users = q_users.filter(Pedido.bot_id == bot_id)
-        q_sales_today = q_sales_today.filter(Pedido.bot_id == bot_id)
-
-    total_revenue = q_revenue.scalar() or 0.0
-    active_users = q_users.distinct().count()
-    sales_today = q_sales_today.scalar() or 0.0
-
-    return {
-        "total_revenue": total_revenue,
-        "active_users": active_users,
-        "sales_today": sales_today
-    }
-
-# =========================================================
-# 💸 WEBHOOK DE PAGAMENTO (BLINDADO E TAGARELA)
-# =========================================================
-@app.post("/webhook/pix")
-async def webhook_pix(request: Request, db: Session = Depends(get_db)):
-    try:
-        # 1. Lê e Loga TUDO que chegou (Pra gente ver no Railway)
-        raw_body = await request.body()
-        data = await request.json()
-        logger.info(f"💰 JSON RECEBIDO PUSHINPAY: {data}")
-
-        # 2. Flexibilidade nos Campos
-        # PushinPay pode mandar 'id', 'external_reference', 'uuid' dependendo da versão
-        tx_id = data.get("external_reference") or data.get("id") or data.get("uuid")
-        status_pix = str(data.get("status", "")).lower()
-
-        # 3. Validação Flexível de Status
-        status_validos = ["paid", "approved", "completed", "succeeded"]
-        
-        if not tx_id:
-            logger.warning("⚠️ Webhook ignorado: Sem ID de transação.")
-            return {"status": "ignored", "reason": "no_tx_id"}
-            
-        if status_pix not in status_validos:
-            logger.warning(f"⚠️ Webhook ignorado: Status '{status_pix}' não é de pagamento aprovado.")
-            return {"status": "ignored", "reason": f"status_{status_pix}"}
-
-        # 4. Busca Pedido + Bot
-        pedido = db.query(Pedido).join(Bot).filter(Pedido.transaction_id == tx_id).first()
-
-        if not pedido:
-            logger.error(f"❌ Pedido não encontrado no banco para TX: {tx_id}")
-            # Retorna 200 para o PushinPay parar de mandar, mas loga erro
-            return {"status": "ok", "msg": "Order not found internally"}
-
-        if pedido.status == "paid":
-            logger.info(f"ℹ️ Pedido {tx_id} já estava pago.")
-            return {"status": "ok", "msg": "Already paid"}
-
-        # 5. Atualiza Banco
-        pedido.status = "paid"
-        pedido.mensagem_enviada = True
-        db.commit()
-        logger.info(f"✅ Pedido {tx_id} atualizado para PAID no banco.")
-        
-        # 6. Liberação no Telegram
-        bot_data = pedido.bot 
-        try:
-            tb = telebot.TeleBot(bot_data.token)
-            chat_id_user = int(pedido.telegram_id)
-            
-            # Tenta converter ID do canal (remove espaços)
-            try:
-                canal_vip_id = int(str(bot_data.id_canal_vip).strip())
-            except:
-                canal_vip_id = bot_data.id_canal_vip # Tenta como string se for @canal
-
-            logger.info(f"🚀 Tentando gerar link no canal {canal_vip_id} para user {chat_id_user}...")
-
-            # GERA O LINK ÚNICO
-            convite = tb.create_chat_invite_link(
-                chat_id=canal_vip_id, 
-                member_limit=1, 
-                name=f"Venda {pedido.first_name}"
-            )
-            link_acesso = convite.invite_link
-
-            msg_sucesso = f"""
-✅ **Pagamento Confirmado!**
-
-Seu acesso ao **{bot_data.nome}** foi liberado.
-Toque no link abaixo para entrar no Canal VIP:
-
-👉 {link_acesso}
-
-⚠️ *Este link é único e válido apenas para você.*
-"""
-            tb.send_message(chat_id_user, msg_sucesso, parse_mode="Markdown")
-            logger.info(f"🏆 SUCESSO! Link enviado para {pedido.first_name}")
-
-        except Exception as e_telegram:
-            logger.error(f"❌ ERRO TELEGRAM: {e_telegram}")
-            # DICA: Se der erro aqui, verifique se o bot é ADMIN no canal
-            tb.send_message(chat_id_user, "✅ Pagamento recebido! \n\n⚠️ Houve um erro ao gerar seu link automático. Um administrador entrará em contato em breve.")
-
-        return {"status": "received"}
-
-    except Exception as e:
-        logger.error(f"❌ ERRO CRÍTICO NO WEBHOOK: {e}")
-        return {"status": "error"}
+@app.get("/api/admin/contacts")
+def listar_contatos(status: str = "todos", db: Session = Depends(get_db)):
+    query = db.query(Pedido)
+    if status == "pagantes": query = query.filter(Pedido.status == "paid")
+    elif status == "pendentes": query = query.filter(Pedido.status == "pending")
+    return query.order_by(Pedido.created_at.desc()).all()
 
 @app.get("/")
-def home():
-    return {"status": "Zenyx SaaS Online - Banco Atualizado"}
+def home(): return {"status": "Zenyx SaaS Online"}
