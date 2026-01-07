@@ -608,23 +608,29 @@ def historico_remarketing(bot_id: int, db: Session = Depends(get_db)):
 # 📊 ROTA DE DASHBOARD (KPIs REAIS)
 # =========================================================
 @app.get("/api/admin/dashboard/stats")
-def dashboard_stats(db: Session = Depends(get_db)):
-    """Calcula métricas reais baseadas nos pedidos"""
+def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db)): # <--- Adicione bot_id
+    """Calcula métricas. Se bot_id for passado, filtra por ele."""
     
-    # 1. Faturamento Total (Soma de todos os 'paid')
-    total_revenue = db.query(func.sum(Pedido.valor)).filter(Pedido.status == "paid").scalar() or 0.0
+    # Base das queries
+    q_revenue = db.query(func.sum(Pedido.valor)).filter(Pedido.status == "paid")
+    q_users = db.query(Pedido.telegram_id).filter(Pedido.status == "paid")
     
-    # 2. Assinantes (Total de pagantes únicos ou ativos)
-    active_users = db.query(Pedido.telegram_id).filter(Pedido.status == "paid").distinct().count()
-    
-    # 3. Vendas Hoje
     today = datetime.utcnow().date()
     start_of_day = datetime.combine(today, datetime.min.time())
-    
-    sales_today = db.query(func.sum(Pedido.valor)).filter(
+    q_sales_today = db.query(func.sum(Pedido.valor)).filter(
         Pedido.status == "paid", 
         Pedido.created_at >= start_of_day
-    ).scalar() or 0.0
+    )
+
+    # APLICA FILTRO SE TIVER BOT_ID
+    if bot_id:
+        q_revenue = q_revenue.filter(Pedido.bot_id == bot_id)
+        q_users = q_users.filter(Pedido.bot_id == bot_id)
+        q_sales_today = q_sales_today.filter(Pedido.bot_id == bot_id)
+
+    total_revenue = q_revenue.scalar() or 0.0
+    active_users = q_users.distinct().count()
+    sales_today = q_sales_today.scalar() or 0.0
 
     return {
         "total_revenue": total_revenue,
