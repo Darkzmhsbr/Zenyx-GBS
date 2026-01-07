@@ -8,7 +8,7 @@ import urllib.parse
 import time
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from telebot import types  # <--- CORRIGIDO: IMPORT NECESSÁRIO PRO BOT
+from telebot import types  # Import essencial para os botões
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func
@@ -106,7 +106,7 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         logger.error(f"Exceção PushinPay: {e}")
         return None
 
-# --- MODELOS (EXPANDIDOS PARA EVITAR ERRO DE SINTAXE) ---
+# --- MODELOS ---
 class IntegrationUpdate(BaseModel):
     token: str
 
@@ -150,7 +150,7 @@ class RemarketingRequest(BaseModel):
     specific_user_id: Optional[str] = None
 
 # =========================================================
-# 💰 ROTA WEBHOOK PIX (CORRIGIDA: LOWERCASE + POLYGLOT)
+# 💰 ROTA WEBHOOK PIX (HÍBRIDA E CORRIGIDA)
 # =========================================================
 @app.post("/webhook/pix")
 async def webhook_pix(request: Request, db: Session = Depends(get_db)):
@@ -179,11 +179,11 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
                 print(f"❌ Falha ao ler dados: {e_parse}")
                 return {"status": "error", "reason": "invalid_format"}
 
-        # Extrai dados e FORÇA MINÚSCULO NO ID
-        tx_id = data.get("external_reference") or data.get("id") or data.get("uuid")
-        if tx_id:
-            tx_id = str(tx_id).lower() # <--- AQUI ESTAVA O ERRO (CORRIGIDO)
-            
+        # Extrai dados (Prioridade para 'id' pois o PushinPay retorna ele no webhook)
+        # Forçamos tudo para string e minúsculo para garantir o match
+        raw_tx_id = data.get("id") or data.get("external_reference") or data.get("uuid")
+        tx_id = str(raw_tx_id).lower() if raw_tx_id else None
+        
         status_pix = str(data.get("status", "")).lower()
         
         print(f"🔎 Processando: ID={tx_id} | Status={status_pix}")
@@ -192,8 +192,9 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
             print(f"⚠️ Status ignorado: {status_pix}")
             return {"status": "ignored"}
 
-        # Busca Pedido com JOIN para garantir conexão
-        pedido = db.query(Pedido).join(Bot).filter(Pedido.transaction_id == tx_id).first()
+        # Busca Pedido SEM JOIN primeiro (para evitar erro de instância desconectada se falhar)
+        # O ID salvo no banco agora será compatível com o ID que chega aqui
+        pedido = db.query(Pedido).filter(Pedido.transaction_id == tx_id).first()
 
         if not pedido:
             print(f"❌ Pedido {tx_id} não encontrado no banco.")
@@ -209,23 +210,27 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         db.commit()
         print(f"✅ Pedido {tx_id} PAGO!")
         
-        # ENVIA TELEGRAM
-        bot_data = pedido.bot 
+        # ENVIA TELEGRAM (Agora recarregamos o bot com segurança)
         try:
-            tb = telebot.TeleBot(bot_data.token)
-            
-            try: canal_id = int(str(bot_data.id_canal_vip).strip())
-            except: canal_id = bot_data.id_canal_vip
+            # Recarrega o bot associado ao pedido
+            bot_data = db.query(Bot).filter(Bot.id == pedido.bot_id).first()
+            if bot_data:
+                tb = telebot.TeleBot(bot_data.token)
+                
+                try: canal_id = int(str(bot_data.id_canal_vip).strip())
+                except: canal_id = bot_data.id_canal_vip
 
-            convite = tb.create_chat_invite_link(
-                chat_id=canal_id, 
-                member_limit=1, 
-                name=f"Venda {pedido.first_name}"
-            )
-            
-            msg = f"✅ **Pagamento Confirmado!**\n\nSeu acesso exclusivo:\n👉 {convite.invite_link}"
-            tb.send_message(int(pedido.telegram_id), msg, parse_mode="Markdown")
-            print("🏆 LINK ENVIADO!")
+                convite = tb.create_chat_invite_link(
+                    chat_id=canal_id, 
+                    member_limit=1, 
+                    name=f"Venda {pedido.first_name}"
+                )
+                
+                msg = f"✅ **Pagamento Confirmado!**\n\nSeu acesso exclusivo:\n👉 {convite.invite_link}"
+                tb.send_message(int(pedido.telegram_id), msg, parse_mode="Markdown")
+                print("🏆 LINK ENVIADO!")
+            else:
+                print("❌ Bot não encontrado para enviar mensagem.")
 
         except Exception as e_tg:
             print(f"❌ Erro Telegram: {e_tg}")
@@ -276,10 +281,10 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
 
         elif update.callback_query and update.callback_query.data == "passo_2":
             chat_id = update.callback_query.message.chat.id
-            msg_id = update.callback_query.message.message_id # ID para apagar
+            msg_id = update.callback_query.message.message_id 
             fluxo = bot_db.fluxo
             
-            # --- 🔥 AUTODESTRUIÇÃO DA MENSAGEM ANTERIOR (MANTIDA) ---
+            # --- 🔥 AUTODESTRUIÇÃO MANTIDA AQUI ---
             if fluxo and fluxo.autodestruir_1:
                 try:
                     bot_temp.delete_message(chat_id, msg_id)
@@ -293,7 +298,6 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                 for p in bot_db.planos:
                     markup.add(types.InlineKeyboardButton(text=f"{p.nome_exibicao} - R$ {p.preco_atual:.2f}", callback_data=f"checkout_{p.id}"))
             
-            # Mídia 2 (Vídeo/Foto da Oferta)
             media_2 = fluxo.msg_2_media if (fluxo and fluxo.msg_2_media) else None
             
             if media_2:
@@ -309,7 +313,7 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             
             bot_temp.answer_callback_query(update.callback_query.id)
 
-        # --- CHECKOUT (MANTIDO INTACTO) ---
+        # --- CHECKOUT (CORRIGIDO PARA SALVAR O ID REAL DO PUSHINPAY) ---
         elif update.callback_query and update.callback_query.data.startswith("checkout_"):
             chat_id = update.callback_query.message.chat.id
             plano_id = update.callback_query.data.split("_")[1]
@@ -321,15 +325,24 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
 
             msg_aguarde = bot_temp.send_message(chat_id, "⏳ Gerando seu PIX, aguarde...")
             
-            tx_id = str(uuid.uuid4())
-            pix_data = gerar_pix_pushinpay(plano.preco_atual, tx_id)
+            # Gera UUID para referência externa
+            temp_uuid = str(uuid.uuid4())
+            
+            # Chama API
+            pix_data = gerar_pix_pushinpay(plano.preco_atual, temp_uuid)
             
             if pix_data:
                 qr_code_text = pix_data.get("qr_code_text") or pix_data.get("qr_code")
                 
+                # --- A CORREÇÃO DE OURO ---
+                # Pegamos o ID que o PushinPay retornou (se existir) e usamos como transaction_id
+                # Se não, usamos nosso UUID. E convertemos pra minúsculo para garantir.
+                provider_id = pix_data.get("id") or temp_uuid
+                final_tx_id = str(provider_id).lower()
+
                 novo_pedido = Pedido(
                     bot_id=bot_db.id,
-                    transaction_id=tx_id,
+                    transaction_id=final_tx_id, # <--- AQUI ESTAVA O ERRO, AGORA ESTÁ CORRIGIDO
                     telegram_id=str(chat_id),
                     first_name=update.callback_query.from_user.first_name,
                     username=update.callback_query.from_user.username,
