@@ -3,7 +3,7 @@ import logging
 import telebot
 import requests
 import uuid
-import json  # <--- ADICIONE AQUI
+import urllib.parse # <--- ADICIONE ESTE NOVO IMPORT
 from fastapi import BackgroundTasks # <--- IMPORTANTE
 import time
 from sqlalchemy import text  # Importante para o SQL
@@ -312,65 +312,77 @@ def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
     return {"status": "saved"}
 
 # =========================================================
-# 💰 ROTA WEBHOOK PIX (VERSÃO DEBUGGER - A PROVA DE FALHAS)
+# 💰 ROTA WEBHOOK PIX (VERSÃO HÍBRIDA: JSON + FORM DATA)
 # =========================================================
 @app.post("/webhook/pix")
 async def webhook_pix(request: Request, db: Session = Depends(get_db)):
+    print("🔔 WEBHOOK PIX RECEBIDO!") 
     try:
-        # 1. LÊ O CORPO COMO TEXTO PURO PRIMEIRO (Pra não dar erro de JSON vazio)
+        # 1. PEGA O CORPO BRUTO
         body_bytes = await request.body()
         body_str = body_bytes.decode("utf-8")
         
-        logger.info(f"📝 RAW BODY RECEBIDO: '{body_str}'") # Vai mostrar aspas vazias '' se não vier nada
+        print(f"📦 BODY: {body_str}") # Log para conferência
 
         if not body_str:
-            logger.warning("⚠️ Webhook ignorado: Corpo da requisição está vazio!")
             return {"status": "ignored", "reason": "empty_body"}
 
-        # 2. TENTA CONVERTER MANUALMENTE
+        # 2. TENTA DECIFRAR (JSON OU FORM DATA)
+        data = {}
         try:
+            # Tentativa A: É JSON?
             data = json.loads(body_str)
         except json.JSONDecodeError:
-            logger.error("❌ O conteúdo recebido não é um JSON válido.")
-            return {"status": "error", "reason": "invalid_json"}
+            # Tentativa B: É Form Data? (O caso do seu erro)
+            try:
+                parsed = urllib.parse.parse_qs(body_str)
+                # Converte {'id': ['123']} para {'id': '123'}
+                data = {k: v[0] for k, v in parsed.items()}
+                print("✅ Formato Form-Data detectado e convertido!")
+            except Exception as e_parse:
+                print(f"❌ Não consegui ler o formato: {e_parse}")
+                return {"status": "error", "reason": "invalid_format"}
 
-        logger.info(f"💰 JSON PROCESSADO: {data}")
-
-        # 3. SEGUE A LÓGICA NORMAL...
+        # 3. EXTRAI OS DADOS (Agora funciona para os dois formatos)
+        # No seu log, o ID veio no campo 'id', então damos prioridade a ele se não tiver external_reference
         tx_id = data.get("external_reference") or data.get("id") or data.get("uuid")
         status_pix = str(data.get("status", "")).lower()
         
-        # Aceita vários status de sucesso
-        if status_pix not in ["paid", "approved", "completed", "succeeded"]:
-            logger.warning(f"⚠️ Status ignorado: {status_pix}")
-            return {"status": "ignored", "reason": f"status_{status_pix}"}
+        print(f"🔎 Processando: ID={tx_id} | Status={status_pix}")
 
-        # 4. BUSCA PEDIDO
+        # 4. VALIDA STATUS
+        if status_pix not in ["paid", "approved", "completed", "succeeded"]:
+            print(f"⚠️ Status ignorado: {status_pix}")
+            return {"status": "ignored"}
+
+        # 5. BUSCA O PEDIDO NO BANCO
+        # IMPORTANTE: O .join(Bot) previne o erro de conexão fechada
         pedido = db.query(Pedido).join(Bot).filter(Pedido.transaction_id == tx_id).first()
 
         if not pedido:
-            logger.error(f"❌ Pedido não encontrado para TX: {tx_id}")
+            print(f"❌ Pedido {tx_id} não encontrado no banco.")
+            # Dica: Se cair aqui, é porque o PushinPay mandou um ID diferente do que geramos.
+            # Nesse caso, teremos que ajustar a criação do pedido, mas vamos testar assim primeiro.
             return {"status": "ok", "msg": "Order not found"}
 
         if pedido.status == "paid":
-            logger.info("ℹ️ Pedido já estava pago.")
+            print("ℹ️ Pedido já estava pago.")
             return {"status": "ok", "msg": "Already paid"}
 
-        # 5. ATUALIZA E ENVIA
+        # 6. ATUALIZA STATUS PARA PAGO
         pedido.status = "paid"
         pedido.mensagem_enviada = True
         db.commit()
+        print(f"✅ Pedido {tx_id} aprovado!")
         
+        # 7. ENTREGA O ACESSO (Telegram)
         bot_data = pedido.bot 
         try:
             tb = telebot.TeleBot(bot_data.token)
-            chat_id_user = int(pedido.telegram_id)
             
-            # Tenta limpar o ID do canal
-            try:
-                canal_id = int(str(bot_data.id_canal_vip).strip())
-            except:
-                canal_id = bot_data.id_canal_vip
+            # Ajuste seguro do ID do canal
+            try: canal_id = int(str(bot_data.id_canal_vip).strip())
+            except: canal_id = bot_data.id_canal_vip
 
             # Gera Link Único
             convite = tb.create_chat_invite_link(
@@ -379,17 +391,20 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
                 name=f"Venda {pedido.first_name}"
             )
             
-            msg_sucesso = f"✅ **Pagamento Confirmado!**\n\nToque para entrar:\n👉 {convite.invite_link}"
-            tb.send_message(chat_id_user, msg_sucesso, parse_mode="Markdown")
-            logger.info(f"🏆 SUCESSO! Link enviado para {pedido.first_name}")
+            msg = f"✅ **Pagamento Confirmado!**\n\nSeu link de acesso exclusivo:\n👉 {convite.invite_link}"
+            tb.send_message(int(pedido.telegram_id), msg, parse_mode="Markdown")
+            print("🏆 LINK ENVIADO COM SUCESSO!")
 
         except Exception as e_tg:
-            logger.error(f"❌ Erro Telegram: {e_tg}")
+            print(f"❌ Erro ao enviar link no Telegram: {e_tg}")
+            # Tenta avisar o usuário do erro
+            try: tb.send_message(int(pedido.telegram_id), "✅ Pagamento recebido! Erro ao gerar link. Contate o suporte.")
+            except: pass
 
         return {"status": "received"}
 
     except Exception as e:
-        logger.error(f"❌ Erro Crítico Webhook: {e}")
+        print(f"❌ ERRO CRÍTICO: {e}")
         return {"status": "error"}
 
 # =========================================================
