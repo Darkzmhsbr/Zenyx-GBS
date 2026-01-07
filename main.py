@@ -94,6 +94,19 @@ def get_pushin_token():
     finally:
         db.close()
 
+# =========================================================
+# 🔌 INTEGRAÇÃO PUSHIN PAY (LINK CORRIGIDO FIXO)
+# =========================================================
+def get_pushin_token():
+    db = SessionLocal()
+    try:
+        config = db.query(SystemConfig).filter(SystemConfig.key == "pushin_pay_token").first()
+        if config and config.value:
+            return config.value
+        return os.getenv("PUSHIN_PAY_TOKEN")
+    finally:
+        db.close()
+
 def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
     token = get_pushin_token()
     
@@ -101,7 +114,6 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         logger.error("❌ Token Pushin Pay não configurado!")
         return None
     
-    # [cite_start]Endpoint correto conforme Documentação Oficial (Pág 1) [cite: 13]
     url = "https://api.pushinpay.com.br/api/pix/cashIn"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -109,14 +121,19 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         "Accept": "application/json"
     }
     
-    # [cite_start]Valor em centavos conforme Documentação Oficial (Pág 1) [cite: 24]
+    # 👇 AQUI ESTAVA O ERRO! COLOQUEI SEU LINK FIXO AGORA 👇
+    seus_dominio = "zenyx-gbs-production.up.railway.app" 
+    
     payload = {
         "value": int(valor_float * 100), 
-        "webhook_url": f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}/webhook/pix",
+        "webhook_url": f"https://{seus_dominio}/webhook/pix", # <--- FIXO E SEGURO
         "external_reference": transaction_id
     }
 
     try:
+        # Adicionei logs aqui para vermos se a CRIAÇÃO está certa
+        logger.info(f"📤 Gerando PIX. Webhook definido para: https://{seus_dominio}/webhook/pix")
+        
         response = requests.post(url, json=payload, headers=headers, timeout=10)
         if response.status_code in [200, 201]:
             return response.json()
