@@ -3,9 +3,9 @@ import logging
 import telebot
 import requests
 import uuid
-import json  # <--- AGORA O JSON ESTÁ AQUI
+import json
+import urllib.parse
 import time
-import urllib.parse # <--- IMPORTANTE PARA LER O PUSHINPAY
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -85,7 +85,7 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         "Accept": "application/json"
     }
     
-    # URL FIXA DO RAILWAY (PELO SEU LOG ANTERIOR)
+    # URL FIXA DO RAILWAY
     seus_dominio = "zenyx-gbs-production.up.railway.app" 
     
     payload = {
@@ -105,16 +105,51 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         logger.error(f"Exceção PushinPay: {e}")
         return None
 
-# --- MODELOS ---
-class IntegrationUpdate(BaseModel): token: str
-class BotCreate(BaseModel): nome: str; token: str; id_canal_vip: str
-class BotResponse(BotCreate): id: int; status: str; class Config: from_attributes = True
-class PlanoCreate(BaseModel): bot_id: int; nome_exibicao: str; preco: float; dias_duracao: int
-class FlowUpdate(BaseModel): msg_boas_vindas: str; media_url: Optional[str] = None; btn_text_1: str; autodestruir_1: bool; msg_2_texto: Optional[str] = None; msg_2_media: Optional[str] = None; mostrar_planos_2: bool
-class RemarketingRequest(BaseModel): bot_id: int; tipo_envio: str; mensagem: str; media_url: Optional[str] = None; incluir_oferta: bool = False; plano_oferta_id: Optional[str] = None; valor_oferta: Optional[float] = 0.0; expire_timestamp: Optional[int] = 0; is_periodic: bool = False; is_test: bool = False; specific_user_id: Optional[str] = None
+# --- MODELOS (CLASSES EXPANDIDAS PARA EVITAR ERRO DE SINTAXE) ---
+class IntegrationUpdate(BaseModel):
+    token: str
+
+class BotCreate(BaseModel):
+    nome: str
+    token: str
+    id_canal_vip: str
+
+class BotResponse(BotCreate):
+    id: int
+    status: str
+    class Config:
+        from_attributes = True
+
+class PlanoCreate(BaseModel):
+    bot_id: int
+    nome_exibicao: str
+    preco: float
+    dias_duracao: int
+
+class FlowUpdate(BaseModel):
+    msg_boas_vindas: str
+    media_url: Optional[str] = None
+    btn_text_1: str
+    autodestruir_1: bool
+    msg_2_texto: Optional[str] = None
+    msg_2_media: Optional[str] = None
+    mostrar_planos_2: bool
+
+class RemarketingRequest(BaseModel):
+    bot_id: int
+    tipo_envio: str
+    mensagem: str
+    media_url: Optional[str] = None
+    incluir_oferta: bool = False
+    plano_oferta_id: Optional[str] = None
+    valor_oferta: Optional[float] = 0.0
+    expire_timestamp: Optional[int] = 0
+    is_periodic: bool = False
+    is_test: bool = False
+    specific_user_id: Optional[str] = None
 
 # =========================================================
-# 💰 ROTA WEBHOOK PIX (A CORREÇÃO DEFINITIVA)
+# 💰 ROTA WEBHOOK PIX (HÍBRIDA: JSON + FORM DATA)
 # =========================================================
 @app.post("/webhook/pix")
 async def webhook_pix(request: Request, db: Session = Depends(get_db)):
@@ -134,7 +169,7 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
             # Tenta JSON primeiro
             data = json.loads(body_str)
         except:
-            # Se falhar, tenta Form Data (igual seu arquivo de referência)
+            # Se falhar, tenta Form Data
             try:
                 parsed = urllib.parse.parse_qs(body_str)
                 data = {k: v[0] for k, v in parsed.items()}
@@ -196,7 +231,7 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         return {"status": "received"}
 
     except Exception as e:
-        print(f"❌ ERRO CRÍTICO NO CODE: {e}") # Agora vai imprimir o erro real se houver
+        print(f"❌ ERRO CRÍTICO NO CODE: {e}")
         return {"status": "error"}
 
 # ===========================
@@ -204,7 +239,7 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
 # ===========================
 @app.post("/webhook/{bot_token}")
 async def receber_update_telegram(bot_token: str, request: Request, db: Session = Depends(get_db)):
-    if bot_token == "pix": return {"status": "ignored_loop"} # Proteção extra
+    if bot_token == "pix": return {"status": "ignored_loop"}
 
     bot_db = db.query(Bot).filter(Bot.token == bot_token).first()
     if not bot_db: return {"status": "ignored"}
@@ -260,36 +295,66 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             
             bot_temp.answer_callback_query(update.callback_query.id)
 
+        # --- 3. CHECKOUT (GERAR PIX) --- [MANTIDO EXATAMENTE COMO SOLICITADO]
         elif update.callback_query and update.callback_query.data.startswith("checkout_"):
             chat_id = update.callback_query.message.chat.id
             plano_id = update.callback_query.data.split("_")[1]
+            
+            # Busca plano no DB
             plano = db.query(PlanoConfig).filter(PlanoConfig.id == plano_id).first()
+            if not plano:
+                bot_temp.send_message(chat_id, "Plano não encontrado.")
+                return {"status": "error"}
+
+            # Avisa que está gerando
+            msg_aguarde = bot_temp.send_message(chat_id, "⏳ Gerando seu PIX, aguarde...")
             
-            if plano:
-                msg_wait = bot_temp.send_message(chat_id, "⏳ Gerando PIX...")
-                tx_id = str(uuid.uuid4())
-                pix_data = gerar_pix_pushinpay(plano.preco_atual, tx_id)
+            # Gera ID único para transação
+            tx_id = str(uuid.uuid4())
+            
+            # --- CHAMA PUSHIN PAY ---
+            pix_data = gerar_pix_pushinpay(plano.preco_atual, tx_id)
+            
+            if pix_data:
+                qr_code_text = pix_data.get("qr_code_text") # Ajuste conforme retorno da API
+                if not qr_code_text: qr_code_text = pix_data.get("qr_code") # Tentativa secundária
                 
-                if pix_data:
-                    qr_code = pix_data.get("qr_code_text") or pix_data.get("qr_code")
-                    novo_pedido = Pedido(
-                        bot_id=bot_db.id, transaction_id=tx_id, telegram_id=str(chat_id),
-                        first_name=update.callback_query.from_user.first_name,
-                        username=update.callback_query.from_user.username,
-                        plano_nome=plano.nome_exibicao, valor=plano.preco_atual,
-                        status="pending", qr_code=qr_code
-                    )
-                    db.add(novo_pedido)
-                    db.commit()
-                    
-                    try: bot_temp.delete_message(chat_id, msg_wait.message_id)
-                    except: pass
-                    
-                    msg_pix = f"💰 **Pagamento Gerado**\nValor: R$ {plano.preco_atual:.2f}\n\nCopia e Cola:\n`{qr_code}`"
-                    bot_temp.send_message(chat_id, msg_pix, parse_mode="Markdown")
-                else:
-                    bot_temp.send_message(chat_id, "❌ Erro ao gerar PIX.")
-            
+                # Salva pedido no Banco
+                novo_pedido = Pedido(
+                    bot_id=bot_db.id,
+                    transaction_id=tx_id,
+                    telegram_id=str(chat_id),
+                    first_name=update.callback_query.from_user.first_name,
+                    username=update.callback_query.from_user.username,
+                    plano_nome=plano.nome_exibicao,
+                    valor=plano.preco_atual,
+                    status="pending",
+                    qr_code=qr_code_text
+                )
+                db.add(novo_pedido)
+                db.commit()
+
+                # Apaga mensagem de "Aguarde"
+                try: bot_temp.delete_message(chat_id, msg_aguarde.message_id)
+                except: pass
+
+                # --- MENSAGEM FINAL IGUAL DO SEU EXEMPLO ---
+                legenda_pix = f"""🌟 Seu pagamento foi gerado com sucesso:
+🎁 Plano: {plano.nome_exibicao}
+💰 Valor: R$ {plano.preco_atual:.2f}
+🔐 Pague via Pix Copia e Cola:
+
+```
+{qr_code_text}
+```
+
+👆 Toque na chave PIX acima para copiá-la
+‼️ Após o pagamento, o acesso será liberado automaticamente!"""
+
+                bot_temp.send_message(chat_id, legenda_pix, parse_mode="Markdown")
+            else:
+                bot_temp.send_message(chat_id, "❌ Erro ao gerar PIX. Tente novamente ou contate o suporte.")
+
             bot_temp.answer_callback_query(update.callback_query.id)
 
         return {"status": "processed"}
@@ -299,11 +364,13 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
 
 # ROTAS API ADMIN
 @app.get("/api/admin/bots", response_model=List[BotResponse])
-def listar_bots(db: Session = Depends(get_db)): return db.query(Bot).all()
+def listar_bots(db: Session = Depends(get_db)):
+    return db.query(Bot).all()
 
 @app.post("/api/admin/bots", response_model=BotResponse)
 def criar_bot(bot_data: BotCreate, db: Session = Depends(get_db)):
-    if db.query(Bot).filter(Bot.token == bot_data.token).first(): raise HTTPException(400, "Token já cadastrado.")
+    if db.query(Bot).filter(Bot.token == bot_data.token).first():
+        raise HTTPException(status_code=400, detail="Token já cadastrado.")
     try:
         tb = telebot.TeleBot(bot_data.token)
         webhook_url = f"https://zenyx-gbs-production.up.railway.app/webhook/{bot_data.token}"
@@ -334,10 +401,12 @@ def criar_plano(plano: PlanoCreate, db: Session = Depends(get_db)):
     return {"status": "ok"}
 
 @app.get("/api/admin/plans/{bot_id}")
-def listar_planos(bot_id: int, db: Session = Depends(get_db)): return db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
+def listar_planos(bot_id: int, db: Session = Depends(get_db)):
+    return db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
 
 @app.delete("/api/admin/plans/{plan_id}")
-def deletar_plano(plan_id: int, db: Session = Depends(get_db)): db.query(PlanoConfig).filter(PlanoConfig.id == plan_id).delete(); db.commit(); return {"status": "deleted"}
+def deletar_plano(plan_id: int, db: Session = Depends(get_db)):
+    db.query(PlanoConfig).filter(PlanoConfig.id == plan_id).delete(); db.commit(); return {"status": "deleted"}
 
 @app.get("/api/admin/bots/{bot_id}/flow")
 def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
