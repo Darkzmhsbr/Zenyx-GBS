@@ -3,6 +3,7 @@ import logging
 import telebot
 import requests
 import uuid
+import json  # <--- ADICIONE AQUI
 from fastapi import BackgroundTasks # <--- IMPORTANTE
 import time
 from sqlalchemy import text  # Importante para o SQL
@@ -294,39 +295,55 @@ def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
     return {"status": "saved"}
 
 # =========================================================
-# 💰 ROTA WEBHOOK PIX (ESSENCIAL PARA LIBERAR ACESSO)
+# 💰 ROTA WEBHOOK PIX (VERSÃO DEBUGGER - A PROVA DE FALHAS)
 # =========================================================
 @app.post("/webhook/pix")
 async def webhook_pix(request: Request, db: Session = Depends(get_db)):
     try:
-        # 1. LOG DETALHADO DO QUE CHEGOU
-        data = await request.json()
-        logger.info(f"💰 JSON RECEBIDO PUSHINPAY: {data}")
+        # 1. LÊ O CORPO COMO TEXTO PURO PRIMEIRO (Pra não dar erro de JSON vazio)
+        body_bytes = await request.body()
+        body_str = body_bytes.decode("utf-8")
+        
+        logger.info(f"📝 RAW BODY RECEBIDO: '{body_str}'") # Vai mostrar aspas vazias '' se não vier nada
 
-        tx_id = data.get("external_reference") or data.get("id")
+        if not body_str:
+            logger.warning("⚠️ Webhook ignorado: Corpo da requisição está vazio!")
+            return {"status": "ignored", "reason": "empty_body"}
+
+        # 2. TENTA CONVERTER MANUALMENTE
+        try:
+            data = json.loads(body_str)
+        except json.JSONDecodeError:
+            logger.error("❌ O conteúdo recebido não é um JSON válido.")
+            return {"status": "error", "reason": "invalid_json"}
+
+        logger.info(f"💰 JSON PROCESSADO: {data}")
+
+        # 3. SEGUE A LÓGICA NORMAL...
+        tx_id = data.get("external_reference") or data.get("id") or data.get("uuid")
         status_pix = str(data.get("status", "")).lower()
         
         # Aceita vários status de sucesso
         if status_pix not in ["paid", "approved", "completed", "succeeded"]:
+            logger.warning(f"⚠️ Status ignorado: {status_pix}")
             return {"status": "ignored", "reason": f"status_{status_pix}"}
 
-        # 2. BUSCA PEDIDO + BOT (CARREGAMENTO FORÇADO)
-        # O .join(Bot) é crucial para evitar o erro de conexão perdida
+        # 4. BUSCA PEDIDO
         pedido = db.query(Pedido).join(Bot).filter(Pedido.transaction_id == tx_id).first()
 
         if not pedido:
-            logger.error(f"❌ Pedido não encontrado: {tx_id}")
+            logger.error(f"❌ Pedido não encontrado para TX: {tx_id}")
             return {"status": "ok", "msg": "Order not found"}
 
         if pedido.status == "paid":
+            logger.info("ℹ️ Pedido já estava pago.")
             return {"status": "ok", "msg": "Already paid"}
 
-        # 3. ATUALIZA BANCO
+        # 5. ATUALIZA E ENVIA
         pedido.status = "paid"
         pedido.mensagem_enviada = True
         db.commit()
         
-        # 4. LIBERA ACESSO TELEGRAM
         bot_data = pedido.bot 
         try:
             tb = telebot.TeleBot(bot_data.token)
@@ -347,20 +364,15 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
             
             msg_sucesso = f"✅ **Pagamento Confirmado!**\n\nToque para entrar:\n👉 {convite.invite_link}"
             tb.send_message(chat_id_user, msg_sucesso, parse_mode="Markdown")
-            logger.info(f"🏆 Link enviado para {pedido.first_name}")
+            logger.info(f"🏆 SUCESSO! Link enviado para {pedido.first_name}")
 
         except Exception as e_tg:
             logger.error(f"❌ Erro Telegram: {e_tg}")
-            # Tenta avisar o usuário mesmo se falhar o link
-            try:
-                tb.send_message(chat_id_user, "✅ Pagamento recebido! Houve um erro ao gerar o link. Contate o suporte.")
-            except:
-                pass
 
         return {"status": "received"}
 
     except Exception as e:
-        logger.error(f"❌ Erro Webhook: {e}")
+        logger.error(f"❌ Erro Crítico Webhook: {e}")
         return {"status": "error"}
 
 # =========================================================
