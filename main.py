@@ -8,7 +8,7 @@ import urllib.parse
 import time
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from telebot import types  # Import essencial para os botões
+from telebot import types
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func
@@ -150,7 +150,7 @@ class RemarketingRequest(BaseModel):
     specific_user_id: Optional[str] = None
 
 # =========================================================
-# 💰 ROTA WEBHOOK PIX (HÍBRIDA E CORRIGIDA)
+# 💰 ROTA WEBHOOK PIX (HÍBRIDA E COM PARSE HTML)
 # =========================================================
 @app.post("/webhook/pix")
 async def webhook_pix(request: Request, db: Session = Depends(get_db)):
@@ -179,8 +179,7 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
                 print(f"❌ Falha ao ler dados: {e_parse}")
                 return {"status": "error", "reason": "invalid_format"}
 
-        # Extrai dados (Prioridade para 'id' pois o PushinPay retorna ele no webhook)
-        # Forçamos tudo para string e minúsculo para garantir o match
+        # Extrai dados e força minúsculo para comparação segura
         raw_tx_id = data.get("id") or data.get("external_reference") or data.get("uuid")
         tx_id = str(raw_tx_id).lower() if raw_tx_id else None
         
@@ -192,8 +191,7 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
             print(f"⚠️ Status ignorado: {status_pix}")
             return {"status": "ignored"}
 
-        # Busca Pedido SEM JOIN primeiro (para evitar erro de instância desconectada se falhar)
-        # O ID salvo no banco agora será compatível com o ID que chega aqui
+        # Busca Pedido
         pedido = db.query(Pedido).filter(Pedido.transaction_id == tx_id).first()
 
         if not pedido:
@@ -210,9 +208,8 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         db.commit()
         print(f"✅ Pedido {tx_id} PAGO!")
         
-        # ENVIA TELEGRAM (Agora recarregamos o bot com segurança)
+        # ENVIA TELEGRAM (MODO HTML PARA EVITAR ERROS)
         try:
-            # Recarrega o bot associado ao pedido
             bot_data = db.query(Bot).filter(Bot.id == pedido.bot_id).first()
             if bot_data:
                 tb = telebot.TeleBot(bot_data.token)
@@ -226,15 +223,18 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
                     name=f"Venda {pedido.first_name}"
                 )
                 
-                msg = f"✅ **Pagamento Confirmado!**\n\nSeu acesso exclusivo:\n👉 {convite.invite_link}"
-                tb.send_message(int(pedido.telegram_id), msg, parse_mode="Markdown")
+                # MUDANÇA CRÍTICA AQUI: parse_mode="HTML"
+                # Isso impede que o link com _ ou - quebre a mensagem
+                msg = f"✅ <b>Pagamento Confirmado!</b>\n\nSeu acesso exclusivo:\n👉 {convite.invite_link}"
+                tb.send_message(int(pedido.telegram_id), msg, parse_mode="HTML")
                 print("🏆 LINK ENVIADO!")
             else:
                 print("❌ Bot não encontrado para enviar mensagem.")
 
         except Exception as e_tg:
             print(f"❌ Erro Telegram: {e_tg}")
-            try: tb.send_message(int(pedido.telegram_id), "✅ Pagamento recebido! Erro ao gerar link. Contate o suporte.")
+            # Tenta avisar sem formatação se der erro
+            try: tb.send_message(int(pedido.telegram_id), "✅ Pagamento recebido! Seu link está sendo gerado. Se não chegar, contate o suporte.")
             except: pass
 
         return {"status": "received"}
@@ -284,7 +284,7 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             msg_id = update.callback_query.message.message_id 
             fluxo = bot_db.fluxo
             
-            # --- 🔥 AUTODESTRUIÇÃO MANTIDA AQUI ---
+            # --- 🔥 AUTODESTRUIÇÃO (MANTIDA) ---
             if fluxo and fluxo.autodestruir_1:
                 try:
                     bot_temp.delete_message(chat_id, msg_id)
@@ -313,7 +313,7 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             
             bot_temp.answer_callback_query(update.callback_query.id)
 
-        # --- CHECKOUT (CORRIGIDO PARA SALVAR O ID REAL DO PUSHINPAY) ---
+        # --- CHECKOUT (COM PARSE HTML PARA EVITAR ERROS NO COPIA E COLA) ---
         elif update.callback_query and update.callback_query.data.startswith("checkout_"):
             chat_id = update.callback_query.message.chat.id
             plano_id = update.callback_query.data.split("_")[1]
@@ -325,24 +325,19 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
 
             msg_aguarde = bot_temp.send_message(chat_id, "⏳ Gerando seu PIX, aguarde...")
             
-            # Gera UUID para referência externa
-            temp_uuid = str(uuid.uuid4())
-            
-            # Chama API
-            pix_data = gerar_pix_pushinpay(plano.preco_atual, temp_uuid)
+            tx_id = str(uuid.uuid4())
+            pix_data = gerar_pix_pushinpay(plano.preco_atual, tx_id)
             
             if pix_data:
                 qr_code_text = pix_data.get("qr_code_text") or pix_data.get("qr_code")
                 
-                # --- A CORREÇÃO DE OURO ---
-                # Pegamos o ID que o PushinPay retornou (se existir) e usamos como transaction_id
-                # Se não, usamos nosso UUID. E convertemos pra minúsculo para garantir.
-                provider_id = pix_data.get("id") or temp_uuid
+                # Pega ID do PushinPay se existir, senão usa o nosso
+                provider_id = pix_data.get("id") or tx_id
                 final_tx_id = str(provider_id).lower()
 
                 novo_pedido = Pedido(
                     bot_id=bot_db.id,
-                    transaction_id=final_tx_id, # <--- AQUI ESTAVA O ERRO, AGORA ESTÁ CORRIGIDO
+                    transaction_id=final_tx_id,
                     telegram_id=str(chat_id),
                     first_name=update.callback_query.from_user.first_name,
                     username=update.callback_query.from_user.username,
@@ -357,19 +352,18 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                 try: bot_temp.delete_message(chat_id, msg_aguarde.message_id)
                 except: pass
 
+                # MUDANÇA: USAR HTML E <CODE> PARA EVITAR QUEBRAS NO PIX
                 legenda_pix = f"""🌟 Seu pagamento foi gerado com sucesso:
 🎁 Plano: {plano.nome_exibicao}
 💰 Valor: R$ {plano.preco_atual:.2f}
 🔐 Pague via Pix Copia e Cola:
 
-```
-{qr_code_text}
-```
+<code>{qr_code_text}</code>
 
 👆 Toque na chave PIX acima para copiá-la
 ‼️ Após o pagamento, o acesso será liberado automaticamente!"""
 
-                bot_temp.send_message(chat_id, legenda_pix, parse_mode="Markdown")
+                bot_temp.send_message(chat_id, legenda_pix, parse_mode="HTML")
             else:
                 bot_temp.send_message(chat_id, "❌ Erro ao gerar PIX. Tente novamente ou contate o suporte.")
 
