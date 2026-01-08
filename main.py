@@ -4,6 +4,7 @@ import telebot
 import requests
 import time
 import urllib.parse # <--- ADICIONE ESTE NOVO IMPORT
+import threading # <--- ADICIONE ESTE NOVO IMPORT PARA O ROBÔ DE VENCIMENTO
 from telebot import types
 import json
 import uuid
@@ -34,48 +35,136 @@ app.add_middleware(
 )
 
 # =========================================================
-# 🛠️ AUTO-REPARO DO BANCO DE DADOS (Executa ao ligar)
+# 🛠️ AUTO-REPARO E INÍCIO DOS JOBS
 # =========================================================
 @app.on_event("startup")
 def on_startup():
-    # 1. Cria tabelas que não existem
+    # 1. Cria tabelas e corrige colunas
     init_db()
-    
-    # 2. FORÇA A CRIAÇÃO DAS COLUNAS NOVAS (Correção Crítica)
     try:
         with engine.connect() as conn:
             logger.info("🔧 Verificando integridade do banco de dados...")
-            
             comandos = [
-                # Correções de Fluxo
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;",
-                
-                # 🔴 CORREÇÃO DO ERRO DE REMARKETING (AQUI ESTÁ A MÁGICA)
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS data_envio TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS campaign_id VARCHAR;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS config TEXT;"
             ]
-            
             for cmd in comandos:
-                try:
-                    conn.execute(text(cmd))
-                except Exception as e:
-                    # Ignora se já existir, mas registra
-                    logger.warning(f"Aviso SQL na migração: {e}")
+                try: conn.execute(text(cmd))
+                except Exception as e: logger.warning(f"Aviso SQL: {e}")
             
             conn.commit()
-            logger.info("✅ BANCO DE DADOS ATUALIZADO E PRONTO!")
+            logger.info("✅ BANCO DE DADOS PRONTO!")
+            
+        # --- 2. INICIA O CEIFADOR (VERIFICADOR DE VENCIMENTOS) ---
+        # Roda em segundo plano (daemon) para não travar o site
+        thread = threading.Thread(target=loop_verificar_vencimentos)
+        thread.daemon = True
+        thread.start()
+        logger.info("💀 O Ceifador (Auto-Kick) foi iniciado!")
             
     except Exception as e:
-        logger.error(f"❌ Erro crítico ao atualizar banco: {e}")
+        logger.error(f"❌ Erro na inicialização: {e}")
 
 def get_db():
+    """Gera conexão com o banco de dados"""
     db = SessionLocal()
     try:
         yield db
+    finally:
+        db.close()
+
+# =========================================================
+# 💀 O CEIFADOR: VERIFICA VENCIMENTOS E REMOVE (KICK SUAVE)
+# =========================================================
+def loop_verificar_vencimentos():
+    """Roda a cada 60 minutos para remover usuários vencidos"""
+    while True:
+        try:
+            logger.info("⏳ Verificando assinaturas vencidas...")
+            verificar_expiracao_massa()
+        except Exception as e:
+            logger.error(f"Erro no loop de vencimento: {e}")
+        
+        time.sleep(3600) # Espera 1 hora (3600 segundos)
+
+def verificar_expiracao_massa():
+    db = SessionLocal()
+    try:
+        # Busca todos os bots para processar cada um
+        bots = db.query(Bot).all()
+        
+        for bot_data in bots:
+            if not bot_data.token or not bot_data.id_canal_vip:
+                continue
+                
+            try:
+                tb = telebot.TeleBot(bot_data.token)
+                
+                # Busca pedidos PAGOS deste bot
+                usuarios_ativos = db.query(Pedido).filter(
+                    Pedido.bot_id == bot_data.id,
+                    Pedido.status == 'paid'
+                ).all()
+                
+                for user in usuarios_ativos:
+                    # Determina a duração baseada no nome do plano
+                    # (Como não salvamos dias no pedido antes, usamos o nome como referência)
+                    dias_duracao = 30 # Padrão Mensal
+                    nome_plano = (user.plano_nome or "").lower()
+                    
+                    if "vital" in nome_plano or "mega" in nome_plano:
+                        continue # Nunca vence
+                    
+                    if "24" in nome_plano or "diario" in nome_plano or "1 dia" in nome_plano:
+                        dias_duracao = 1
+                    elif "trimestral" in nome_plano:
+                        dias_duracao = 90
+                    elif "semanal" in nome_plano:
+                        dias_duracao = 7
+                    
+                    # Calcula data de vencimento
+                    data_vencimento = user.created_at + timedelta(days=dias_duracao)
+                    agora = datetime.utcnow()
+                    
+                    if agora > data_vencimento:
+                        logger.info(f"🚫 Assinatura vencida: {user.telegram_id} (Bot: {bot_data.nome})")
+                        
+                        # --- A LÓGICA DO KICK SUAVE (REMOVE DA BLACKLIST) ---
+                        try:
+                            # 1. Identifica o Canal
+                            try: canal_id = int(str(bot_data.id_canal_vip).strip())
+                            except: canal_id = bot_data.id_canal_vip
+
+                            # 2. Banir (Remove do canal)
+                            tb.ban_chat_member(canal_id, int(user.telegram_id))
+                            
+                            # 3. Desbanir Imediatamente (Limpa a Blacklist)
+                            # Isso permite que ele compre de novo e entre sem erro de "User was kicked"
+                            tb.unban_chat_member(canal_id, int(user.telegram_id))
+                            
+                            # 4. Atualiza DB para 'expired' (Para o Porteiro barrar depois)
+                            user.status = 'expired'
+                            db.commit()
+                            
+                            # 5. Avisa o usuário
+                            try:
+                                tb.send_message(user.telegram_id, "Seu plano VIP expirou! 😢\nPara voltar ao canal, renove sua assinatura digitando /start")
+                            except: pass
+                            
+                        except Exception as e_kick:
+                            # Se der erro (ex: user já saiu), marca como expirado mesmo assim
+                            logger.error(f"Erro ao remover membro {user.telegram_id}: {e_kick}")
+                            user.status = 'expired'
+                            db.commit()
+                            
+            except Exception as e_bot:
+                logger.error(f"Erro ao processar bot {bot_data.nome}: {e_bot}")
+                
     finally:
         db.close()
 
@@ -94,20 +183,7 @@ def get_pushin_token():
         return os.getenv("PUSHIN_PAY_TOKEN")
     finally:
         db.close()
-
-# =========================================================
-# 🔌 INTEGRAÇÃO PUSHIN PAY (LINK CORRIGIDO FIXO)
-# =========================================================
-def get_pushin_token():
-    db = SessionLocal()
-    try:
-        config = db.query(SystemConfig).filter(SystemConfig.key == "pushin_pay_token").first()
-        if config and config.value:
-            return config.value
-        return os.getenv("PUSHIN_PAY_TOKEN")
-    finally:
-        db.close()
-
+        
 # =========================================================
 # 🔌 INTEGRAÇÃO PUSHIN PAY (CORRIGIDA)
 # =========================================================
@@ -328,7 +404,7 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         if not body_str:
             return {"status": "ignored", "reason": "empty_body"}
 
-        # 2. TENTA DECIFRAR (JSON OU FORM DATA)
+        # 2. TENTA DECIFRAR (JSON OU FORM DATA) - Lógica "Poliglota"
         data = {}
         try:
             data = json.loads(body_str) # Tenta JSON
@@ -340,10 +416,8 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
                 return {"status": "error", "reason": "invalid_format"}
 
         # 3. EXTRAÇÃO INTELIGENTE DO ID (CORREÇÃO DE OURO)
-        # O PushinPay retorna o ID dele no campo 'id'. Usamos ele para buscar no banco.
         raw_tx_id = data.get("id") or data.get("external_reference") or data.get("uuid")
         tx_id = str(raw_tx_id).lower() if raw_tx_id else None
-        
         status_pix = str(data.get("status", "")).lower()
         
         print(f"🔎 Processando: ID={tx_id} | Status={status_pix}")
@@ -377,6 +451,10 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
                 try: canal_id = int(str(bot_data.id_canal_vip).strip())
                 except: canal_id = bot_data.id_canal_vip
 
+                # Tenta desbanir antes (Kick Suave)
+                try: tb.unban_chat_member(canal_id, int(pedido.telegram_id))
+                except: pass
+
                 # Gera Link Único
                 convite = tb.create_chat_invite_link(
                     chat_id=canal_id, 
@@ -384,7 +462,7 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
                     name=f"Venda {pedido.first_name}"
                 )
                 
-                # MENSAGEM EM HTML (IMPORTANTE!)
+                # MENSAGEM EM HTML (CRÍTICO: Evita erro de parse do Telegram)
                 msg = f"✅ <b>Pagamento Confirmado!</b>\n\nSeu acesso exclusivo:\n👉 {convite.invite_link}"
                 tb.send_message(int(pedido.telegram_id), msg, parse_mode="HTML")
                 print("🏆 LINK ENVIADO!")
@@ -393,8 +471,7 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
 
         except Exception as e_tg:
             print(f"❌ Erro Telegram: {e_tg}")
-            # Fallback sem formatação se der erro
-            try: tb.send_message(int(pedido.telegram_id), "✅ Pagamento recebido! Seu link está sendo gerado.")
+            try: tb.send_message(int(pedido.telegram_id), "✅ Pagamento recebido! Link sendo gerado.")
             except: pass
 
         return {"status": "received"}
@@ -404,7 +481,7 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         return {"status": "error"}
 
 # =========================================================
-# 🚀 WEBHOOK PRINCIPAL (HOT FLOW & CHECKOUT)
+# 🚀 WEBHOOK GERAL DO BOT (COM PORTEIRO / ANTI-INTRUSO)
 # =========================================================
 @app.post("/webhook/{bot_token}")
 async def receber_update_telegram(bot_token: str, request: Request, db: Session = Depends(get_db)):
@@ -416,6 +493,63 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
         json_str = await request.json()
         update = telebot.types.Update.de_json(json_str)
         bot_temp = telebot.TeleBot(bot_token)
+        
+        # --- 🚪 O PORTEIRO (VERIFICA ENTRADA NO GRUPO) ---
+        # Se alguém tentar entrar no grupo pelo link...
+        if update.message and update.message.new_chat_members:
+            chat_id_atual = str(update.message.chat.id)
+            # Normaliza o ID do canal do banco
+            canal_vip_db = str(bot_db.id_canal_vip).strip()
+            
+            # Verifica se o evento aconteceu no Canal VIP protegido
+            if chat_id_atual == canal_vip_db:
+                for member in update.message.new_chat_members:
+                    if member.is_bot: continue # Ignora bots
+                    
+                    user_id = str(member.id)
+                    logger.info(f"👤 Verificando entrada de {user_id} no canal {canal_vip_db}")
+                    
+                    # 1. Busca se tem pedido PAGO e VÁLIDO no banco
+                    pedido = db.query(Pedido).filter(
+                        Pedido.bot_id == bot_db.id,
+                        Pedido.telegram_id == user_id
+                    ).order_by(text("created_at DESC")).first() # Pega o último
+                    
+                    acesso_autorizado = False
+                    
+                    if pedido and pedido.status == 'paid':
+                        # Verifica data de validade (Dupla checagem)
+                        dias = 30
+                        nome = (pedido.plano_nome or "").lower()
+                        
+                        if "vital" in nome or "mega" in nome: 
+                            acesso_autorizado = True
+                        else:
+                            if "diario" in nome or "24" in nome: dias = 1
+                            elif "trimestral" in nome: dias = 90
+                            elif "semanal" in nome: dias = 7
+                            
+                            validade = pedido.created_at + timedelta(days=dias)
+                            # Se a data atual for MENOR que a validade, deixa entrar
+                            if datetime.utcnow() < validade:
+                                acesso_autorizado = True
+                    
+                    # 2. Se não tiver autorizado, CHUTA!
+                    if not acesso_autorizado:
+                        logger.warning(f"🚫 Intruso detectado! Removendo {user_id}...")
+                        try:
+                            # Ban + Unban (Kick Suave para não poluir a blacklist)
+                            bot_temp.ban_chat_member(chat_id_atual, int(user_id))
+                            bot_temp.unban_chat_member(chat_id_atual, int(user_id))
+                            
+                            # Avisa no privado
+                            try:
+                                bot_temp.send_message(int(user_id), "🚫 **Acesso Negado**\n\nSua assinatura venceu ou não foi encontrada. Faça um novo pagamento para entrar.")
+                            except: pass
+                        except Exception as e_kick:
+                            logger.error(f"Erro ao kickar intruso: {e_kick}")
+            
+            return {"status": "member_checked"}
         
         # --- 1. COMANDO /START (Início do Funil) ---
         if update.message and update.message.text == "/start":
@@ -552,7 +686,7 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
     except Exception as e:
         logger.error(f"Erro webhook: {e}")
         return {"status": "error"}
-        
+
 # =========================================================
 # 👥 ROTAS DE CRM (BASE DE CONTATOS)
 # =========================================================
