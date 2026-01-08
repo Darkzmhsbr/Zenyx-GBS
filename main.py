@@ -1369,13 +1369,21 @@ def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db))
 async def webhook(req: Request, bg_tasks: BackgroundTasks):
     try:
         raw = await req.body()
-        try: payload = json.loads(raw)
-        except: payload = {k: v[0] for k,v in parse_qs(raw.decode()).items()}
+        try: 
+            payload = json.loads(raw)
+        except: 
+            # Fallback para formato x-www-form-urlencoded
+            payload = {k: v[0] for k,v in parse_qs(raw.decode()).items()}
         
-        # Se for pagamento APROVADO
+        # Log para debug (opcional, pode remover em produção)
+        # logger.info(f"Webhook recebido: {payload}")
+
+        # Se for pagamento APROVADO (Vários status possíveis de gateways)
         if str(payload.get('status')).upper() in ['PAID', 'APPROVED', 'COMPLETED', 'SUCCEEDED']:
             db = SessionLocal()
-            tx = str(payload.get('id')).lower()
+            tx = str(payload.get('id')).lower() # ID da transação
+            
+            # Busca o pedido pelo ID da transação
             p = db.query(Pedido).filter(Pedido.transaction_id == tx).first()
             
             # Se achou o pedido e ele ainda não estava pago
@@ -1386,6 +1394,8 @@ async def webhook(req: Request, bg_tasks: BackgroundTasks):
                 # --- 🔔 NOTIFICAÇÃO AO ADMIN (NOVO) ---
                 try:
                     bot_db = db.query(Bot).filter(Bot.id == p.bot_id).first()
+                    
+                    # Verifica se o bot tem um Admin configurado para receber o aviso
                     if bot_db and bot_db.admin_principal_id:
                         msg_venda = (
                             f"💰 *VENDA APROVADA!*\n\n"
@@ -1394,6 +1404,7 @@ async def webhook(req: Request, bg_tasks: BackgroundTasks):
                             f"💵 Valor: R$ {p.valor:.2f}\n"
                             f"📅 Data: {datetime.now().strftime('%d/%m %H:%M')}"
                         )
+                        # Chama a função auxiliar de notificação
                         notificar_admin_principal(bot_db, msg_venda) 
                 except Exception as e_notify:
                     logger.error(f"Erro ao notificar admin: {e_notify}")
@@ -1405,14 +1416,15 @@ async def webhook(req: Request, bg_tasks: BackgroundTasks):
                         bot_data = db.query(Bot).filter(Bot.id == p.bot_id).first()
                         tb = telebot.TeleBot(bot_data.token)
                         
+                        # Tenta converter o ID do canal VIP com segurança
                         try: canal_vip_id = int(str(bot_data.id_canal_vip).strip())
                         except: canal_vip_id = bot_data.id_canal_vip
 
-                        # Tenta desbanir antes (garantia)
+                        # Tenta desbanir o usuário antes (garantia caso ele tenha sido expulso antes)
                         try: tb.unban_chat_member(canal_vip_id, int(p.telegram_id))
                         except: pass
 
-                        # Gera Link Único
+                        # Gera Link Único (Válido para 1 pessoa)
                         convite = tb.create_chat_invite_link(
                             chat_id=canal_vip_id, 
                             member_limit=1, 
@@ -1430,27 +1442,31 @@ Toque no link abaixo para entrar no Canal VIP:
 
 ⚠️ <i>Este link é único e válido apenas para você.</i>
 """
+                        # Envia a mensagem com o link para o usuário
                         tb.send_message(int(p.telegram_id), msg_sucesso, parse_mode="HTML")
                         
+                        # Marca que a mensagem foi enviada para não enviar duplicado
                         p.mensagem_enviada = True
                         db.commit()
                         logger.info(f"🏆 Link enviado para {p.first_name}")
 
                     except Exception as e_telegram:
                         logger.error(f"❌ ERRO TELEGRAM: {e_telegram}")
-                        # Avisa o cliente que deu erro no envio do link
+                        # Fallback: Avisa o cliente que deu erro no envio do link, mas confirma o pagamento
                         try:
                             tb.send_message(int(p.telegram_id), "✅ Pagamento recebido! \n\n⚠️ Houve um erro ao gerar seu link automático. Um administrador entrará em contato em breve.")
                         except: pass
 
             db.close()
         
+        # Retorna 200 OK para o Gateway de Pagamento parar de mandar o Webhook
         return {"status": "received"}
 
     except Exception as e:
         logger.error(f"❌ ERRO CRÍTICO NO WEBHOOK: {e}")
+        # Mesmo com erro, retornamos 200 ou estrutura json para não travar o gateway (opcional, depende da estratégia)
         return {"status": "error"}
-
+        
 @app.get("/")
 def home():
     return {"status": "Zenyx SaaS Online - Banco Atualizado"}
