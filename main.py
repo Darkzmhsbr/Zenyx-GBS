@@ -3,19 +3,21 @@ import logging
 import telebot
 import requests
 import time
-import urllib.parse # <--- ADICIONE ESTE NOVO IMPORT
-import threading # <--- ADICIONE ESTE NOVO IMPORT PARA O ROBÔ DE VENCIMENTO
+import urllib.parse 
+import threading 
 from telebot import types
 import json
 import uuid
-from fastapi import BackgroundTasks # <--- IMPORTANTE
-from sqlalchemy import text, desc, func # <--- O 'desc' e 'func' são obrigatórios!from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import BackgroundTasks 
+from sqlalchemy import text, desc, func 
+
+# --- CORREÇÃO: O IMPORT DO FASTAPI AGORA ESTÁ EM LINHA SEPARADA ---
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
-from sqlalchemy import func
 
 # Importa banco de dados
 from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, Pedido, SystemConfig, RemarketingCampaign, BotAdmin, engine
