@@ -345,9 +345,10 @@ class BotResponse(BotCreate):
         from_attributes = True
 
 # Modelo unificado para Remarketing (Individual + Massa + Wizard)
+# Modelo unificado para Remarketing (Tolerante a falhas do Front)
 class RemarketingRequest(BaseModel):
     bot_id: Optional[int] = None
-    tipo_envio: str # 'todos', 'pendentes', 'individual', etc
+    tipo_envio: str 
     mensagem: str
     media_url: Optional[str] = None
     
@@ -359,18 +360,22 @@ class RemarketingRequest(BaseModel):
     # Validade e Agendamento
     expire_timestamp: Optional[int] = 0
     is_periodic: bool = False
-    periodic_days: int = 0
+    periodic_days: Optional[int] = 0 # Alterado para Optional
     periodic_time: Optional[str] = None
     
-    # Campos Extras do Wizard (Para compatibilidade com o Front)
+    # Campos Extras do Wizard
     price_mode: Optional[str] = "original"
     custom_price: Optional[float] = 0.0
     expiration_mode: Optional[str] = "none"
     expiration_value: Optional[int] = 0
     
-    # Controle de Envio Individual / Teste
+    # Controle
     is_test: bool = False
-    specific_user_id: Optional[str] = None
+    specific_user_id: Optional[str] = None 
+
+    # Validação automática para converter string vazia em None
+    class Config:
+        from_attributes = True
 
 # Modelo para Atualização de Usuário (CRM)
 class UserUpdate(BaseModel):
@@ -641,27 +646,19 @@ def list_bots(db: Session = Depends(get_db)):
     resultado = []
     
     for bot in bots:
-        # 1. Busca Username do Bot (Se não tiver salvo, tenta buscar na API do Telegram)
+        # 1. Busca Username (Garante que começa com @)
         username_display = bot.username or "..."
-        if not bot.username and bot.token:
-            try:
-                tb = telebot.TeleBot(bot.token)
-                me = tb.get_me()
-                username_display = f"@{me.username}"
-                # Opcional: Salvar no banco para não consultar sempre
-                bot.username = username_display
-                db.commit()
-            except:
-                pass
+        if username_display != "..." and not username_display.startswith("@"):
+            username_display = f"@{username_display}"
 
-        # 2. Calcula LEADS TOTAIS (Contagem de usuários únicos na tabela de pedidos ou usuários)
-        # Assumindo que cada pedido único por telegram_id conta como um lead
+        # 2. Calcula LEADS TOTAIS (Contagem de usuários únicos na tabela de pedidos)
         leads_count = db.query(func.count(Pedido.telegram_id.distinct())).filter(Pedido.bot_id == bot.id).scalar() or 0
 
-        # 3. Calcula RECEITA TOTAL (Soma de todos os pedidos pagos)
+        # 3. Calcula RECEITA TOTAL (Soma estendida para todos status de sucesso)
+        # O erro estava aqui: somava apenas 'paid'. Agora soma todos os aprovados.
         receita_total = db.query(func.sum(Pedido.valor)).filter(
             Pedido.bot_id == bot.id, 
-            Pedido.status == 'paid'
+            Pedido.status.in_(['paid', 'approved', 'completed', 'succeeded'])
         ).scalar() or 0.0
 
         resultado.append({
@@ -670,10 +667,10 @@ def list_bots(db: Session = Depends(get_db)):
             "token": bot.token,
             "username": username_display,
             "status": bot.status,
-            "admin_principal_id": bot.admin_principal_id, # Garante que vai pro front
+            "admin_principal_id": bot.admin_principal_id,
             "id_canal_vip": bot.id_canal_vip,
-            "leads_count": leads_count,       # KPI Total
-            "vendas_total": receita_total     # KPI Total
+            "leads_count": leads_count,       
+            "vendas_total": receita_total     
         })
     
     return resultado
