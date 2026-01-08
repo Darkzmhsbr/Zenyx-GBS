@@ -1185,50 +1185,58 @@ Copie o código abaixo para garantir sua vaga:
         return {"status": "error"}
 
 # =========================================================
-# 👥 ROTAS DE CRM (BASE DE CONTATOS)
+# 👥 ROTA: CONTATOS / CRM (CORRIGIDA E HÍBRIDA)
 # =========================================================
 @app.get("/api/admin/contacts")
-def listar_contatos(bot_id: int = None, status: str = "todos", page: int = 1, limit: int = 100, db: Session = Depends(get_db)):
-    # Query Base
+def listar_contatos(
+    bot_id: Optional[int] = None, # Aceita ID numérico
+    status: str = "todos", 
+    page: int = 1, 
+    limit: int = 50, 
+    db: Session = Depends(get_db)
+):
     query = db.query(Pedido)
     
-    # 1. Filtra por Bot (Se enviado)
+    # 1. Filtro de Bot (Se não vier ID, tenta pegar todos ou filtra se vier na query string antiga)
     if bot_id:
         query = query.filter(Pedido.bot_id == bot_id)
         
-    # 2. Filtra por Status
-    if status == "pagantes": query = query.filter(Pedido.status == 'paid')
-    elif status == "pendentes": query = query.filter(Pedido.status == 'pending')
-    elif status == "expirados": query = query.filter(Pedido.status == 'expired')
+    # 2. Filtros de Status
+    if status == 'pagantes':
+        query = query.filter(Pedido.status == 'paid')
+    elif status == 'pendentes':
+        query = query.filter(Pedido.status == 'pending')
+    elif status == 'expirados':
+        query = query.filter(Pedido.status == 'expired')
+
+    total_records = query.count()
     
-    total_registros = query.count()
-    
-    # 3. Paginação
+    # 3. Ordenação e Paginação
     offset = (page - 1) * limit
-    pedidos = query.order_by(desc(Pedido.created_at)).offset(offset).limit(limit).all()
+    users_raw = query.order_by(desc(Pedido.created_at)).offset(offset).limit(limit).all()
     
-    # 4. Formata retorno (Incluindo Expiração)
-    users_list = []
-    for p in pedidos:
-        users_list.append({
-            "id": p.id,
-            "telegram_id": p.telegram_id,
-            "first_name": p.first_name,
-            "username": p.username,
-            "plano_nome": p.plano_nome,
-            "valor": p.valor,
-            "status": p.status,
-            "created_at": p.created_at,
-            # Tenta pegar a expiração customizada ou calcula
-            "expiration_date": p.custom_expiration,
-            "role": p.role
-        })
+    users_formatted = []
+    for u in users_raw:
+        # Tenta pegar a data de expiração customizada ou calcula baseada no plano
+        exp_date = u.custom_expiration
         
+        users_formatted.append({
+            "id": u.id,
+            "telegram_id": u.telegram_id,
+            "first_name": u.first_name,
+            "username": u.username,
+            "plano_nome": u.plano_nome,
+            "valor": u.valor,
+            "status": u.status,
+            "created_at": u.created_at,
+            "expiration_date": exp_date
+        })
+
+    # Retorna formato compatível
     return {
-        "users": users_list,
-        "total": total_registros,
-        "page": page,
-        "pages": (total_registros + limit - 1) // limit
+        "users": users_formatted,
+        "total_records": total_records,
+        "total_pages": (total_records // limit) + 1
     }
 
 # =========================================================
