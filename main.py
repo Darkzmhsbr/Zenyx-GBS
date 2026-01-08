@@ -522,15 +522,18 @@ def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
 # =========================================================
 # 👥 ROTA: CONTATOS (CORRIGIDA COLUNA EXPIRAÇÃO)
 # =========================================================
+# =========================================================
+# 👥 ROTA: CONTATOS / CRM (COM EXPIRAÇÃO)
+# =========================================================
 @app.get("/api/admin/contacts")
-def get_contacts(bot_id: int = None, status: str = 'todos', page: int = 1, limit: int = 50, db: Session = Depends(get_db)):
-    # Se não passar bot_id, tenta pegar o primeiro ou retorna vazio (ajuste conforme sua lógica)
+def get_contacts(bot_id: int = None, status: str = 'todos', page: int = 1, limit: int = 1000, db: Session = Depends(get_db)):
+    # Se não passar bot_id, retorna vazio
     if not bot_id:
-        return {"users": [], "total_pages": 0, "total_records": 0}
+        return {"users": [], "total_records": 0}
 
     query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
 
-    # Filtros
+    # Filtros de Status
     if status == 'pendente':
         query = query.filter(Pedido.status == 'pending')
     elif status == 'active':
@@ -538,13 +541,13 @@ def get_contacts(bot_id: int = None, status: str = 'todos', page: int = 1, limit
     elif status == 'expired':
         query = query.filter(Pedido.status == 'expired')
 
-    # Paginação
     total_records = query.count()
-    users_raw = query.order_by(desc(Pedido.created_at)).offset((page - 1) * limit).limit(limit).all()
+    
+    # Ordenação por data (mais recentes primeiro)
+    users_raw = query.order_by(desc(Pedido.created_at)).limit(limit).all()
     
     users_formatted = []
     for u in users_raw:
-        # Garante que expiration_date seja enviado
         users_formatted.append({
             "id": u.id,
             "telegram_id": u.telegram_id,
@@ -552,14 +555,37 @@ def get_contacts(bot_id: int = None, status: str = 'todos', page: int = 1, limit
             "username": u.username,
             "status": u.status,
             "created_at": u.created_at,
-            "expiration_date": u.expiration_date # <--- CAMPO CRÍTICO PARA A TABELA
+            "expiration_date": u.expiration_date # <--- Garante o envio desta coluna
         })
 
     return {
         "users": users_formatted,
-        "total_pages": (total_records // limit) + 1,
         "total_records": total_records
     }
+
+@app.put("/api/admin/users/{user_id}")
+def update_user(user_id: int, dados: UserUpdate, db: Session = Depends(get_db)):
+    user = db.query(Pedido).filter(Pedido.id == user_id).first()
+    if not user: raise HTTPException(404, "Usuário não encontrado")
+    
+    if dados.status: 
+        user.status = dados.status
+    
+    # Lógica de Expiração Personalizada
+    if dados.custom_expiration: 
+        if dados.custom_expiration == 'vitalicio': 
+            user.expiration_date = None
+        elif dados.custom_expiration == 'remover': 
+            user.expiration_date = None
+        else:
+            try: 
+                # Tenta converter string YYYY-MM-DD para data
+                user.expiration_date = datetime.strptime(dados.custom_expiration, '%Y-%m-%d')
+            except: 
+                pass
+            
+    db.commit()
+    return {"status": "ok"}
 
 # --- NOVA ROTA: LIGAR/DESLIGAR BOT (TOGGLE) ---
 @app.post("/api/admin/bots/{bot_id}/toggle")
