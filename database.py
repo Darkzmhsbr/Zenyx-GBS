@@ -51,13 +51,29 @@ class Bot(Base):
     id_canal_vip = Column(String)
     status = Column(String, default="desconectado")
     
+    # Relacionamentos
     pedidos = relationship("Pedido", back_populates="bot")
     planos = relationship("PlanoConfig", back_populates="bot")
     campanhas = relationship("RemarketingCampaign", back_populates="bot")
-    
-    # Relacionamento One-to-One com o Fluxo
     fluxo = relationship("BotFlow", back_populates="bot", uselist=False)
     
+    # NOVO: Relacionamento com Administradores
+    admins = relationship("BotAdmin", back_populates="bot", cascade="all, delete-orphan")
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# =========================================================
+# 🛡️ TABELA DE ADMINISTRADORES (NOVA - FASE 1)
+# =========================================================
+class BotAdmin(Base):
+    __tablename__ = "bot_admins"
+
+    id = Column(Integer, primary_key=True, index=True)
+    bot_id = Column(Integer, ForeignKey("bots.id"))
+    bot = relationship("Bot", back_populates="admins")
+
+    telegram_id = Column(String, index=True) # ID numérico do admin no Telegram
+    nome = Column(String, nullable=True)     # Nome para identificação no painel
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # =========================================================
