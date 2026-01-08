@@ -380,6 +380,44 @@ def atualizar_bot(bot_id: int, dados: BotUpdate, db: Session = Depends(get_db)):
     db.refresh(bot_db)
     return {"status": "updated", "msg": "Bot atualizado com sucesso!"}
 
+# --- NOVA ROTA: LIGAR/DESLIGAR BOT (TOGGLE) ---
+@app.post("/api/admin/bots/{bot_id}/toggle")
+def toggle_bot(bot_id: int, db: Session = Depends(get_db)):
+    bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
+    if not bot_db:
+        raise HTTPException(status_code=404, detail="Bot não encontrado")
+    
+    # Inverte o status atual
+    if bot_db.status == "pausado":
+        bot_db.status = "conectado" # Liga
+    else:
+        bot_db.status = "pausado" # Desliga
+        
+    db.commit()
+    return {"id": bot_db.id, "status": bot_db.status}
+
+# --- NOVA ROTA: EXCLUIR BOT ---
+@app.delete("/api/admin/bots/{bot_id}")
+def deletar_bot(bot_id: int, db: Session = Depends(get_db)):
+    bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
+    if not bot_db:
+        raise HTTPException(status_code=404, detail="Bot não encontrado")
+    
+    # 1. Tenta remover o Webhook do Telegram para limpar
+    try:
+        tb = telebot.TeleBot(bot_db.token)
+        tb.delete_webhook()
+    except:
+        pass # Se der erro (ex: token inválido), continua e apaga do banco
+    
+    # 2. Apaga do Banco de Dados
+    db.delete(bot_db)
+    db.commit()
+    
+    return {"status": "deleted", "msg": "Bot removido com sucesso"}
+
+# --- NOVA ROTA: LISTAR BOTS ---
+
 @app.get("/api/admin/bots", response_model=List[BotResponse])
 def listar_bots(db: Session = Depends(get_db)):
     bots = db.query(Bot).all()
@@ -555,13 +593,21 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         return {"status": "error"}
 
 # =========================================================
-# 🚀 WEBHOOK GERAL DO BOT (COM PORTEIRO / ANTI-INTRUSO)
+# 🚀 WEBHOOK GERAL DO BOT (COM PORTEIRO + PAUSA)
 # =========================================================
 @app.post("/webhook/{bot_token}")
 async def receber_update_telegram(bot_token: str, request: Request, db: Session = Depends(get_db)):
     
+    # Proteção contra loop do pix
+    if bot_token == "pix": return {"status": "ignored_loop"}
+    
     bot_db = db.query(Bot).filter(Bot.token == bot_token).first()
     if not bot_db: return {"status": "ignored"}
+
+    # --- 🛑 NOVA VERIFICAÇÃO: BOT PAUSADO? ---
+    # Se você clicou no botão de desligar no painel, ele para aqui.
+    if bot_db.status == "pausado":
+        return {"status": "paused_by_admin"}
 
     try:
         json_str = await request.json()
