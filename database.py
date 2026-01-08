@@ -30,13 +30,12 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 # =========================================================
-# ⚙️ TABELA DE CONFIGURAÇÕES GERAIS (INTEGRAÇÕES)
+# ⚙️ TABELA DE CONFIGURAÇÕES GERAIS
 # =========================================================
 class SystemConfig(Base):
     __tablename__ = "system_config"
-    
-    key = Column(String, primary_key=True, index=True) # Ex: 'pushin_pay_token'
-    value = Column(String)                             # O Token em si
+    key = Column(String, primary_key=True, index=True)
+    value = Column(String)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 # =========================================================
@@ -44,7 +43,6 @@ class SystemConfig(Base):
 # =========================================================
 class Bot(Base):
     __tablename__ = "bots"
-
     id = Column(Integer, primary_key=True, index=True)
     nome = Column(String)
     token = Column(String, unique=True, index=True)
@@ -56,24 +54,20 @@ class Bot(Base):
     planos = relationship("PlanoConfig", back_populates="bot")
     campanhas = relationship("RemarketingCampaign", back_populates="bot")
     fluxo = relationship("BotFlow", back_populates="bot", uselist=False)
-    
-    # NOVO: Relacionamento com Administradores
     admins = relationship("BotAdmin", back_populates="bot", cascade="all, delete-orphan")
     
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # =========================================================
-# 🛡️ TABELA DE ADMINISTRADORES (NOVA - FASE 1)
+# 🛡️ TABELA DE ADMINISTRADORES
 # =========================================================
 class BotAdmin(Base):
     __tablename__ = "bot_admins"
-
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, ForeignKey("bots.id"))
     bot = relationship("Bot", back_populates="admins")
-
-    telegram_id = Column(String, index=True) # ID numérico do admin no Telegram
-    nome = Column(String, nullable=True)     # Nome para identificação no painel
+    telegram_id = Column(String, index=True)
+    nome = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # =========================================================
@@ -81,17 +75,15 @@ class BotAdmin(Base):
 # =========================================================
 class Pedido(Base):
     __tablename__ = "pedidos"
-
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, ForeignKey("bots.id"))
     bot = relationship("Bot", back_populates="pedidos")
-
+    
     transaction_id = Column(String, unique=True, index=True)
     telegram_id = Column(String, index=True)
     first_name = Column(String, nullable=True)
     username = Column(String, nullable=True)
-    role = Column(String, default="user") 
-    custom_expiration = Column(DateTime, nullable=True) 
+    
     plano_nome = Column(String)
     valor = Column(Float)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -104,11 +96,10 @@ class Pedido(Base):
 # =========================================================
 class PlanoConfig(Base):
     __tablename__ = "planos_config"
-
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, ForeignKey("bots.id"))
     bot = relationship("Bot", back_populates="planos")
-
+    
     key_id = Column(String, index=True)
     nome_exibicao = Column(String)
     descricao = Column(String)
@@ -116,10 +107,10 @@ class PlanoConfig(Base):
     preco_atual = Column(Float)
     dias_duracao = Column(Integer)
     oculto = Column(Boolean, default=False)
-    tag = Column(String, nullable=True) 
+    tag = Column(String, nullable=True)
 
 # =========================================================
-# 📢 TABELA DE REMARKETING
+# 📢 TABELA DE REMARKETING (ATUALIZADA)
 # =========================================================
 class RemarketingCampaign(Base):
     __tablename__ = "remarketing_campaigns"
@@ -129,9 +120,14 @@ class RemarketingCampaign(Base):
     bot = relationship("Bot", back_populates="campanhas")
 
     campaign_id = Column(String, unique=True, index=True)
-    config = Column(Text) 
-    status = Column(String, default="enviado")
-    type = Column(String, default="imediato") 
+    
+    # Configurações da campanha
+    type = Column(String, default="massivo") 
+    target = Column(String, default="todos") # NOVO CAMPO: Filtro usado (pendentes, pagantes, etc)
+    config = Column(Text) # JSON com mensagem, mídia, etc.
+    status = Column(String, default="concluido")
+    
+    # Métricas
     total_leads = Column(Integer, default=0)
     sent_success = Column(Integer, default=0)
     blocked_count = Column(Integer, default=0)
@@ -142,7 +138,6 @@ class RemarketingCampaign(Base):
 # =========================================================
 class BotFlow(Base):
     __tablename__ = "bot_flows"
-    
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, ForeignKey("bots.id"), unique=True)
     bot = relationship("Bot", back_populates="fluxo")
