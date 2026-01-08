@@ -35,40 +35,56 @@ app.add_middleware(
 )
 
 # =========================================================
-# 🛠️ AUTO-REPARO E INÍCIO DOS JOBS
+# 🛠️ AUTO-REPARO DO BANCO DE DADOS (CORREÇÃO DE COLUNAS)
 # =========================================================
 @app.on_event("startup")
 def on_startup():
-    # 1. Cria tabelas e corrige colunas
+    # 1. Cria tabelas que não existem
     init_db()
+    
+    # 2. FORÇA A CRIAÇÃO DAS COLUNAS NOVAS (Correção Crítica)
     try:
         with engine.connect() as conn:
             logger.info("🔧 Verificando integridade do banco de dados...")
-            comandos = [
+            
+            comandos_sql = [
+                # --- Campos antigos (para garantir) ---
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;",
-                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS data_envio TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
-                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS campaign_id VARCHAR;",
-                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS config TEXT;"
+                
+                # --- NOVOS CAMPOS DO REMARKETING (CRÍTICO) ---
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS target VARCHAR DEFAULT 'todos';",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS type VARCHAR DEFAULT 'massivo';",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS promo_price FLOAT;",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS expiration_at TIMESTAMP WITHOUT TIME ZONE;",
+                
+                # --- Campos de Recorrência (Se faltar) ---
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS dia_atual INTEGER DEFAULT 0;",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS data_inicio TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS proxima_execucao TIMESTAMP WITHOUT TIME ZONE;"
             ]
-            for cmd in comandos:
-                try: conn.execute(text(cmd))
-                except Exception as e: logger.warning(f"Aviso SQL: {e}")
+            
+            for cmd in comandos_sql:
+                try:
+                    conn.execute(text(cmd))
+                except Exception as e_sql:
+                    # Ignora erro se a coluna já existir (dupla segurança)
+                    logger.warning(f"Aviso SQL: {e_sql}")
             
             conn.commit()
-            logger.info("✅ BANCO DE DADOS PRONTO!")
+            logger.info("✅ BANCO DE DADOS ATUALIZADO COM SUCESSO!")
             
-        # --- 2. INICIA O CEIFADOR (VERIFICADOR DE VENCIMENTOS) ---
-        # Roda em segundo plano (daemon) para não travar o site
+        # --- 3. INICIA O CEIFADOR ---
         thread = threading.Thread(target=loop_verificar_vencimentos)
         thread.daemon = True
         thread.start()
         logger.info("💀 O Ceifador (Auto-Kick) foi iniciado!")
             
     except Exception as e:
-        logger.error(f"❌ Erro na inicialização: {e}")
+        logger.error(f"❌ Erro crítico na inicialização do banco: {e}")
 
 def get_db():
     """Gera conexão com o banco de dados"""
