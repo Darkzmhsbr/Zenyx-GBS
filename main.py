@@ -1187,33 +1187,27 @@ Copie o código abaixo para garantir sua vaga:
 # =========================================================
 # 👥 ROTAS DE CRM (BASE DE CONTATOS)
 # =========================================================
-# =========================================================
-# 👥 ROTAS DE CRM (BASE DE CONTATOS) - CORRIGIDO
-# =========================================================
 @app.get("/api/admin/contacts")
-def listar_contatos(bot_id: Optional[int] = None, status: str = "todos", page: int = 1, limit: int = 100, db: Session = Depends(get_db)):
-    # Inicia a query base
+def listar_contatos(bot_id: int = None, status: str = "todos", page: int = 1, limit: int = 100, db: Session = Depends(get_db)):
+    # Query Base
     query = db.query(Pedido)
     
-    # 1. Filtra pelo Bot (Essencial para não misturar dados)
+    # 1. Filtra por Bot (Se enviado)
     if bot_id:
         query = query.filter(Pedido.bot_id == bot_id)
-    
-    # 2. Filtros de Status
-    if status == "pagantes": 
-        query = query.filter(Pedido.status.in_(['paid', 'active', 'approved']))
-    elif status == "pendentes": 
-        query = query.filter(Pedido.status == 'pending')
-    elif status == "expirados": 
-        query = query.filter(Pedido.status == 'expired')
+        
+    # 2. Filtra por Status
+    if status == "pagantes": query = query.filter(Pedido.status == 'paid')
+    elif status == "pendentes": query = query.filter(Pedido.status == 'pending')
+    elif status == "expirados": query = query.filter(Pedido.status == 'expired')
     
     total_registros = query.count()
     
-    # 3. Paginação e Ordenação
+    # 3. Paginação
     offset = (page - 1) * limit
     pedidos = query.order_by(desc(Pedido.created_at)).offset(offset).limit(limit).all()
     
-    # 4. Formata retorno
+    # 4. Formata retorno (Incluindo Expiração)
     users_list = []
     for p in pedidos:
         users_list.append({
@@ -1225,12 +1219,13 @@ def listar_contatos(bot_id: Optional[int] = None, status: str = "todos", page: i
             "valor": p.valor,
             "status": p.status,
             "created_at": p.created_at,
-            "custom_expiration": p.custom_expiration, # Campo correto do banco
+            # Tenta pegar a expiração customizada ou calcula
+            "expiration_date": p.custom_expiration,
             "role": p.role
         })
         
     return {
-        "users": users_list, # O frontend deve ler esta chave
+        "users": users_list,
         "total": total_registros,
         "page": page,
         "pages": (total_registros + limit - 1) // limit
