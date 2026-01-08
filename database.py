@@ -48,6 +48,11 @@ class Bot(Base):
     token = Column(String, unique=True, index=True)
     id_canal_vip = Column(String)
     status = Column(String, default="desconectado")
+
+    # --- NOVOS CAMPOS QUE FALTAVAM ---
+    admin_principal_id = Column(String, nullable=True)
+    id_canal_vip = Column(String, nullable=True)
+    username = Column(String, nullable=True) # <--- ADICIONE ESTA LINHA OBRIGATORIAMENTE
     
     # NOVO CAMPO: Admin Principal para notificações
     admin_principal_id = Column(String, nullable=True) 
