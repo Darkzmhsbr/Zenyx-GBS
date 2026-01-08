@@ -317,45 +317,145 @@ class FlowUpdate(BaseModel):
     mostrar_planos_2: bool
 
 # ✅ MODELO COMPLETO PARA O WIZARD DE REMARKETING
+# =========================================================
+# 📢 DISPARO DE REMARKETING (MASSIVO OU INDIVIDUAL)
+# =========================================================
+# =========================================================
+# 📝 MODELOS PYDANTIC (REQ/RES)
+# =========================================================
+
+# Modelo para Criar/Atualizar Bot (Com suporte ao Admin ID)
+class BotCreate(BaseModel):
+    nome: str
+    token: str
+    id_canal_vip: str
+    admin_principal_id: Optional[str] = None # Campo Novo
+
+# Modelo para Atualização Parcial
+class BotUpdate(BaseModel):
+    nome: Optional[str] = None
+    token: Optional[str] = None
+    id_canal_vip: Optional[str] = None
+    admin_principal_id: Optional[str] = None
+
+class BotResponse(BotCreate):
+    id: int
+    status: str
+    leads: int = 0       # KPI Novo
+    revenue: float = 0.0 # KPI Novo
+    class Config:
+        from_attributes = True
+
+# Modelo unificado para Remarketing (Individual + Massa + Wizard)
 class RemarketingRequest(BaseModel):
-    bot_id: int
-    tipo_envio: str = "massivo"
-    target: str = "todos" # 'todos', 'pendentes', 'pagantes', 'expirados'
+    bot_id: Optional[int] = None
+    tipo_envio: str # 'todos', 'pendentes', 'individual', etc
     mensagem: str
     media_url: Optional[str] = None
-    incluir_oferta: bool = False
-    plano_oferta_id: Optional[str] = None
-    is_test: bool = False
-    
-    # Campos Extras do Wizard
-    plano_oferta_id: Optional[str] = None
-    valor_oferta: Optional[float] = 0.0
-    expire_timestamp: Optional[int] = 0
-    is_periodic: bool = False
     
     # Oferta
     incluir_oferta: bool = False
     plano_oferta_id: Optional[str] = None
+    valor_oferta: Optional[float] = 0.0
     
-    # Preço
-    price_mode: str = "original" # original, custom
+    # Validade e Agendamento
+    expire_timestamp: Optional[int] = 0
+    is_periodic: bool = False
+    periodic_days: int = 0
+    periodic_time: Optional[str] = None
+    
+    # Campos Extras do Wizard (Para compatibilidade com o Front)
+    price_mode: Optional[str] = "original"
     custom_price: Optional[float] = 0.0
-
-    # Validade (Expiração)
-    expiration_mode: str = "none" # none, minutes, hours, days
+    expiration_mode: Optional[str] = "none"
     expiration_value: Optional[int] = 0
-
-
-    # Controle de Teste
+    
+    # Controle de Envio Individual / Teste
     is_test: bool = False
-    specific_user_id: Optional[str] = None # Telegram ID para teste
+    specific_user_id: Optional[str] = None
 
-# ---   
 # Modelo para Atualização de Usuário (CRM)
 class UserUpdate(BaseModel):
     role: Optional[str] = None
     status: Optional[str] = None
-    custom_expiration: Optional[str] = None # 'vitalicio', 'remover' ou data YYYY-MM-DD
+    custom_expiration: Optional[str] = None
+
+# =========================================================
+# 📢 ROTA DE DISPARO (INDIVIDUAL E EM MASSA - FUNDIDA)
+# =========================================================
+@app.post("/api/admin/remarketing/send")
+def send_remarketing(data: RemarketingRequest, db: Session = Depends(get_db)):
+    
+    # --- 1. LÓGICA DE ENVIO INDIVIDUAL (NOVO) ---
+    if data.specific_user_id:
+        try:
+            bot = db.query(Bot).filter(Bot.id == data.bot_id).first()
+            if not bot: raise HTTPException(404, "Bot não encontrado")
+            
+            tb = telebot.TeleBot(bot.token)
+            
+            # Monta teclado se tiver oferta
+            markup = None
+            if data.incluir_oferta and data.plano_oferta_id:
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton(
+                    f"💎 Aproveitar por R$ {data.valor_oferta}", 
+                    callback_data=f"buy_promo_{data.plano_oferta_id}_{data.valor_oferta}"
+                ))
+
+            # Envia Mídia ou Texto
+            target_id = data.specific_user_id
+            
+            if data.media_url:
+                if data.media_url.endswith(('.jpg', '.png', '.jpeg')):
+                    tb.send_photo(target_id, data.media_url, caption=data.mensagem, reply_markup=markup)
+                elif data.media_url.endswith(('.mp4')):
+                    tb.send_video(target_id, data.media_url, caption=data.mensagem, reply_markup=markup)
+                else:
+                    tb.send_message(target_id, f"{data.mensagem}\n\n🔗 {data.media_url}", reply_markup=markup)
+            else:
+                tb.send_message(target_id, data.mensagem, reply_markup=markup)
+                
+            return {"status": "sent", "msg": "Enviado individualmente com sucesso"}
+            
+        except Exception as e:
+            logger.error(f"Erro no envio individual: {e}")
+            raise HTTPException(500, f"Erro ao enviar: {str(e)}")
+
+    # --- 2. LÓGICA DE ENVIO EM MASSA (ANTIGO - MANTIDO AQUI) ---
+    # Cria campanha no banco para o CronJob processar
+    try:
+        # Serializa a configuração para salvar no banco
+        config_json = json.dumps({
+            "msg": data.mensagem,
+            "media": data.media_url,
+            "offer": data.incluir_oferta,
+            "plano_id": data.plano_oferta_id,
+            "promo_price": data.valor_oferta,
+            "expire_timestamp": data.expire_timestamp
+        })
+
+        nova_campanha = RemarketingCampaign(
+            campaign_id=str(uuid.uuid4()),
+            bot_id=data.bot_id,
+            type='periodico' if data.is_periodic else 'massivo',
+            target=data.tipo_envio,
+            config=config_json,
+            status='ativo',
+            dia_atual=0, # Reset
+            data_inicio=datetime.utcnow(),
+            # Se for periódico, define intervalo. Se for massivo, executa agora (controlado pelo loop)
+            proxima_execucao=datetime.utcnow() 
+        )
+        
+        db.add(nova_campanha)
+        db.commit()
+        
+        return {"status": "queued", "msg": "Campanha em massa iniciada/agendada com sucesso"}
+
+    except Exception as e:
+        logger.error(f"Erro ao criar campanha em massa: {e}")
+        raise HTTPException(500, "Erro ao criar campanha")
 
 # ===========================
 # ⚙️ GESTÃO DE BOTS
@@ -381,7 +481,8 @@ def criar_bot(bot_data: BotCreate, db: Session = Depends(get_db)):
         nome=bot_data.nome,
         token=bot_data.token,
         id_canal_vip=bot_data.id_canal_vip,
-        status=status
+        status=status,
+        admin_principal_id=bot_data.admin_principal_id # Salva já na criação
     )
     db.add(novo_bot)
     db.commit()
@@ -390,52 +491,48 @@ def criar_bot(bot_data: BotCreate, db: Session = Depends(get_db)):
 
 @app.put("/api/admin/bots/{bot_id}")
 def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
-    bot = db.query(Bot).filter(Bot.id == bot_id).first()
-    if not bot: raise HTTPException(404, "Bot não encontrado")
+    bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
+    if not bot_db: raise HTTPException(404, "Bot não encontrado")
     
-    if dados.nome: bot.nome = dados.nome
-    if dados.token: bot.token = dados.token
-    if dados.id_canal_vip: bot.id_canal_vip = dados.id_canal_vip
+    # Guarda token antigo para verificar mudança
+    old_token = bot_db.token
+
+    # Atualiza campos básicos
+    if dados.nome: bot_db.nome = dados.nome
+    if dados.token: bot_db.token = dados.token
+    if dados.id_canal_vip: bot_db.id_canal_vip = dados.id_canal_vip
     
     # --- SALVA O ADMIN PRINCIPAL ---
+    # Aceita string vazia para limpar o campo, ou valor novo
     if dados.admin_principal_id is not None: 
-        bot.admin_principal_id = dados.admin_principal_id
+        bot_db.admin_principal_id = dados.admin_principal_id
     
-    db.commit()
-    return {"status": "ok", "msg": "Bot atualizado"}
-    
-    # Se houver troca de token, precisamos atualizar o Webhook
-    if dados.token and dados.token != bot_db.token:
+    # Se houver troca de token, atualiza Webhook
+    if dados.token and dados.token != old_token:
         try:
-            # 1. Tenta remover webhook do token antigo (opcional, mas bom)
+            # 1. Tenta remover webhook do token antigo
             try:
-                old_tb = telebot.TeleBot(bot_db.token)
+                old_tb = telebot.TeleBot(old_token)
                 old_tb.delete_webhook()
             except: pass
 
             # 2. Configura o novo webhook
             tb = telebot.TeleBot(dados.token)
             public_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "zenyx-gbs-production.up.railway.app")
-            # Garante que não tem https:// duplicado
             if public_url.startswith("https://"): public_url = public_url.replace("https://", "")
             
             webhook_url = f"https://{public_url}/webhook/{dados.token}"
             tb.set_webhook(url=webhook_url)
             
-            logger.info(f"♻️ Webhook atualizado para o novo token do bot {bot_db.nome}")
-            bot_db.status = "conectado"
+            logger.info(f"♻️ Webhook atualizado para o bot {bot_db.nome}")
+            bot_db.status = "ativo" # Reseta para ativo ao trocar token
         except Exception as e:
             logger.error(f"Erro ao atualizar webhook: {e}")
             bot_db.status = "erro_token"
     
-    # Atualiza os campos no banco
-    if dados.nome: bot_db.nome = dados.nome
-    if dados.token: bot_db.token = dados.token
-    if dados.id_canal_vip: bot_db.id_canal_vip = dados.id_canal_vip
-    
     db.commit()
     db.refresh(bot_db)
-    return {"status": "updated", "msg": "Bot atualizado com sucesso!"}
+    return {"status": "ok", "msg": "Bot atualizado com sucesso"}
 
 # --- NOVA ROTA: LIGAR/DESLIGAR BOT (TOGGLE) ---
 @app.post("/api/admin/bots/{bot_id}/toggle")
@@ -537,32 +634,50 @@ def remover_admin(bot_id: int, telegram_id: str, db: Session = Depends(get_db)):
 
 # --- NOVA ROTA: LISTAR BOTS ---
 
-@app.get("/api/admin/bots", response_model=List[BotResponse])
-def listar_bots(db: Session = Depends(get_db)):
+# =========================================================
+# 🤖 LISTAR BOTS (COM KPI TOTAIS E USERNAME)
+# =========================================================
+@app.get("/api/admin/bots")
+def list_bots(db: Session = Depends(get_db)):
     bots = db.query(Bot).all()
     resultado = []
     
     for bot in bots:
-        # 1. Calcula Leads (Total de Telegram IDs únicos que interagiram com este bot)
-        leads = db.query(func.count(func.distinct(Pedido.telegram_id)))\
-                  .filter(Pedido.bot_id == bot.id).scalar() or 0
-        
-        # 2. Calcula Receita Total (Soma dos pedidos 'paid')
-        revenue = db.query(func.sum(Pedido.valor))\
-                    .filter(Pedido.bot_id == bot.id, Pedido.status == 'paid').scalar() or 0.0
-        
-        # Monta o objeto de resposta manual para incluir os campos extras
-        bot_dict = {
+        # 1. Busca Username do Bot (Se não tiver salvo, tenta buscar na API do Telegram)
+        username_display = bot.username or "..."
+        if not bot.username and bot.token:
+            try:
+                tb = telebot.TeleBot(bot.token)
+                me = tb.get_me()
+                username_display = f"@{me.username}"
+                # Opcional: Salvar no banco para não consultar sempre
+                bot.username = username_display
+                db.commit()
+            except:
+                pass
+
+        # 2. Calcula LEADS TOTAIS (Contagem de usuários únicos na tabela de pedidos ou usuários)
+        # Assumindo que cada pedido único por telegram_id conta como um lead
+        leads_count = db.query(func.count(Pedido.telegram_id.distinct())).filter(Pedido.bot_id == bot.id).scalar() or 0
+
+        # 3. Calcula RECEITA TOTAL (Soma de todos os pedidos pagos)
+        receita_total = db.query(func.sum(Pedido.valor)).filter(
+            Pedido.bot_id == bot.id, 
+            Pedido.status == 'paid'
+        ).scalar() or 0.0
+
+        resultado.append({
             "id": bot.id,
             "nome": bot.nome,
             "token": bot.token,
-            "id_canal_vip": bot.id_canal_vip,
+            "username": username_display,
             "status": bot.status,
-            "leads": leads,
-            "revenue": revenue
-        }
-        resultado.append(bot_dict)
-        
+            "admin_principal_id": bot.admin_principal_id, # Garante que vai pro front
+            "id_canal_vip": bot.id_canal_vip,
+            "leads_count": leads_count,       # KPI Total
+            "vendas_total": receita_total     # KPI Total
+        })
+    
     return resultado
 
 # ===========================
