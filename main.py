@@ -352,7 +352,7 @@ class RemarketingRequest(BaseModel):
     mensagem: str
     media_url: Optional[str] = None
     
-    # Oferta
+    # Oferta (Aceita None e converte)
     incluir_oferta: bool = False
     plano_oferta_id: Optional[str] = None
     valor_oferta: Optional[float] = 0.0
@@ -360,20 +360,13 @@ class RemarketingRequest(BaseModel):
     # Validade e Agendamento
     expire_timestamp: Optional[int] = 0
     is_periodic: bool = False
-    periodic_days: Optional[int] = 0 # Alterado para Optional
+    periodic_days: Optional[int] = 0
     periodic_time: Optional[str] = None
     
-    # Campos Extras do Wizard
-    price_mode: Optional[str] = "original"
-    custom_price: Optional[float] = 0.0
-    expiration_mode: Optional[str] = "none"
-    expiration_value: Optional[int] = 0
-    
-    # Controle
-    is_test: bool = False
+    # Campos Extras e Controle
     specific_user_id: Optional[str] = None 
+    is_test: bool = False
 
-    # Validação automática para converter string vazia em None
     class Config:
         from_attributes = True
 
@@ -384,12 +377,11 @@ class UserUpdate(BaseModel):
     custom_expiration: Optional[str] = None
 
 # =========================================================
-# 📢 ROTA DE DISPARO (INDIVIDUAL E EM MASSA - FUNDIDA)
+# 📢 ROTA DE DISPARO (BLINDADA)
 # =========================================================
 @app.post("/api/admin/remarketing/send")
 def send_remarketing(data: RemarketingRequest, db: Session = Depends(get_db)):
-    
-    # --- 1. LÓGICA DE ENVIO INDIVIDUAL (NOVO) ---
+    # 1. ENVIO INDIVIDUAL
     if data.specific_user_id:
         try:
             bot = db.query(Bot).filter(Bot.id == data.bot_id).first()
@@ -397,7 +389,6 @@ def send_remarketing(data: RemarketingRequest, db: Session = Depends(get_db)):
             
             tb = telebot.TeleBot(bot.token)
             
-            # Monta teclado se tiver oferta
             markup = None
             if data.incluir_oferta and data.plano_oferta_id:
                 markup = types.InlineKeyboardMarkup()
@@ -406,10 +397,9 @@ def send_remarketing(data: RemarketingRequest, db: Session = Depends(get_db)):
                     callback_data=f"buy_promo_{data.plano_oferta_id}_{data.valor_oferta}"
                 ))
 
-            # Envia Mídia ou Texto
             target_id = data.specific_user_id
-            
             if data.media_url:
+                # Lógica de Mídia
                 if data.media_url.endswith(('.jpg', '.png', '.jpeg')):
                     tb.send_photo(target_id, data.media_url, caption=data.mensagem, reply_markup=markup)
                 elif data.media_url.endswith(('.mp4')):
@@ -420,22 +410,19 @@ def send_remarketing(data: RemarketingRequest, db: Session = Depends(get_db)):
                 tb.send_message(target_id, data.mensagem, reply_markup=markup)
                 
             return {"status": "sent", "msg": "Enviado individualmente com sucesso"}
-            
         except Exception as e:
-            logger.error(f"Erro no envio individual: {e}")
-            raise HTTPException(500, f"Erro ao enviar: {str(e)}")
+            logger.error(f"Erro envio individual: {e}")
+            raise HTTPException(500, f"Erro: {str(e)}")
 
-    # --- 2. LÓGICA DE ENVIO EM MASSA (ANTIGO - MANTIDO AQUI) ---
-    # Cria campanha no banco para o CronJob processar
+    # 2. ENVIO EM MASSA (Cria campanha)
     try:
-        # Serializa a configuração para salvar no banco
         config_json = json.dumps({
             "msg": data.mensagem,
             "media": data.media_url,
             "offer": data.incluir_oferta,
             "plano_id": data.plano_oferta_id,
             "promo_price": data.valor_oferta,
-            "expire_timestamp": data.expire_timestamp
+            "expire_timestamp": data.expire_timestamp or 0
         })
 
         nova_campanha = RemarketingCampaign(
@@ -445,19 +432,15 @@ def send_remarketing(data: RemarketingRequest, db: Session = Depends(get_db)):
             target=data.tipo_envio,
             config=config_json,
             status='ativo',
-            dia_atual=0, # Reset
+            dia_atual=0,
             data_inicio=datetime.utcnow(),
-            # Se for periódico, define intervalo. Se for massivo, executa agora (controlado pelo loop)
             proxima_execucao=datetime.utcnow() 
         )
-        
         db.add(nova_campanha)
         db.commit()
-        
-        return {"status": "queued", "msg": "Campanha em massa iniciada/agendada com sucesso"}
-
+        return {"status": "queued", "msg": "Campanha criada com sucesso"}
     except Exception as e:
-        logger.error(f"Erro ao criar campanha em massa: {e}")
+        logger.error(f"Erro criar campanha: {e}")
         raise HTTPException(500, "Erro ao criar campanha")
 
 # ===========================
@@ -536,6 +519,55 @@ def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(bot_db)
     return {"status": "ok", "msg": "Bot atualizado com sucesso"}
+
+# =========================================================
+# 👥 CRM DE USUÁRIOS (COM EXPIRAÇÃO)
+# =========================================================
+@app.get("/api/admin/users")
+def get_users(bot_id: int, filtro: str = 'todos', page: int = 1, limit: int = 50, db: Session = Depends(get_db)):
+    query = db.query(
+        Pedido.telegram_id, 
+        Pedido.first_name, 
+        Pedido.username,
+        Pedido.status,
+        Pedido.created_at,
+        Pedido.expiration_date, # <--- ESSENCIAL PARA A COLUNA APARECER
+        Pedido.id
+    ).filter(Pedido.bot_id == bot_id)
+
+    # Filtros
+    if filtro == 'pendente':
+        query = query.filter(Pedido.status == 'pending')
+    elif filtro == 'active':
+        query = query.filter(Pedido.status.in_(['paid', 'approved', 'active']))
+    elif filtro == 'expired':
+        query = query.filter(Pedido.status == 'expired')
+
+    # Ordenação e Paginação
+    total_records = query.distinct(Pedido.telegram_id).count()
+    query = query.order_by(desc(Pedido.created_at))
+    offset = (page - 1) * limit
+    
+    # Agrupa por telegram_id para não repetir usuário
+    users_raw = query.distinct(Pedido.telegram_id).limit(limit).offset(offset).all()
+    
+    users_formatted = []
+    for u in users_raw:
+        users_formatted.append({
+            "id": u.id,
+            "telegram_id": u.telegram_id,
+            "first_name": u.first_name,
+            "username": u.username,
+            "status": u.status,
+            "created_at": u.created_at,
+            "expiration_date": u.expiration_date # Envia a data para o Front
+        })
+
+    return {
+        "users": users_formatted,
+        "total_pages": (total_records // limit) + 1,
+        "total_records": total_records
+    }
 
 # --- NOVA ROTA: LIGAR/DESLIGAR BOT (TOGGLE) ---
 @app.post("/api/admin/bots/{bot_id}/toggle")
@@ -646,16 +678,13 @@ def list_bots(db: Session = Depends(get_db)):
     resultado = []
     
     for bot in bots:
-        # 1. Busca Username (Garante que começa com @)
+        # Busca Username
         username_display = bot.username or "..."
-        if username_display != "..." and not username_display.startswith("@"):
-            username_display = f"@{username_display}"
-
-        # 2. Calcula LEADS TOTAIS (Contagem de usuários únicos na tabela de pedidos)
+        
+        # KPI: Leads (Pedidos Únicos)
         leads_count = db.query(func.count(Pedido.telegram_id.distinct())).filter(Pedido.bot_id == bot.id).scalar() or 0
 
-        # 3. Calcula RECEITA TOTAL (Soma estendida para todos status de sucesso)
-        # O erro estava aqui: somava apenas 'paid'. Agora soma todos os aprovados.
+        # KPI: Receita Total (Soma TODOS os status de sucesso)
         receita_total = db.query(func.sum(Pedido.valor)).filter(
             Pedido.bot_id == bot.id, 
             Pedido.status.in_(['paid', 'approved', 'completed', 'succeeded'])
