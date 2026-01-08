@@ -37,6 +37,9 @@ app.add_middleware(
 # =========================================================
 # 🛠️ AUTO-REPARO DO BANCO DE DADOS (CORREÇÃO DE COLUNAS)
 # =========================================================
+# =========================================================
+# 🛠️ AUTO-REPARO DO BANCO DE DADOS (CORREÇÃO DE COLUNAS)
+# =========================================================
 @app.on_event("startup")
 def on_startup():
     # 1. Cria tabelas e corrige colunas
@@ -54,7 +57,9 @@ def on_startup():
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS promo_price FLOAT;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS expiration_at TIMESTAMP WITHOUT TIME ZONE;",
-                # --- NOVO: Campo Admin Principal ---
+                # --- CORREÇÃO DO ERRO ATUAL ---
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS admin_id VARCHAR;", 
+                # --- CORREÇÃO DO BOT CONFIG ---
                 "ALTER TABLE bots ADD COLUMN IF NOT EXISTS admin_principal_id VARCHAR;"
             ]
             for cmd in comandos_sql:
