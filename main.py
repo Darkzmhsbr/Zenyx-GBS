@@ -900,8 +900,10 @@ CAMPAIGN_STATUS = {
 }
 
 # =========================================================
-# 📢 LÓGICA DE REMARKETING (VERSÃO GOLD: FILTROS + TESTE + SEGURANÇA)
+# 📢 LÓGICA DE REMARKETING (RECUPERADA E BLINDADA)
 # =========================================================
+
+# Variável global de status
 CAMPAIGN_STATUS = {"running": False, "sent": 0, "total": 0, "blocked": 0}
 
 def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Session):
@@ -916,17 +918,17 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
     bot_sender = telebot.TeleBot(bot_db.token)
     usuarios_para_envio = []
 
-    # --- 1. DEFINIR QUEM RECEBE (Lógica Híbrida) ---
+    # --- A. DEFINIR QUEM RECEBE (Lógica Híbrida) ---
     
-    # A) MODO TESTE: Envia apenas para o ID específico
+    # 1. MODO TESTE: Envia apenas para o ID específico (Admin ou último user)
     if payload.is_test and payload.specific_user_id:
         logger.info(f"🧪 MODO TESTE: Enviando apenas para {payload.specific_user_id}")
-        # Cria um objeto falso para simular o usuário do banco
+        # Cria um objeto simples simulando um usuário
         class MockUser:
             def __init__(self, tid): self.telegram_id = tid
         usuarios_para_envio = [MockUser(payload.specific_user_id)]
         
-    # B) MODO REAL: Filtra do banco
+    # 2. MODO REAL: Filtra do banco de dados
     else:
         query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
         
@@ -943,11 +945,11 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
 
     CAMPAIGN_STATUS["total"] = len(usuarios_para_envio)
     
-    # --- 2. PREPARAR BOTÃO (SE HOUVER OFERTA) ---
+    # --- B. PREPARAR BOTÃO (SE HOUVER OFERTA) ---
     markup = None
     if payload.incluir_oferta and payload.plano_oferta_id:
         try:
-            # Busca o plano de forma robusta (pelo ID ou pela Key)
+            # Busca o plano de forma flexível (ID numérico ou Key string)
             plano = db.query(PlanoConfig).filter(
                 (PlanoConfig.key_id == payload.plano_oferta_id) | 
                 (PlanoConfig.id == int(payload.plano_oferta_id) if str(payload.plano_oferta_id).isdigit() else False)
@@ -962,11 +964,11 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
         except Exception as e:
             logger.error(f"Erro ao gerar botão de oferta: {e}")
 
-    # --- 3. LOOP DE ENVIO ---
+    # --- C. LOOP DE ENVIO ---
     for u in usuarios_para_envio:
         try:
-            # Tenta enviar Mídia (Foto/Vídeo) se houver URL válida
             sent = False
+            # Tenta enviar Mídia (Foto/Vídeo) se houver URL válida
             if payload.media_url and len(payload.media_url) > 5:
                 try:
                     if payload.media_url.lower().endswith(('.mp4', '.mov', '.avi')):
@@ -975,7 +977,7 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
                         bot_sender.send_photo(u.telegram_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
                     sent = True
                 except Exception as e_media:
-                    # Se falhar a mídia (link quebrado, formato inválido), faz fallback para texto
+                    # Se falhar a mídia (link quebrado), faz fallback para texto
                     logger.warning(f"Erro mídia para {u.telegram_id}: {e_media}. Tentando apenas texto.")
             
             # Se não tinha mídia ou se a mídia falhou, envia texto puro
@@ -989,14 +991,15 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
             if "blocked" in str(e).lower() or "kicked" in str(e).lower():
                 CAMPAIGN_STATUS["blocked"] += 1
             else:
-                logger.error(f"Erro envio genérico {u.telegram_id}: {e}")
+                # logger.error(f"Erro envio genérico {u.telegram_id}: {e}")
+                pass
         
         # Delay anti-spam (importante!)
         time.sleep(0.05) 
     
     CAMPAIGN_STATUS["running"] = False
     
-    # --- 4. SALVAR HISTÓRICO (Apenas se não for teste) ---
+    # --- D. SALVAR HISTÓRICO (Apenas se não for teste) ---
     if not payload.is_test:
         try:
             config_summary = json.dumps({
@@ -1021,7 +1024,41 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
         except Exception as e:
             logger.error(f"Erro ao salvar historico: {e}")
 
-            
+# --- ROTAS DA API ---
+
+@app.post("/api/admin/remarketing/send")
+def enviar_remarketing(payload: RemarketingRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    # Lógica para Teste: Se for teste e não tiver ID, pega o último do banco
+    if payload.is_test and not payload.specific_user_id:
+        ultimo = db.query(Pedido).filter(Pedido.bot_id == payload.bot_id).order_by(Pedido.id.desc()).first()
+        if ultimo:
+            payload.specific_user_id = ultimo.telegram_id
+        else:
+            # Tenta pegar um admin se não tiver clientes
+            admin = db.query(BotAdmin).filter(BotAdmin.bot_id == payload.bot_id).first()
+            if admin: payload.specific_user_id = admin.telegram_id
+            else: raise HTTPException(400, "Nenhum usuário encontrado para teste. Interaja com o bot primeiro (/start).")
+
+    background_tasks.add_task(processar_envio_remarketing, payload.bot_id, payload, db)
+    return {"status": "enviando", "msg": "Campanha iniciada!"}
+
+@app.get("/api/admin/remarketing/status")
+def status_remarketing():
+    return CAMPAIGN_STATUS
+
+@app.get("/api/admin/remarketing/history/{bot_id}")
+def historico_remarketing(bot_id: int, db: Session = Depends(get_db)):
+    history = db.query(RemarketingCampaign).filter(RemarketingCampaign.bot_id == bot_id).order_by(RemarketingCampaign.data_envio.desc()).all()
+    return [{
+        "id": h.id, 
+        "data": h.data_envio.strftime("%d/%m/%Y %H:%M"), 
+        "total": h.total_leads, 
+        "sent": h.sent_success, 
+        "blocked": h.blocked_count, 
+        "config": {"content_data": h.config}
+    } for h in history]
+
+
 # =========================================================
 # 📊 ROTA DE DASHBOARD (KPIs REAIS)
 # =========================================================
