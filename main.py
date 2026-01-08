@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func
 
 # Importa banco de dados
-from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, Pedido, SystemConfig, RemarketingCampaign, engine
+from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, Pedido, SystemConfig, RemarketingCampaign, BotAdmin, engine
 
 # Configuração de Log
 logging.basicConfig(level=logging.INFO)
@@ -266,6 +266,11 @@ class BotUpdate(BaseModel):
     token: Optional[str] = None
     id_canal_vip: Optional[str] = None
 
+# Modelo para Criar Admin
+class BotAdminCreate(BaseModel):
+    telegram_id: str
+    nome: Optional[str] = "Admin"
+
 # Modelo de Resposta com Estatísticas
 class BotResponse(BotCreate):
     id: int
@@ -415,6 +420,58 @@ def deletar_bot(bot_id: int, db: Session = Depends(get_db)):
     db.commit()
     
     return {"status": "deleted", "msg": "Bot removido com sucesso"}
+
+# =========================================================
+# 🛡️ GESTÃO DE ADMINISTRADORES (FASE 1)
+# =========================================================
+
+@app.get("/api/admin/bots/{bot_id}/admins")
+def listar_admins(bot_id: int, db: Session = Depends(get_db)):
+    """Lista todos os admins de um bot específico"""
+    admins = db.query(BotAdmin).filter(BotAdmin.bot_id == bot_id).all()
+    return admins
+
+@app.post("/api/admin/bots/{bot_id}/admins")
+def adicionar_admin(bot_id: int, dados: BotAdminCreate, db: Session = Depends(get_db)):
+    """Adiciona um novo admin ao bot"""
+    # Verifica se o bot existe
+    bot = db.query(Bot).filter(Bot.id == bot_id).first()
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot não encontrado")
+    
+    # Verifica se já é admin
+    existente = db.query(BotAdmin).filter(
+        BotAdmin.bot_id == bot_id, 
+        BotAdmin.telegram_id == dados.telegram_id
+    ).first()
+    
+    if existente:
+        raise HTTPException(status_code=400, detail="Este ID já é administrador deste bot.")
+    
+    novo_admin = BotAdmin(
+        bot_id=bot_id,
+        telegram_id=dados.telegram_id,
+        nome=dados.nome
+    )
+    db.add(novo_admin)
+    db.commit()
+    db.refresh(novo_admin)
+    return novo_admin
+
+@app.delete("/api/admin/bots/{bot_id}/admins/{telegram_id}")
+def remover_admin(bot_id: int, telegram_id: str, db: Session = Depends(get_db)):
+    """Remove um admin pelo Telegram ID"""
+    admin_db = db.query(BotAdmin).filter(
+        BotAdmin.bot_id == bot_id,
+        BotAdmin.telegram_id == telegram_id
+    ).first()
+    
+    if not admin_db:
+        raise HTTPException(status_code=404, detail="Administrador não encontrado")
+    
+    db.delete(admin_db)
+    db.commit()
+    return {"status": "deleted", "msg": "Administrador removido com sucesso"}
 
 # --- NOVA ROTA: LISTAR BOTS ---
 
