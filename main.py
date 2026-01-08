@@ -314,10 +314,6 @@ class FlowUpdate(BaseModel):
     msg_2_media: Optional[str] = None
     mostrar_planos_2: bool
 
-# ✅ MODELO COMPLETO PARA O WIZARD DE REMARKETING
-# =========================================================
-# 📢 DISPARO DE REMARKETING (MASSIVO OU INDIVIDUAL)
-# =========================================================
 # =========================================================
 # 📝 MODELOS PYDANTIC (REQ/RES)
 # =========================================================
@@ -327,9 +323,8 @@ class BotCreate(BaseModel):
     nome: str
     token: str
     id_canal_vip: str
-    admin_principal_id: Optional[str] = None # Campo Novo
+    admin_principal_id: Optional[str] = None
 
-# Modelo para Atualização Parcial
 class BotUpdate(BaseModel):
     nome: Optional[str] = None
     token: Optional[str] = None
@@ -339,20 +334,19 @@ class BotUpdate(BaseModel):
 class BotResponse(BotCreate):
     id: int
     status: str
-    leads: int = 0       # KPI Novo
-    revenue: float = 0.0 # KPI Novo
+    leads: int = 0
+    revenue: float = 0.0
     class Config:
         from_attributes = True
 
-# Modelo unificado para Remarketing (Individual + Massa + Wizard)
-# Modelo unificado para Remarketing (Tolerante a falhas do Front)
+# Modelo ULTRA PERMISSIVO para Remarketing (Aceita opcionais)
 class RemarketingRequest(BaseModel):
     bot_id: Optional[int] = None
     tipo_envio: str 
     mensagem: str
     media_url: Optional[str] = None
     
-    # Oferta (Aceita None e converte)
+    # Oferta
     incluir_oferta: bool = False
     plano_oferta_id: Optional[str] = None
     valor_oferta: Optional[float] = 0.0
@@ -360,17 +354,22 @@ class RemarketingRequest(BaseModel):
     # Validade e Agendamento
     expire_timestamp: Optional[int] = 0
     is_periodic: bool = False
-    periodic_days: Optional[int] = 0
+    periodic_days: Optional[int] = 0 
     periodic_time: Optional[str] = None
     
-    # Campos Extras e Controle
-    specific_user_id: Optional[str] = None 
+    # Campos Extras do Front (Ignorados ou convertidos)
+    price_mode: Optional[str] = None
+    custom_price: Optional[float] = 0.0
+    expiration_mode: Optional[str] = None
+    expiration_value: Optional[int] = 0
+    
+    # Controle
     is_test: bool = False
+    specific_user_id: Optional[str] = None 
 
     class Config:
         from_attributes = True
 
-# Modelo para Atualização de Usuário (CRM)
 class UserUpdate(BaseModel):
     role: Optional[str] = None
     status: Optional[str] = None
@@ -381,7 +380,8 @@ class UserUpdate(BaseModel):
 # =========================================================
 @app.post("/api/admin/remarketing/send")
 def send_remarketing(data: RemarketingRequest, db: Session = Depends(get_db)):
-    # 1. ENVIO INDIVIDUAL
+    
+    # 1. Envio Individual
     if data.specific_user_id:
         try:
             bot = db.query(Bot).filter(Bot.id == data.bot_id).first()
@@ -393,28 +393,27 @@ def send_remarketing(data: RemarketingRequest, db: Session = Depends(get_db)):
             if data.incluir_oferta and data.plano_oferta_id:
                 markup = types.InlineKeyboardMarkup()
                 markup.add(types.InlineKeyboardButton(
-                    f"💎 Aproveitar por R$ {data.valor_oferta}", 
+                    f"💎 Oferta R$ {data.valor_oferta}", 
                     callback_data=f"buy_promo_{data.plano_oferta_id}_{data.valor_oferta}"
                 ))
 
-            target_id = data.specific_user_id
+            target = data.specific_user_id
             if data.media_url:
-                # Lógica de Mídia
                 if data.media_url.endswith(('.jpg', '.png', '.jpeg')):
-                    tb.send_photo(target_id, data.media_url, caption=data.mensagem, reply_markup=markup)
+                    tb.send_photo(target, data.media_url, caption=data.mensagem, reply_markup=markup)
                 elif data.media_url.endswith(('.mp4')):
-                    tb.send_video(target_id, data.media_url, caption=data.mensagem, reply_markup=markup)
+                    tb.send_video(target, data.media_url, caption=data.mensagem, reply_markup=markup)
                 else:
-                    tb.send_message(target_id, f"{data.mensagem}\n\n🔗 {data.media_url}", reply_markup=markup)
+                    tb.send_message(target, f"{data.mensagem}\n\n🔗 {data.media_url}", reply_markup=markup)
             else:
-                tb.send_message(target_id, data.mensagem, reply_markup=markup)
+                tb.send_message(target, data.mensagem, reply_markup=markup)
                 
-            return {"status": "sent", "msg": "Enviado individualmente com sucesso"}
+            return {"status": "sent", "msg": "Enviado com sucesso"}
         except Exception as e:
             logger.error(f"Erro envio individual: {e}")
             raise HTTPException(500, f"Erro: {str(e)}")
 
-    # 2. ENVIO EM MASSA (Cria campanha)
+    # 2. Envio em Massa (Cria Campanha)
     try:
         config_json = json.dumps({
             "msg": data.mensagem,
@@ -440,8 +439,8 @@ def send_remarketing(data: RemarketingRequest, db: Session = Depends(get_db)):
         db.commit()
         return {"status": "queued", "msg": "Campanha criada com sucesso"}
     except Exception as e:
-        logger.error(f"Erro criar campanha: {e}")
-        raise HTTPException(500, "Erro ao criar campanha")
+        logger.error(f"Erro ao criar campanha: {e}")
+        raise HTTPException(500, "Erro interno")
 
 # ===========================
 # ⚙️ GESTÃO DE BOTS
@@ -521,38 +520,31 @@ def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
     return {"status": "ok", "msg": "Bot atualizado com sucesso"}
 
 # =========================================================
-# 👥 CRM DE USUÁRIOS (COM EXPIRAÇÃO)
+# 👥 ROTA: CONTATOS (CORRIGIDA COLUNA EXPIRAÇÃO)
 # =========================================================
-@app.get("/api/admin/users")
-def get_users(bot_id: int, filtro: str = 'todos', page: int = 1, limit: int = 50, db: Session = Depends(get_db)):
-    query = db.query(
-        Pedido.telegram_id, 
-        Pedido.first_name, 
-        Pedido.username,
-        Pedido.status,
-        Pedido.created_at,
-        Pedido.expiration_date, # <--- ESSENCIAL PARA A COLUNA APARECER
-        Pedido.id
-    ).filter(Pedido.bot_id == bot_id)
+@app.get("/api/admin/contacts")
+def get_contacts(bot_id: int = None, status: str = 'todos', page: int = 1, limit: int = 50, db: Session = Depends(get_db)):
+    # Se não passar bot_id, tenta pegar o primeiro ou retorna vazio (ajuste conforme sua lógica)
+    if not bot_id:
+        return {"users": [], "total_pages": 0, "total_records": 0}
+
+    query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
 
     # Filtros
-    if filtro == 'pendente':
+    if status == 'pendente':
         query = query.filter(Pedido.status == 'pending')
-    elif filtro == 'active':
+    elif status == 'active':
         query = query.filter(Pedido.status.in_(['paid', 'approved', 'active']))
-    elif filtro == 'expired':
+    elif status == 'expired':
         query = query.filter(Pedido.status == 'expired')
 
-    # Ordenação e Paginação
-    total_records = query.distinct(Pedido.telegram_id).count()
-    query = query.order_by(desc(Pedido.created_at))
-    offset = (page - 1) * limit
-    
-    # Agrupa por telegram_id para não repetir usuário
-    users_raw = query.distinct(Pedido.telegram_id).limit(limit).offset(offset).all()
+    # Paginação
+    total_records = query.count()
+    users_raw = query.order_by(desc(Pedido.created_at)).offset((page - 1) * limit).limit(limit).all()
     
     users_formatted = []
     for u in users_raw:
+        # Garante que expiration_date seja enviado
         users_formatted.append({
             "id": u.id,
             "telegram_id": u.telegram_id,
@@ -560,7 +552,7 @@ def get_users(bot_id: int, filtro: str = 'todos', page: int = 1, limit: int = 50
             "username": u.username,
             "status": u.status,
             "created_at": u.created_at,
-            "expiration_date": u.expiration_date # Envia a data para o Front
+            "expiration_date": u.expiration_date # <--- CAMPO CRÍTICO PARA A TABELA
         })
 
     return {
@@ -678,16 +670,16 @@ def list_bots(db: Session = Depends(get_db)):
     resultado = []
     
     for bot in bots:
-        # Busca Username
+        # Username Limpo
         username_display = bot.username or "..."
         
-        # KPI: Leads (Pedidos Únicos)
+        # Leads (Pedidos Únicos)
         leads_count = db.query(func.count(Pedido.telegram_id.distinct())).filter(Pedido.bot_id == bot.id).scalar() or 0
 
-        # KPI: Receita Total (Soma TODOS os status de sucesso)
+        # Receita Total (Soma TODOS os status de sucesso)
         receita_total = db.query(func.sum(Pedido.valor)).filter(
             Pedido.bot_id == bot.id, 
-            Pedido.status.in_(['paid', 'approved', 'completed', 'succeeded'])
+            Pedido.status.in_(['paid', 'approved', 'completed', 'succeeded', 'active'])
         ).scalar() or 0.0
 
         resultado.append({
