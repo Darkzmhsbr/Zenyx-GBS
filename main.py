@@ -39,45 +39,31 @@ app.add_middleware(
 # =========================================================
 @app.on_event("startup")
 def on_startup():
-    # 1. Cria tabelas que não existem
+    # 1. Cria tabelas e corrige colunas
     init_db()
-    
-    # 2. FORÇA A CRIAÇÃO DAS COLUNAS NOVAS (Correção Crítica)
     try:
         with engine.connect() as conn:
             logger.info("🔧 Verificando integridade do banco de dados...")
-            
             comandos_sql = [
-                # --- Campos antigos (para garantir) ---
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;",
-                
-                # --- NOVOS CAMPOS DO REMARKETING (CRÍTICO) ---
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS target VARCHAR DEFAULT 'todos';",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS type VARCHAR DEFAULT 'massivo';",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS promo_price FLOAT;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS expiration_at TIMESTAMP WITHOUT TIME ZONE;",
-                
-                # --- Campos de Recorrência (Se faltar) ---
-                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS dia_atual INTEGER DEFAULT 0;",
-                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS data_inicio TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
-                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS proxima_execucao TIMESTAMP WITHOUT TIME ZONE;"
+                # --- NOVO: Campo Admin Principal ---
+                "ALTER TABLE bots ADD COLUMN IF NOT EXISTS admin_principal_id VARCHAR;"
             ]
-            
             for cmd in comandos_sql:
-                try:
-                    conn.execute(text(cmd))
-                except Exception as e_sql:
-                    # Ignora erro se a coluna já existir (dupla segurança)
-                    logger.warning(f"Aviso SQL: {e_sql}")
-            
+                try: conn.execute(text(cmd))
+                except Exception as e_sql: logger.warning(f"Aviso SQL: {e_sql}")
             conn.commit()
             logger.info("✅ BANCO DE DADOS ATUALIZADO COM SUCESSO!")
             
-        # --- 3. INICIA O CEIFADOR ---
+        # Inicia Ceifador
         thread = threading.Thread(target=loop_verificar_vencimentos)
         thread.daemon = True
         thread.start()
@@ -239,6 +225,16 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
         logger.error(f"Exceção PushinPay: {e}")
         return None
 
+# --- HELPER: Notificar Admin Principal ---
+def notificar_admin_principal(bot_db: Bot, mensagem: str):
+    if not bot_db.admin_principal_id:
+        return
+    try:
+        sender = telebot.TeleBot(bot_db.token)
+        sender.send_message(bot_db.admin_principal_id, mensagem, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Falha ao notificar admin principal {bot_db.admin_principal_id}: {e}")
+
 # --- ROTAS DE INTEGRAÇÃO (SALVAR TOKEN) ---
 class IntegrationUpdate(BaseModel):
     token: str
@@ -281,6 +277,7 @@ class BotUpdate(BaseModel):
     nome: Optional[str] = None
     token: Optional[str] = None
     id_canal_vip: Optional[str] = None
+    admin_principal_id: Optional[str] = None
 
 # Modelo para Criar Admin
 class BotAdminCreate(BaseModel):
@@ -386,10 +383,20 @@ def criar_bot(bot_data: BotCreate, db: Session = Depends(get_db)):
     return novo_bot
 
 @app.put("/api/admin/bots/{bot_id}")
-def atualizar_bot(bot_id: int, dados: BotUpdate, db: Session = Depends(get_db)):
-    bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
-    if not bot_db:
-        raise HTTPException(status_code=404, detail="Bot não encontrado")
+def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
+    bot = db.query(Bot).filter(Bot.id == bot_id).first()
+    if not bot: raise HTTPException(404, "Bot não encontrado")
+    
+    if dados.nome: bot.nome = dados.nome
+    if dados.token: bot.token = dados.token
+    if dados.id_canal_vip: bot.id_canal_vip = dados.id_canal_vip
+    
+    # --- SALVA O ADMIN PRINCIPAL ---
+    if dados.admin_principal_id is not None: 
+        bot.admin_principal_id = dados.admin_principal_id
+    
+    db.commit()
+    return {"status": "ok", "msg": "Bot atualizado"}
     
     # Se houver troca de token, precisamos atualizar o Webhook
     if dados.token and dados.token != bot_db.token:
@@ -427,9 +434,19 @@ def atualizar_bot(bot_id: int, dados: BotUpdate, db: Session = Depends(get_db)):
 # --- NOVA ROTA: LIGAR/DESLIGAR BOT (TOGGLE) ---
 @app.post("/api/admin/bots/{bot_id}/toggle")
 def toggle_bot(bot_id: int, db: Session = Depends(get_db)):
-    bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
-    if not bot_db:
-        raise HTTPException(status_code=404, detail="Bot não encontrado")
+    bot = db.query(Bot).filter(Bot.id == bot_id).first()
+    if not bot: raise HTTPException(404, "Bot não encontrado")
+    
+    novo_status = "ativo" if bot.status != "ativo" else "pausado"
+    bot.status = novo_status
+    db.commit()
+    
+    # 🔔 Notifica Admin
+    emoji = "🟢" if novo_status == "ativo" else "🔴"
+    msg = f"{emoji} *STATUS DO BOT ALTERADO*\n\nO bot *{bot.nome}* agora está: *{novo_status.upper()}*"
+    notificar_admin_principal(bot, msg)
+    
+    return {"status": novo_status}
     
     # Inverte o status atual
     if bot_db.status == "pausado":
@@ -953,8 +970,19 @@ Copie o código abaixo para garantir sua vaga:
                 db.add(novo_pedido)
                 db.commit()
 
+                # --- AQUI VOCÊ PODE NOTIFICAR NOVO LEAD (OPCIONAL) ⬇️ ---
+                try:
+                    # Correção: Usamos plano.preco_atual aqui, pois 'preco_final' não existe neste bloco
+                    msg_lead = f"🆕 *Novo Lead (PIX Gerado)*\n👤 {update.callback_query.from_user.first_name}\n💰 R$ {plano.preco_atual:.2f}"
+                    notificar_admin_principal(bot_db, msg_lead)
+                except Exception as e:
+                    # Loga o erro mas não trava o bot se a notificação falhar
+                    logger.error(f"Erro ao notificar lead: {e}")
+                # --------------------------------------------------------
+
                 try: bot_temp.delete_message(chat_id, msg_aguarde.message_id)
                 except: pass
+
 
                 legenda_pix = f"""🌟 Seu pagamento foi gerado com sucesso:
 🎁 Plano: {plano.nome_exibicao}
@@ -984,21 +1012,41 @@ Copie o código abaixo para garantir sua vaga:
 # 👥 ROTAS DE CRM (BASE DE CONTATOS)
 # =========================================================
 @app.get("/api/admin/contacts")
-def listar_contatos(status: str = "todos", db: Session = Depends(get_db)):
-    """
-    Lista usuários com base nos pedidos gerados.
-    Filtros: 'todos', 'pagantes' (paid), 'pendentes' (pending)
-    """
-    query = db.query(Pedido)
+def listar_contatos(status: str = "todos", page: int = 1, limit: int = 100, db: Session = Depends(get_db)):
+    query = db.query(Pedido).order_by(Pedido.created_at.desc())
     
-    if status == "pagantes":
-        query = query.filter(Pedido.status == "paid")
-    elif status == "pendentes":
-        query = query.filter(Pedido.status == "pending")
+    if status == "pagantes": query = query.filter(Pedido.status == 'paid')
+    elif status == "pendentes": query = query.filter(Pedido.status == 'pending')
+    elif status == "expirados": query = query.filter(Pedido.status == 'expired')
     
-    # Ordena pelos mais recentes
-    contatos = query.order_by(Pedido.created_at.desc()).all()
-    return contatos
+    total_registros = query.count()
+    
+    # Paginação
+    offset = (page - 1) * limit
+    pedidos = query.offset(offset).limit(limit).all()
+    
+    # Formata retorno
+    users_list = []
+    for p in pedidos:
+        users_list.append({
+            "id": p.id,
+            "telegram_id": p.telegram_id,
+            "first_name": p.first_name,
+            "username": p.username,
+            "plano_nome": p.plano_nome,
+            "valor": p.valor,
+            "status": p.status,
+            "created_at": p.created_at,
+            "custom_expiration": p.custom_expiration,
+            "role": p.role
+        })
+        
+    return {
+        "users": users_list,
+        "total": total_registros,
+        "page": page,
+        "pages": (total_registros + limit - 1) // limit
+    }
 
 # =========================================================
 # 📢 ROTAS DE REMARKETING (DISPARADOR AVANÇADO)
@@ -1311,88 +1359,86 @@ def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db))
 # =========================================================
 # 💸 WEBHOOK DE PAGAMENTO (BLINDADO E TAGARELA)
 # =========================================================
-@app.post("/webhook/pix")
-async def webhook_pix(request: Request, db: Session = Depends(get_db)):
+@app.post("/api/webhook")
+async def webhook(req: Request, bg_tasks: BackgroundTasks):
     try:
-        # 1. Lê e Loga TUDO que chegou (Pra gente ver no Railway)
-        raw_body = await request.body()
-        data = await request.json()
-        logger.info(f"💰 JSON RECEBIDO PUSHINPAY: {data}")
-
-        # 2. Flexibilidade nos Campos
-        # PushinPay pode mandar 'id', 'external_reference', 'uuid' dependendo da versão
-        tx_id = data.get("external_reference") or data.get("id") or data.get("uuid")
-        status_pix = str(data.get("status", "")).lower()
-
-        # 3. Validação Flexível de Status
-        status_validos = ["paid", "approved", "completed", "succeeded"]
+        raw = await req.body()
+        try: payload = json.loads(raw)
+        except: payload = {k: v[0] for k,v in parse_qs(raw.decode()).items()}
         
-        if not tx_id:
-            logger.warning("⚠️ Webhook ignorado: Sem ID de transação.")
-            return {"status": "ignored", "reason": "no_tx_id"}
+        # Se for pagamento APROVADO
+        if str(payload.get('status')).upper() in ['PAID', 'APPROVED', 'COMPLETED', 'SUCCEEDED']:
+            db = SessionLocal()
+            tx = str(payload.get('id')).lower()
+            p = db.query(Pedido).filter(Pedido.transaction_id == tx).first()
             
-        if status_pix not in status_validos:
-            logger.warning(f"⚠️ Webhook ignorado: Status '{status_pix}' não é de pagamento aprovado.")
-            return {"status": "ignored", "reason": f"status_{status_pix}"}
+            # Se achou o pedido e ele ainda não estava pago
+            if p and p.status != 'paid':
+                p.status = 'paid'
+                db.commit() # Salva o status pago
+                
+                # --- 🔔 NOTIFICAÇÃO AO ADMIN (NOVO) ---
+                try:
+                    bot_db = db.query(Bot).filter(Bot.id == p.bot_id).first()
+                    if bot_db and bot_db.admin_principal_id:
+                        msg_venda = (
+                            f"💰 *VENDA APROVADA!*\n\n"
+                            f"👤 Cliente: {p.first_name}\n"
+                            f"💎 Plano: {p.plano_nome}\n"
+                            f"💵 Valor: R$ {p.valor:.2f}\n"
+                            f"📅 Data: {datetime.now().strftime('%d/%m %H:%M')}"
+                        )
+                        notificar_admin_principal(bot_db, msg_venda) 
+                except Exception as e_notify:
+                    logger.error(f"Erro ao notificar admin: {e_notify}")
+                # --------------------------------------
 
-        # 4. Busca Pedido + Bot
-        pedido = db.query(Pedido).join(Bot).filter(Pedido.transaction_id == tx_id).first()
+                # --- ENVIO DO LINK DE ACESSO AO CLIENTE ---
+                if not p.mensagem_enviada:
+                    try:
+                        bot_data = db.query(Bot).filter(Bot.id == p.bot_id).first()
+                        tb = telebot.TeleBot(bot_data.token)
+                        
+                        try: canal_vip_id = int(str(bot_data.id_canal_vip).strip())
+                        except: canal_vip_id = bot_data.id_canal_vip
 
-        if not pedido:
-            logger.error(f"❌ Pedido não encontrado no banco para TX: {tx_id}")
-            # Retorna 200 para o PushinPay parar de mandar, mas loga erro
-            return {"status": "ok", "msg": "Order not found internally"}
+                        # Tenta desbanir antes (garantia)
+                        try: tb.unban_chat_member(canal_vip_id, int(p.telegram_id))
+                        except: pass
 
-        if pedido.status == "paid":
-            logger.info(f"ℹ️ Pedido {tx_id} já estava pago.")
-            return {"status": "ok", "msg": "Already paid"}
+                        # Gera Link Único
+                        convite = tb.create_chat_invite_link(
+                            chat_id=canal_vip_id, 
+                            member_limit=1, 
+                            name=f"Venda {p.first_name}"
+                        )
+                        link_acesso = convite.invite_link
 
-        # 5. Atualiza Banco
-        pedido.status = "paid"
-        pedido.mensagem_enviada = True
-        db.commit()
-        logger.info(f"✅ Pedido {tx_id} atualizado para PAID no banco.")
-        
-        # 6. Liberação no Telegram
-        bot_data = pedido.bot 
-        try:
-            tb = telebot.TeleBot(bot_data.token)
-            chat_id_user = int(pedido.telegram_id)
-            
-            # Tenta converter ID do canal (remove espaços)
-            try:
-                canal_vip_id = int(str(bot_data.id_canal_vip).strip())
-            except:
-                canal_vip_id = bot_data.id_canal_vip # Tenta como string se for @canal
+                        msg_sucesso = f"""
+✅ <b>Pagamento Confirmado!</b>
 
-            logger.info(f"🚀 Tentando gerar link no canal {canal_vip_id} para user {chat_id_user}...")
-
-            # GERA O LINK ÚNICO
-            convite = tb.create_chat_invite_link(
-                chat_id=canal_vip_id, 
-                member_limit=1, 
-                name=f"Venda {pedido.first_name}"
-            )
-            link_acesso = convite.invite_link
-
-            msg_sucesso = f"""
-✅ **Pagamento Confirmado!**
-
-Seu acesso ao **{bot_data.nome}** foi liberado.
+Seu acesso ao <b>{bot_data.nome}</b> foi liberado.
 Toque no link abaixo para entrar no Canal VIP:
 
 👉 {link_acesso}
 
-⚠️ *Este link é único e válido apenas para você.*
+⚠️ <i>Este link é único e válido apenas para você.</i>
 """
-            tb.send_message(chat_id_user, msg_sucesso, parse_mode="Markdown")
-            logger.info(f"🏆 SUCESSO! Link enviado para {pedido.first_name}")
+                        tb.send_message(int(p.telegram_id), msg_sucesso, parse_mode="HTML")
+                        
+                        p.mensagem_enviada = True
+                        db.commit()
+                        logger.info(f"🏆 Link enviado para {p.first_name}")
 
-        except Exception as e_telegram:
-            logger.error(f"❌ ERRO TELEGRAM: {e_telegram}")
-            # DICA: Se der erro aqui, verifique se o bot é ADMIN no canal
-            tb.send_message(chat_id_user, "✅ Pagamento recebido! \n\n⚠️ Houve um erro ao gerar seu link automático. Um administrador entrará em contato em breve.")
+                    except Exception as e_telegram:
+                        logger.error(f"❌ ERRO TELEGRAM: {e_telegram}")
+                        # Avisa o cliente que deu erro no envio do link
+                        try:
+                            tb.send_message(int(p.telegram_id), "✅ Pagamento recebido! \n\n⚠️ Houve um erro ao gerar seu link automático. Um administrador entrará em contato em breve.")
+                        except: pass
 
+            db.close()
+        
         return {"status": "received"}
 
     except Exception as e:
