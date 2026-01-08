@@ -183,7 +183,7 @@ def get_pushin_token():
         return os.getenv("PUSHIN_PAY_TOKEN")
     finally:
         db.close()
-        
+
 # =========================================================
 # 🔌 INTEGRAÇÃO PUSHIN PAY (CORRIGIDA)
 # =========================================================
@@ -260,9 +260,20 @@ class BotCreate(BaseModel):
     token: str
     id_canal_vip: str
 
+# Novo modelo para Atualização
+class BotUpdate(BaseModel):
+    nome: Optional[str] = None
+    token: Optional[str] = None
+    id_canal_vip: Optional[str] = None
+
+# Modelo de Resposta com Estatísticas
 class BotResponse(BotCreate):
     id: int
     status: str
+    # Novos campos de métricas
+    leads: int = 0
+    revenue: float = 0.0
+    
     class Config:
         from_attributes = True
 
@@ -330,9 +341,72 @@ def criar_bot(bot_data: BotCreate, db: Session = Depends(get_db)):
     db.refresh(novo_bot)
     return novo_bot
 
+@app.put("/api/admin/bots/{bot_id}")
+def atualizar_bot(bot_id: int, dados: BotUpdate, db: Session = Depends(get_db)):
+    bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
+    if not bot_db:
+        raise HTTPException(status_code=404, detail="Bot não encontrado")
+    
+    # Se houver troca de token, precisamos atualizar o Webhook
+    if dados.token and dados.token != bot_db.token:
+        try:
+            # 1. Tenta remover webhook do token antigo (opcional, mas bom)
+            try:
+                old_tb = telebot.TeleBot(bot_db.token)
+                old_tb.delete_webhook()
+            except: pass
+
+            # 2. Configura o novo webhook
+            tb = telebot.TeleBot(dados.token)
+            public_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "zenyx-gbs-production.up.railway.app")
+            # Garante que não tem https:// duplicado
+            if public_url.startswith("https://"): public_url = public_url.replace("https://", "")
+            
+            webhook_url = f"https://{public_url}/webhook/{dados.token}"
+            tb.set_webhook(url=webhook_url)
+            
+            logger.info(f"♻️ Webhook atualizado para o novo token do bot {bot_db.nome}")
+            bot_db.status = "conectado"
+        except Exception as e:
+            logger.error(f"Erro ao atualizar webhook: {e}")
+            bot_db.status = "erro_token"
+    
+    # Atualiza os campos no banco
+    if dados.nome: bot_db.nome = dados.nome
+    if dados.token: bot_db.token = dados.token
+    if dados.id_canal_vip: bot_db.id_canal_vip = dados.id_canal_vip
+    
+    db.commit()
+    db.refresh(bot_db)
+    return {"status": "updated", "msg": "Bot atualizado com sucesso!"}
+
 @app.get("/api/admin/bots", response_model=List[BotResponse])
 def listar_bots(db: Session = Depends(get_db)):
-    return db.query(Bot).all()
+    bots = db.query(Bot).all()
+    resultado = []
+    
+    for bot in bots:
+        # 1. Calcula Leads (Total de Telegram IDs únicos que interagiram com este bot)
+        leads = db.query(func.count(func.distinct(Pedido.telegram_id)))\
+                  .filter(Pedido.bot_id == bot.id).scalar() or 0
+        
+        # 2. Calcula Receita Total (Soma dos pedidos 'paid')
+        revenue = db.query(func.sum(Pedido.valor))\
+                    .filter(Pedido.bot_id == bot.id, Pedido.status == 'paid').scalar() or 0.0
+        
+        # Monta o objeto de resposta manual para incluir os campos extras
+        bot_dict = {
+            "id": bot.id,
+            "nome": bot.nome,
+            "token": bot.token,
+            "id_canal_vip": bot.id_canal_vip,
+            "status": bot.status,
+            "leads": leads,
+            "revenue": revenue
+        }
+        resultado.append(bot_dict)
+        
+    return resultado
 
 # ===========================
 # 💎 PLANOS & FLUXO
