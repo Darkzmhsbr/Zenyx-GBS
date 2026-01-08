@@ -314,6 +314,19 @@ class RemarketingRequest(BaseModel):
     expire_timestamp: Optional[int] = 0
     is_periodic: bool = False
     
+    # Oferta
+    incluir_oferta: bool = False
+    plano_oferta_id: Optional[str] = None
+    
+    # Preço
+    price_mode: str = "original" # original, custom
+    custom_price: Optional[float] = 0.0
+
+    # Validade (Expiração)
+    expiration_mode: str = "none" # none, minutes, hours, days
+    expiration_value: Optional[int] = 0
+
+
     # Controle de Teste
     is_test: bool = False
     specific_user_id: Optional[str] = None # Telegram ID para teste
@@ -798,7 +811,92 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             # Para o "reloginho" do botão
             bot_temp.answer_callback_query(update.callback_query.id)
 
-        # --- 3. CHECKOUT (GERAR PIX) ---
+        # ==================================================================
+        # 🕒 AQUI ENTRA A NOVIDADE: VERIFICAÇÃO DE OFERTA COM EXPIRAÇÃO
+        # ==================================================================
+        elif update.callback_query and update.callback_query.data.startswith("promo_"):
+            chat_id = update.callback_query.message.chat.id
+            # Pega o ID da campanha que vem no botão (ex: promo_123e4567...)
+            campanha_uuid = update.callback_query.data.split("_")[1]
+            
+            # 1. Busca a Campanha no Banco para ver as regras
+            campanha = db.query(RemarketingCampaign).filter(RemarketingCampaign.campaign_id == campanha_uuid).first()
+            
+            if not campanha or not campanha.plano_id:
+                bot_temp.answer_callback_query(update.callback_query.id, "Oferta não encontrada.")
+                return {"status": "error"}
+
+            # 2. VERIFICA SE A OFERTA EXPIROU (O GRANDE TRUQUE)
+            # Se tiver data de expiração E a data de agora for maior que a data limite...
+            if campanha.expiration_at and datetime.utcnow() > campanha.expiration_at:
+                
+                # Manda a mensagem de escassez
+                msg_esgotado = "🚫 **OFERTA ENCERRADA!**\n\nInfelizmente as vagas promocionais esgotaram ou o tempo da oferta acabou.\n\nFique atento às próximas oportunidades!"
+                bot_temp.send_message(chat_id, msg_esgotado, parse_mode="Markdown")
+                
+                bot_temp.answer_callback_query(update.callback_query.id, "Oferta expirada!")
+                return {"status": "expired"}
+
+            # 3. SE ESTIVER VÁLIDA: GERA O PIX COM O PREÇO PROMOCIONAL
+            # Pega o plano original para saber o nome
+            plano = db.query(PlanoConfig).filter(PlanoConfig.id == campanha.plano_id).first()
+            
+            # Usa o preço da promoção (se existir) ou o preço atual do plano
+            preco_final = campanha.promo_price if campanha.promo_price else plano.preco_atual
+            
+            msg_aguarde = bot_temp.send_message(chat_id, f"⏳ Gerando oferta exclusiva de R$ {preco_final:.2f}...")
+            
+            # Gera PIX
+            temp_uuid = str(uuid.uuid4())
+            pix_data = gerar_pix_pushinpay(preco_final, temp_uuid)
+            
+            if pix_data:
+                qr_code_text = pix_data.get("qr_code_text") or pix_data.get("qr_code")
+                provider_id = pix_data.get("id") or temp_uuid
+                final_tx_id = str(provider_id).lower()
+
+                # Cria o pedido como "Pendente"
+                novo_pedido = Pedido(
+                    bot_id=bot_db.id,
+                    transaction_id=final_tx_id,
+                    telegram_id=str(chat_id),
+                    first_name=update.callback_query.from_user.first_name,
+                    username=update.callback_query.from_user.username,
+                    plano_nome=f"{plano.nome_exibicao} (OFERTA)", # Marca no nome que foi oferta
+                    valor=preco_final,
+                    status="pending",
+                    qr_code=qr_code_text
+                )
+                db.add(novo_pedido)
+                db.commit()
+
+                try: bot_temp.delete_message(chat_id, msg_aguarde.message_id)
+                except: pass
+
+                # Manda o PIX Bonitinho
+                legenda_pix = f"""🎉 **OFERTA ATIVADA COM SUCESSO!**
+🎁 Plano: {plano.nome_exibicao}
+💸 **Valor Promocional: R$ {preco_final:.2f}**
+
+Copie o código abaixo para garantir sua vaga:
+
+```
+{qr_code_text}
+```
+
+👆 Toque no código para copiar.
+⏳ Pague agora antes que expire!"""
+
+                bot_temp.send_message(chat_id, legenda_pix, parse_mode="Markdown")
+            else:
+                bot_temp.send_message(chat_id, "❌ Erro ao gerar oferta.")
+
+            bot_temp.answer_callback_query(update.callback_query.id)
+            return {"status": "processed"}
+
+        # ==================================================================
+        # 🛒 CHECKOUT PADRÃO (SEM VALIDADE / PREÇO CHEIO)
+        # ==================================================================
         elif update.callback_query and update.callback_query.data.startswith("checkout_"):
             chat_id = update.callback_query.message.chat.id
             plano_id = update.callback_query.data.split("_")[1]
@@ -810,24 +908,17 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
 
             msg_aguarde = bot_temp.send_message(chat_id, "⏳ Gerando seu PIX, aguarde...")
             
-            # Gera UUID Provisório
             temp_uuid = str(uuid.uuid4())
-            
-            # Chama API
             pix_data = gerar_pix_pushinpay(plano.preco_atual, temp_uuid)
             
             if pix_data:
                 qr_code_text = pix_data.get("qr_code_text") or pix_data.get("qr_code")
-                
-                # --- A CORREÇÃO DE OURO ---
-                # Pega o ID que o PushinPay retornou (se existir) e usa como transaction_id.
-                # Isso garante que o Webhook encontre o pedido depois.
                 provider_id = pix_data.get("id") or temp_uuid
                 final_tx_id = str(provider_id).lower()
 
                 novo_pedido = Pedido(
                     bot_id=bot_db.id,
-                    transaction_id=final_tx_id, # <--- ID SINCRONIZADO
+                    transaction_id=final_tx_id, 
                     telegram_id=str(chat_id),
                     first_name=update.callback_query.from_user.first_name,
                     username=update.callback_query.from_user.username,
@@ -842,7 +933,6 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                 try: bot_temp.delete_message(chat_id, msg_aguarde.message_id)
                 except: pass
 
-                # --- VISUAL "CAIXA DE CÓDIGO" (MARKDOWN) RESTAURADO ---
                 legenda_pix = f"""🌟 Seu pagamento foi gerado com sucesso:
 🎁 Plano: {plano.nome_exibicao}
 💰 Valor: R$ {plano.preco_atual:.2f}
@@ -900,10 +990,8 @@ CAMPAIGN_STATUS = {
 }
 
 # =========================================================
-# 📢 LÓGICA DE REMARKETING (RECUPERADA E BLINDADA)
+# 📢 LÓGICA DE REMARKETING (OFERTA + VALIDADE)
 # =========================================================
-
-# Variável global de status
 CAMPAIGN_STATUS = {"running": False, "sent": 0, "total": 0, "blocked": 0}
 
 def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Session):
@@ -914,90 +1002,121 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
     if not bot_db: 
         CAMPAIGN_STATUS["running"] = False
         return
-    
+
+    # --- 1. CONFIGURAÇÃO DA OFERTA (PREÇO E DATA) ---
+    uuid_campanha = str(uuid.uuid4())
+    data_expiracao = None
+    preco_final = 0.0
+    plano_db = None
+
+    if payload.incluir_oferta and payload.plano_oferta_id:
+        # Busca plano
+        plano_db = db.query(PlanoConfig).filter(
+            (PlanoConfig.key_id == payload.plano_oferta_id) | 
+            (PlanoConfig.id == int(payload.plano_oferta_id) if str(payload.plano_oferta_id).isdigit() else False)
+        ).first()
+
+        if plano_db:
+            # Define Preço
+            if payload.price_mode == "custom" and payload.custom_price > 0:
+                preco_final = payload.custom_price
+            else:
+                preco_final = plano_db.preco_atual
+            
+            # Define Expiração
+            if payload.expiration_mode != "none" and payload.expiration_value > 0:
+                agora = datetime.utcnow()
+                if payload.expiration_mode == "minutes":
+                    data_expiracao = agora + timedelta(minutes=payload.expiration_value)
+                elif payload.expiration_mode == "hours":
+                    data_expiracao = agora + timedelta(hours=payload.expiration_value)
+                elif payload.expiration_mode == "days":
+                    data_expiracao = agora + timedelta(days=payload.expiration_value)
+
+    # --- 2. SALVAR A CAMPANHA NO BANCO (ANTES DE ENVIAR) ---
+    # Precisamos salvar antes para que o ID da campanha exista quando o usuário clicar
+    nova_campanha = RemarketingCampaign(
+        bot_id=bot_id,
+        campaign_id=uuid_campanha,
+        type="massivo",
+        target=payload.target,
+        config=json.dumps({"msg": payload.mensagem, "media": payload.media_url}),
+        status="enviando",
+        
+        # Dados da Oferta
+        plano_id=plano_db.id if plano_db else None,
+        promo_price=preco_final if plano_db else None,
+        expiration_at=data_expiracao
+    )
+    if not payload.is_test:
+        db.add(nova_campanha)
+        db.commit()
+
+    # --- 3. DEFINIR PÚBLICO ALVO ---
     bot_sender = telebot.TeleBot(bot_db.token)
     usuarios_para_envio = []
 
-    # --- A. DEFINIR QUEM RECEBE (Lógica Híbrida) ---
-    
-    # 1. MODO TESTE: Envia apenas para o ID específico (Admin ou último user)
     if payload.is_test and payload.specific_user_id:
-        logger.info(f"🧪 MODO TESTE: Enviando apenas para {payload.specific_user_id}")
-        # Cria um objeto simples simulando um usuário
         class MockUser:
             def __init__(self, tid): self.telegram_id = tid
         usuarios_para_envio = [MockUser(payload.specific_user_id)]
-        
-    # 2. MODO REAL: Filtra do banco de dados
     else:
         query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
-        
-        if payload.target == "pendentes":
-            query = query.filter(Pedido.status == "pending")
-        elif payload.target == "pagantes":
-            query = query.filter(Pedido.status == "paid")
-        elif payload.target == "expirados":
-            query = query.filter(Pedido.status == "expired")
-        # se for "todos", pega tudo
-        
-        # Distinct para não enviar repetido para a mesma pessoa
+        if payload.target == "pendentes": query = query.filter(Pedido.status == "pending")
+        elif payload.target == "pagantes": query = query.filter(Pedido.status == "paid")
+        elif payload.target == "expirados": query = query.filter(Pedido.status == "expired")
         usuarios_para_envio = query.distinct(Pedido.telegram_id).all()
 
     CAMPAIGN_STATUS["total"] = len(usuarios_para_envio)
-    
-    # --- B. PREPARAR BOTÃO (SE HOUVER OFERTA) ---
-    markup = None
-    if payload.incluir_oferta and payload.plano_oferta_id:
-        try:
-            # Busca o plano de forma flexível (ID numérico ou Key string)
-            plano = db.query(PlanoConfig).filter(
-                (PlanoConfig.key_id == payload.plano_oferta_id) | 
-                (PlanoConfig.id == int(payload.plano_oferta_id) if str(payload.plano_oferta_id).isdigit() else False)
-            ).first()
-            
-            if plano:
-                markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton(
-                    text=f"🛒 {plano.nome_exibicao} - R$ {plano.preco_atual:.2f}",
-                    callback_data=f"checkout_{plano.id}"
-                ))
-        except Exception as e:
-            logger.error(f"Erro ao gerar botão de oferta: {e}")
 
-    # --- C. LOOP DE ENVIO ---
+    # --- 4. PREPARAR BOTÃO (CALLBACK ESPECIAL) ---
+    markup = None
+    if plano_db:
+        markup = types.InlineKeyboardMarkup()
+        # O callback 'promo_' leva o ID da campanha. O Webhook vai checar se expirou.
+        btn_text = f"🔥 {plano_db.nome_exibicao} - R$ {preco_final:.2f}"
+        
+        # Se for teste, usamos checkout direto pois não salvamos campanha no banco
+        if payload.is_test:
+             markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"checkout_{plano_db.id}"))
+        else:
+             # Callback aponta para a campanha para validar data
+             markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"promo_{uuid_campanha}"))
+
+    # --- 5. DISPARO ---
+    sent_count = 0
+    blocked_count = 0
+
     for u in usuarios_para_envio:
         try:
-            sent = False
-            # Tenta enviar Mídia (Foto/Vídeo) se houver URL válida
+            midia_ok = False
             if payload.media_url and len(payload.media_url) > 5:
                 try:
                     if payload.media_url.lower().endswith(('.mp4', '.mov', '.avi')):
                         bot_sender.send_video(u.telegram_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
                     else:
                         bot_sender.send_photo(u.telegram_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
-                    sent = True
-                except Exception as e_media:
-                    # Se falhar a mídia (link quebrado), faz fallback para texto
-                    logger.warning(f"Erro mídia para {u.telegram_id}: {e_media}. Tentando apenas texto.")
+                    midia_ok = True
+                except: pass
             
-            # Se não tinha mídia ou se a mídia falhou, envia texto puro
-            if not sent:
+            if not midia_ok:
                 bot_sender.send_message(u.telegram_id, payload.mensagem, reply_markup=markup)
-                
-            CAMPAIGN_STATUS["sent"] += 1
             
-        except Exception as e: 
-            # Erros de bloqueio ou usuário deletado
-            if "blocked" in str(e).lower() or "kicked" in str(e).lower():
-                CAMPAIGN_STATUS["blocked"] += 1
-            else:
-                # logger.error(f"Erro envio genérico {u.telegram_id}: {e}")
-                pass
+            sent_count += 1
+        except Exception as e:
+            if "blocked" in str(e).lower() or "kicked" in str(e).lower(): blocked_count += 1
         
-        # Delay anti-spam (importante!)
         time.sleep(0.05) 
-    
+
     CAMPAIGN_STATUS["running"] = False
+    
+    # Atualiza status final no banco
+    if not payload.is_test:
+        nova_campanha.status = "concluido"
+        nova_campanha.total_leads = len(usuarios_para_envio)
+        nova_campanha.sent_success = sent_count
+        nova_campanha.blocked_count = blocked_count
+        db.commit()
     
     # --- D. SALVAR HISTÓRICO (Apenas se não for teste) ---
     if not payload.is_test:
