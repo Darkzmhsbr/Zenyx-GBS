@@ -276,6 +276,7 @@ class BotCreate(BaseModel):
     nome: str
     token: str
     id_canal_vip: str
+    admin_principal_id: Optional[str] = None
 
 # Novo modelo para Atualização
 class BotUpdate(BaseModel):
