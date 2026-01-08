@@ -9,8 +9,7 @@ from telebot import types
 import json
 import uuid
 from fastapi import BackgroundTasks # <--- IMPORTANTE
-from sqlalchemy import text  # Importante para o SQL
-from fastapi import FastAPI, HTTPException, Depends, Request
+from sqlalchemy import text, desc, func # <--- O 'desc' e 'func' são obrigatórios!from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -488,7 +487,6 @@ def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
     if dados.id_canal_vip: bot_db.id_canal_vip = dados.id_canal_vip
     
     # --- SALVA O ADMIN PRINCIPAL ---
-    # Aceita string vazia para limpar o campo, ou valor novo
     if dados.admin_principal_id is not None: 
         bot_db.admin_principal_id = dados.admin_principal_id
     
@@ -510,7 +508,7 @@ def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
             tb.set_webhook(url=webhook_url)
             
             logger.info(f"♻️ Webhook atualizado para o bot {bot_db.nome}")
-            bot_db.status = "ativo" # Reseta para ativo ao trocar token
+            bot_db.status = "ativo" 
         except Exception as e:
             logger.error(f"Erro ao atualizar webhook: {e}")
             bot_db.status = "erro_token"
@@ -520,31 +518,54 @@ def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
     return {"status": "ok", "msg": "Bot atualizado com sucesso"}
 
 # =========================================================
+# 📊 DASHBOARD STATS (CORREÇÃO DA TELA INICIAL)
+# =========================================================
+@app.get("/api/admin/dashboard/stats")
+def get_dashboard_stats(bot_id: int, db: Session = Depends(get_db)):
+    # 1. Total Leads
+    total_leads = db.query(func.count(Pedido.telegram_id.distinct())).filter(Pedido.bot_id == bot_id).scalar() or 0
+    
+    # 2. Vendas Hoje
+    hoje = datetime.utcnow().date()
+    vendas_hoje = db.query(func.count(Pedido.id)).filter(
+        Pedido.bot_id == bot_id,
+        Pedido.status.in_(['paid', 'approved', 'active']),
+        func.date(Pedido.created_at) == hoje
+    ).scalar() or 0
+    
+    # 3. Receita Total
+    receita_total = db.query(func.sum(Pedido.valor)).filter(
+        Pedido.bot_id == bot_id,
+        Pedido.status.in_(['paid', 'approved', 'active', 'completed'])
+    ).scalar() or 0.0
+    
+    # 4. Ativos vs Expirados
+    ativos = db.query(func.count(Pedido.id)).filter(Pedido.bot_id == bot_id, Pedido.status.in_(['paid', 'active'])).scalar() or 0
+    expirados = db.query(func.count(Pedido.id)).filter(Pedido.bot_id == bot_id, Pedido.status == 'expired').scalar() or 0
+
+    return {
+        "total_leads": total_leads,
+        "sales_today": vendas_hoje,
+        "total_revenue": receita_total,
+        "active_users": ativos,
+        "expired_users": expirados
+    }
+
+# =========================================================
 # 👥 ROTA: CONTATOS (CORRIGIDA COLUNA EXPIRAÇÃO)
 # =========================================================
-# =========================================================
-# 👥 ROTA: CONTATOS / CRM (COM EXPIRAÇÃO)
-# =========================================================
 @app.get("/api/admin/contacts")
-def get_contacts(bot_id: int = None, status: str = 'todos', page: int = 1, limit: int = 1000, db: Session = Depends(get_db)):
-    # Se não passar bot_id, retorna vazio
-    if not bot_id:
-        return {"users": [], "total_records": 0}
+def get_contacts(bot_id: int = None, status: str = 'todos', page: int = 1, limit: int = 50, db: Session = Depends(get_db)):
+    if not bot_id: return {"users": [], "total_records": 0}
 
     query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
 
-    # Filtros de Status
-    if status == 'pendente':
-        query = query.filter(Pedido.status == 'pending')
-    elif status == 'active':
-        query = query.filter(Pedido.status.in_(['paid', 'approved', 'active']))
-    elif status == 'expired':
-        query = query.filter(Pedido.status == 'expired')
+    if status == 'pendente': query = query.filter(Pedido.status == 'pending')
+    elif status == 'active': query = query.filter(Pedido.status.in_(['paid', 'approved', 'active']))
+    elif status == 'expired': query = query.filter(Pedido.status == 'expired')
 
     total_records = query.count()
-    
-    # Ordenação por data (mais recentes primeiro)
-    users_raw = query.order_by(desc(Pedido.created_at)).limit(limit).all()
+    users_raw = query.order_by(desc(Pedido.created_at)).offset((page - 1) * limit).limit(limit).all()
     
     users_formatted = []
     for u in users_raw:
@@ -555,34 +576,24 @@ def get_contacts(bot_id: int = None, status: str = 'todos', page: int = 1, limit
             "username": u.username,
             "status": u.status,
             "created_at": u.created_at,
-            "expiration_date": u.expiration_date # <--- Garante o envio desta coluna
+            "expiration_date": u.expiration_date 
         })
 
-    return {
-        "users": users_formatted,
-        "total_records": total_records
-    }
+    return {"users": users_formatted, "total_records": total_records}
 
 @app.put("/api/admin/users/{user_id}")
 def update_user(user_id: int, dados: UserUpdate, db: Session = Depends(get_db)):
     user = db.query(Pedido).filter(Pedido.id == user_id).first()
     if not user: raise HTTPException(404, "Usuário não encontrado")
     
-    if dados.status: 
-        user.status = dados.status
+    if dados.status: user.status = dados.status
     
-    # Lógica de Expiração Personalizada
     if dados.custom_expiration: 
-        if dados.custom_expiration == 'vitalicio': 
-            user.expiration_date = None
-        elif dados.custom_expiration == 'remover': 
-            user.expiration_date = None
+        if dados.custom_expiration == 'vitalicio': user.expiration_date = None
+        elif dados.custom_expiration == 'remover': user.expiration_date = None
         else:
-            try: 
-                # Tenta converter string YYYY-MM-DD para data
-                user.expiration_date = datetime.strptime(dados.custom_expiration, '%Y-%m-%d')
-            except: 
-                pass
+            try: user.expiration_date = datetime.strptime(dados.custom_expiration, '%Y-%m-%d')
+            except: pass
             
     db.commit()
     return {"status": "ok"}
