@@ -541,7 +541,7 @@ def remover_admin(bot_id: int, telegram_id: str, db: Session = Depends(get_db)):
 # --- NOVA ROTA: LISTAR BOTS ---
 
 # =========================================================
-# 🤖 LISTAR BOTS (COM KPI TOTAIS E USERNAME)
+# 🤖 LISTAR BOTS (COM KPI TOTAIS E USERNAME CORRIGIDO)
 # =========================================================
 @app.get("/api/admin/bots")
 def list_bots(db: Session = Depends(get_db)):
@@ -549,14 +549,16 @@ def list_bots(db: Session = Depends(get_db)):
     resultado = []
     
     for bot in bots:
-        # Corrige Username (remove @ duplicado se tiver)
+        # [CORREÇÃO] Remove todos os @ existentes e adiciona apenas um limpo
         u_name = bot.username or "..."
-        if u_name != "..." and not u_name.startswith("@"): u_name = f"@{u_name}"
+        if u_name != "...":
+            # lstrip remove os @ do início, f"@..." adiciona um novo limpo
+            u_name = f"@{u_name.lstrip('@')}"
 
         # Corrige Leads
         leads = db.query(func.count(Pedido.telegram_id.distinct())).filter(Pedido.bot_id == bot.id).scalar() or 0
         
-        # Corrige Receita (Soma TODOS os sucessos)
+        # Corrige Receita
         receita = db.query(func.sum(Pedido.valor)).filter(
             Pedido.bot_id == bot.id, 
             Pedido.status.in_(['paid', 'approved', 'completed', 'succeeded', 'active'])
@@ -566,12 +568,12 @@ def list_bots(db: Session = Depends(get_db)):
             "id": bot.id,
             "nome": bot.nome,
             "token": bot.token,
-            "username": u_name,
+            "username": u_name, # Agora vai sempre limpo: @usuario
             "status": bot.status,
             "admin_principal_id": bot.admin_principal_id,
             "id_canal_vip": bot.id_canal_vip,
-            "leads": leads,     # NOME ALINHADO COM O FRONTEND
-            "revenue": receita  # NOME ALINHADO COM O FRONTEND
+            "leads": leads,
+            "revenue": receita
         })
     return resultado
 
