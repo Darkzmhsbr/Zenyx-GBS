@@ -549,14 +549,15 @@ def list_bots(db: Session = Depends(get_db)):
     resultado = []
     
     for bot in bots:
-        # Username Limpo
-        username_display = bot.username or "..."
-        
-        # Leads (Pedidos Únicos)
-        leads_count = db.query(func.count(Pedido.telegram_id.distinct())).filter(Pedido.bot_id == bot.id).scalar() or 0
+        # Corrige Username (remove @ duplicado se tiver)
+        u_name = bot.username or "..."
+        if u_name != "..." and not u_name.startswith("@"): u_name = f"@{u_name}"
 
-        # Receita Total (Soma TODOS os status de sucesso)
-        receita_total = db.query(func.sum(Pedido.valor)).filter(
+        # Corrige Leads
+        leads = db.query(func.count(Pedido.telegram_id.distinct())).filter(Pedido.bot_id == bot.id).scalar() or 0
+        
+        # Corrige Receita (Soma TODOS os sucessos)
+        receita = db.query(func.sum(Pedido.valor)).filter(
             Pedido.bot_id == bot.id, 
             Pedido.status.in_(['paid', 'approved', 'completed', 'succeeded', 'active'])
         ).scalar() or 0.0
@@ -565,14 +566,13 @@ def list_bots(db: Session = Depends(get_db)):
             "id": bot.id,
             "nome": bot.nome,
             "token": bot.token,
-            "username": username_display,
+            "username": u_name,
             "status": bot.status,
             "admin_principal_id": bot.admin_principal_id,
             "id_canal_vip": bot.id_canal_vip,
-            "leads_count": leads_count,       
-            "vendas_total": receita_total     
+            "leads": leads,     # NOME ALINHADO COM O FRONTEND
+            "revenue": receita  # NOME ALINHADO COM O FRONTEND
         })
-    
     return resultado
 
 # ===========================
