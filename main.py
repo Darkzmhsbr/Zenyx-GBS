@@ -9,8 +9,7 @@ from telebot import types
 import json
 import uuid
 from fastapi import BackgroundTasks # <--- IMPORTANTE
-from sqlalchemy import text  # Importante para o SQL
-from fastapi import FastAPI, HTTPException, Depends, Request
+from sqlalchemy import func, desc, text  # <--- Adicione 'desc' aqui se der erro depoisfrom fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -294,17 +293,16 @@ class BotUpdate(BaseModel):
     id_canal_vip: Optional[str] = None
     admin_principal_id: Optional[str] = None
 
+# Modelo para Criar Admin
+class BotAdminCreate(BaseModel):
+    telegram_id: str
+    nome: Optional[str] = "Admin"
+
 # Modelo para Criar/Atualizar Bot (Com suporte ao Admin ID)
 class BotCreate(BaseModel):
     nome: str
     token: str
     id_canal_vip: str
-    admin_principal_id: Optional[str] = None
-
-class BotUpdate(BaseModel):
-    nome: Optional[str] = None
-    token: Optional[str] = None
-    id_canal_vip: Optional[str] = None
     admin_principal_id: Optional[str] = None
 
 class BotResponse(BotCreate):
