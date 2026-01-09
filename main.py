@@ -314,31 +314,38 @@ class FlowUpdate(BaseModel):
     mostrar_planos_2: bool
 
 # ✅ MODELO COMPLETO PARA O WIZARD DE REMARKETING
-# Modelo BLINDADO para evitar erro 422 (Aceita opcionais)
 class RemarketingRequest(BaseModel):
     bot_id: int
     tipo_envio: str = "massivo"
-    target: str = "todos"
+    target: str = "todos" # 'todos', 'pendentes', 'pagantes', 'expirados'
     mensagem: str
     media_url: Optional[str] = None
-    
-    # Campos de Oferta e Validade (Opcionais)
     incluir_oferta: bool = False
-    plano_oferta_id: Optional[Union[str, int]] = None 
-    
-    price_mode: Optional[str] = "original"
-    custom_price: Optional[float] = 0.0
-    valor_oferta: Optional[float] = 0.0
-    
-    expiration_mode: Optional[str] = "none"
-    expiration_value: Optional[int] = 0
-    expire_timestamp: Optional[int] = 0
-
+    plano_oferta_id: Optional[str] = None
     is_test: bool = False
-    specific_user_id: Optional[str] = None
     
-    class Config:
-        from_attributes = True
+    # Campos Extras do Wizard
+    plano_oferta_id: Optional[str] = None
+    valor_oferta: Optional[float] = 0.0
+    expire_timestamp: Optional[int] = 0
+    is_periodic: bool = False
+    
+    # Oferta
+    incluir_oferta: bool = False
+    plano_oferta_id: Optional[str] = None
+    
+    # Preço
+    price_mode: str = "original" # original, custom
+    custom_price: Optional[float] = 0.0
+
+    # Validade (Expiração)
+    expiration_mode: str = "none" # none, minutes, hours, days
+    expiration_value: Optional[int] = 0
+
+
+    # Controle de Teste
+    is_test: bool = False
+    specific_user_id: Optional[str] = None # Telegram ID para teste
 
 # ===========================
 # ⚙️ GESTÃO DE BOTS
