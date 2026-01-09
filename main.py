@@ -341,33 +341,29 @@ class BotResponse(BotCreate):
         from_attributes = True
 
 # Modelo ULTRA PERMISSIVO para Remarketing (Aceita opcionais)
+# Modelo BLINDADO para evitar erro 422 (Aceita opcionais)
 class RemarketingRequest(BaseModel):
-    bot_id: Optional[int] = None
-    tipo_envio: str 
+    bot_id: int
+    tipo_envio: str = "massivo"
+    target: str = "todos"
     mensagem: str
     media_url: Optional[str] = None
     
-    # Oferta
+    # Campos de Oferta e Validade (Opcionais)
     incluir_oferta: bool = False
-    plano_oferta_id: Optional[str] = None
+    plano_oferta_id: Optional[Union[str, int]] = None 
+    
+    price_mode: Optional[str] = "original"
+    custom_price: Optional[float] = 0.0
     valor_oferta: Optional[float] = 0.0
     
-    # Validade e Agendamento
-    expire_timestamp: Optional[int] = 0
-    is_periodic: bool = False
-    periodic_days: Optional[int] = 0 
-    periodic_time: Optional[str] = None
-    
-    # Campos Extras do Front (Ignorados ou convertidos)
-    price_mode: Optional[str] = None
-    custom_price: Optional[float] = 0.0
-    expiration_mode: Optional[str] = None
+    expiration_mode: Optional[str] = "none"
     expiration_value: Optional[int] = 0
-    
-    # Controle
-    is_test: bool = False
-    specific_user_id: Optional[str] = None 
+    expire_timestamp: Optional[int] = 0
 
+    is_test: bool = False
+    specific_user_id: Optional[str] = None
+    
     class Config:
         from_attributes = True
 
@@ -1188,56 +1184,29 @@ Copie o código abaixo para garantir sua vaga:
 # 👥 ROTA: CONTATOS / CRM (CORRIGIDA E HÍBRIDA)
 # =========================================================
 @app.get("/api/admin/contacts")
-def listar_contatos(
-    bot_id: Optional[int] = None, # Aceita ID numérico
-    status: str = "todos", 
-    page: int = 1, 
-    limit: int = 50, 
-    db: Session = Depends(get_db)
-):
+def listar_contatos(bot_id: Optional[int] = None, status: str = "todos", db: Session = Depends(get_db)):
+    """
+    Lista usuários. Se bot_id for passado, filtra apenas daquele bot.
+    """
     query = db.query(Pedido)
     
-    # 1. Filtro de Bot (Se não vier ID, tenta pegar todos ou filtra se vier na query string antiga)
+    # 1. FILTRO DE BOT (Novo e Essencial)
     if bot_id:
         query = query.filter(Pedido.bot_id == bot_id)
-        
+    
     # 2. Filtros de Status
-    if status == 'pagantes':
-        query = query.filter(Pedido.status == 'paid')
-    elif status == 'pendentes':
-        query = query.filter(Pedido.status == 'pending')
-    elif status == 'expirados':
-        query = query.filter(Pedido.status == 'expired')
-
-    total_records = query.count()
+    if status == "pagantes":
+        query = query.filter(Pedido.status == "paid")
+    elif status == "pendentes":
+        query = query.filter(Pedido.status == "pending")
+    elif status == "expirados":
+        query = query.filter(Pedido.status == "expired")
     
-    # 3. Ordenação e Paginação
-    offset = (page - 1) * limit
-    users_raw = query.order_by(desc(Pedido.created_at)).offset(offset).limit(limit).all()
+    # Ordena pelos mais recentes
+    contatos = query.order_by(desc(Pedido.created_at)).all()
     
-    users_formatted = []
-    for u in users_raw:
-        # Tenta pegar a data de expiração customizada ou calcula baseada no plano
-        exp_date = u.custom_expiration
-        
-        users_formatted.append({
-            "id": u.id,
-            "telegram_id": u.telegram_id,
-            "first_name": u.first_name,
-            "username": u.username,
-            "plano_nome": u.plano_nome,
-            "valor": u.valor,
-            "status": u.status,
-            "created_at": u.created_at,
-            "expiration_date": exp_date
-        })
-
-    # Retorna formato compatível
-    return {
-        "users": users_formatted,
-        "total_records": total_records,
-        "total_pages": (total_records // limit) + 1
-    }
+    # Retorna lista direta (Mantendo compatibilidade com seu front V1)
+    return contatos
 
 # =========================================================
 # 📢 ROTAS DE REMARKETING (DISPARADOR AVANÇADO)
