@@ -9,7 +9,7 @@ from telebot import types
 import json
 import uuid
 from fastapi import BackgroundTasks # <--- IMPORTANTE
-from sqlalchemy import func, desc, text  # <--- Adicione 'desc' aqui se der erro depoisfrom fastapi import FastAPI, HTTPException, Depends, Request
+from sqlalchemy import func, desc, text 
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
