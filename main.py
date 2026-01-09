@@ -336,9 +336,6 @@ class RemarketingRequest(BaseModel):
     target: str = "todos" # 'todos', 'pendentes', 'pagantes', 'expirados'
     mensagem: str
     media_url: Optional[str] = None
-    incluir_oferta: bool = False
-    plano_oferta_id: Optional[str] = None
-    is_test: bool = False
     
     # Campos Extras do Wizard
     plano_oferta_id: Optional[str] = None
@@ -348,7 +345,6 @@ class RemarketingRequest(BaseModel):
     
     # Oferta
     incluir_oferta: bool = False
-    plano_oferta_id: Optional[str] = None
     
     # Preço
     price_mode: str = "original" # original, custom
@@ -357,7 +353,6 @@ class RemarketingRequest(BaseModel):
     # Validade (Expiração)
     expiration_mode: str = "none" # none, minutes, hours, days
     expiration_value: Optional[int] = 0
-
 
     # Controle de Teste
     is_test: bool = False
@@ -1067,7 +1062,7 @@ CAMPAIGN_STATUS = {
 }
 
 # =========================================================
-# 📢 LÓGICA DE REMARKETING (OFERTA + VALIDADE)
+# 📢 LÓGICA DE REMARKETING (OFERTA + VALIDADE + TESTE)
 # =========================================================
 CAMPAIGN_STATUS = {"running": False, "sent": 0, "total": 0, "blocked": 0}
 
@@ -1087,9 +1082,9 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
     plano_db = None
 
     if payload.incluir_oferta and payload.plano_oferta_id:
-        # Busca plano
+        # Busca plano (aceita ID numérico ou string chave)
         plano_db = db.query(PlanoConfig).filter(
-            (PlanoConfig.key_id == payload.plano_oferta_id) | 
+            (PlanoConfig.key_id == str(payload.plano_oferta_id)) | 
             (PlanoConfig.id == int(payload.plano_oferta_id) if str(payload.plano_oferta_id).isdigit() else False)
         ).first()
 
@@ -1103,29 +1098,32 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
             # Define Expiração
             if payload.expiration_mode != "none" and payload.expiration_value > 0:
                 agora = datetime.utcnow()
+                val = payload.expiration_value
                 if payload.expiration_mode == "minutes":
-                    data_expiracao = agora + timedelta(minutes=payload.expiration_value)
+                    data_expiracao = agora + timedelta(minutes=val)
                 elif payload.expiration_mode == "hours":
-                    data_expiracao = agora + timedelta(hours=payload.expiration_value)
+                    data_expiracao = agora + timedelta(hours=val)
                 elif payload.expiration_mode == "days":
-                    data_expiracao = agora + timedelta(days=payload.expiration_value)
+                    data_expiracao = agora + timedelta(days=val)
 
     # --- 2. SALVAR A CAMPANHA NO BANCO (ANTES DE ENVIAR) ---
     # Precisamos salvar antes para que o ID da campanha exista quando o usuário clicar
-    nova_campanha = RemarketingCampaign(
-        bot_id=bot_id,
-        campaign_id=uuid_campanha,
-        type="massivo",
-        target=payload.target,
-        config=json.dumps({"msg": payload.mensagem, "media": payload.media_url}),
-        status="enviando",
-        
-        # Dados da Oferta
-        plano_id=plano_db.id if plano_db else None,
-        promo_price=preco_final if plano_db else None,
-        expiration_at=data_expiracao
-    )
+    # Se for teste, NÃO salvamos no banco para não sujar o histórico, a menos que queira log
+    nova_campanha = None
     if not payload.is_test:
+        nova_campanha = RemarketingCampaign(
+            bot_id=bot_id,
+            campaign_id=uuid_campanha,
+            type="massivo",
+            target=payload.target,
+            config=json.dumps({"msg": payload.mensagem, "media": payload.media_url}),
+            status="enviando",
+            
+            # Dados da Oferta
+            plano_id=plano_db.id if plano_db else None,
+            promo_price=preco_final if plano_db else None,
+            expiration_at=data_expiracao
+        )
         db.add(nova_campanha)
         db.commit()
 
@@ -1133,11 +1131,14 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
     bot_sender = telebot.TeleBot(bot_db.token)
     usuarios_para_envio = []
 
-    if payload.is_test and payload.specific_user_id:
-        class MockUser:
-            def __init__(self, tid): self.telegram_id = tid
-        usuarios_para_envio = [MockUser(payload.specific_user_id)]
+    if payload.is_test:
+        # Se for teste, manda só para o ID específico (Admin)
+        if payload.specific_user_id:
+            class MockUser:
+                def __init__(self, tid): self.telegram_id = tid
+            usuarios_para_envio = [MockUser(payload.specific_user_id)]
     else:
+        # Lógica normal de busca no banco
         query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
         if payload.target == "pendentes": query = query.filter(Pedido.status == "pending")
         elif payload.target == "pagantes": query = query.filter(Pedido.status == "paid")
@@ -1150,14 +1151,14 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
     markup = None
     if plano_db:
         markup = types.InlineKeyboardMarkup()
-        # O callback 'promo_' leva o ID da campanha. O Webhook vai checar se expirou.
         btn_text = f"🔥 {plano_db.nome_exibicao} - R$ {preco_final:.2f}"
         
-        # Se for teste, usamos checkout direto pois não salvamos campanha no banco
+        # Se for teste, usamos um callback fictício ou direto para checkout padrão (pois não tem campanha salva)
         if payload.is_test:
-             markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"checkout_{plano_db.id}"))
+             # No teste, forçamos um checkout direto só pra ver o botão, mas sem validação de tempo do banco
+             markup.add(types.InlineKeyboardButton(f"[TESTE] {btn_text}", callback_data=f"checkout_{plano_db.id}"))
         else:
-             # Callback aponta para a campanha para validar data
+             # O callback 'promo_' leva o ID da campanha. O Webhook vai checar se expirou.
              markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"promo_{uuid_campanha}"))
 
     # --- 5. DISPARO ---
@@ -1183,42 +1184,17 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
         except Exception as e:
             if "blocked" in str(e).lower() or "kicked" in str(e).lower(): blocked_count += 1
         
-        time.sleep(0.05) 
+        time.sleep(0.05) # Evita flood
 
     CAMPAIGN_STATUS["running"] = False
     
-    # Atualiza status final no banco
-    if not payload.is_test:
+    # Atualiza status final no banco (Se não for teste)
+    if not payload.is_test and nova_campanha:
         nova_campanha.status = "concluido"
         nova_campanha.total_leads = len(usuarios_para_envio)
         nova_campanha.sent_success = sent_count
         nova_campanha.blocked_count = blocked_count
         db.commit()
-    
-    # --- D. SALVAR HISTÓRICO (Apenas se não for teste) ---
-    if not payload.is_test:
-        try:
-            config_summary = json.dumps({
-                "msg": payload.mensagem, 
-                "offer": payload.incluir_oferta,
-                "media": payload.media_url,
-                "target": payload.target
-            })
-            
-            db.add(RemarketingCampaign(
-                bot_id=bot_id, 
-                campaign_id=str(uuid.uuid4()), 
-                config=config_summary, 
-                target=payload.target,
-                type="massivo",
-                status="concluido", 
-                total_leads=len(usuarios_para_envio), 
-                sent_success=CAMPAIGN_STATUS["sent"], 
-                blocked_count=CAMPAIGN_STATUS["blocked"]
-            ))
-            db.commit()
-        except Exception as e:
-            logger.error(f"Erro ao salvar historico: {e}")
 
 # --- ROTAS DA API ---
 
