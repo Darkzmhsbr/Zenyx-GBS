@@ -294,41 +294,6 @@ class BotUpdate(BaseModel):
     id_canal_vip: Optional[str] = None
     admin_principal_id: Optional[str] = None
 
-# Modelo para Criar Admin
-class BotAdminCreate(BaseModel):
-    telegram_id: str
-    nome: Optional[str] = "Admin"
-
-# Modelo de Resposta com Estatísticas
-class BotResponse(BotCreate):
-    id: int
-    status: str
-    # Novos campos de métricas
-    leads: int = 0
-    revenue: float = 0.0
-    
-    class Config:
-        from_attributes = True
-
-class PlanoCreate(BaseModel):
-    bot_id: int
-    nome_exibicao: str
-    preco: float
-    dias_duracao: int
-
-class FlowUpdate(BaseModel):
-    msg_boas_vindas: str
-    media_url: Optional[str] = None
-    btn_text_1: str
-    autodestruir_1: bool
-    msg_2_texto: Optional[str] = None
-    msg_2_media: Optional[str] = None
-    mostrar_planos_2: bool
-
-# =========================================================
-# 📝 MODELOS PYDANTIC (REQ/RES)
-# =========================================================
-
 # Modelo para Criar/Atualizar Bot (Com suporte ao Admin ID)
 class BotCreate(BaseModel):
     nome: str
@@ -350,108 +315,54 @@ class BotResponse(BotCreate):
     class Config:
         from_attributes = True
 
-# Modelo ULTRA PERMISSIVO para Remarketing (Aceita opcionais)
+class PlanoCreate(BaseModel):
+    bot_id: int
+    nome_exibicao: str
+    preco: float
+    dias_duracao: int
+
+class FlowUpdate(BaseModel):
+    msg_boas_vindas: str
+    media_url: Optional[str] = None
+    btn_text_1: str
+    autodestruir_1: bool
+    msg_2_texto: Optional[str] = None
+    msg_2_media: Optional[str] = None
+    mostrar_planos_2: bool
+
+# ✅ MODELO COMPLETO PARA O WIZARD DE REMARKETING
 class RemarketingRequest(BaseModel):
-    bot_id: Optional[int] = None
-    tipo_envio: str 
+    bot_id: int
+    tipo_envio: str = "massivo"
+    target: str = "todos" # 'todos', 'pendentes', 'pagantes', 'expirados'
     mensagem: str
     media_url: Optional[str] = None
+    incluir_oferta: bool = False
+    plano_oferta_id: Optional[str] = None
+    is_test: bool = False
+    
+    # Campos Extras do Wizard
+    plano_oferta_id: Optional[str] = None
+    valor_oferta: Optional[float] = 0.0
+    expire_timestamp: Optional[int] = 0
+    is_periodic: bool = False
     
     # Oferta
     incluir_oferta: bool = False
     plano_oferta_id: Optional[str] = None
-    valor_oferta: Optional[float] = 0.0
     
-    # Validade e Agendamento
-    expire_timestamp: Optional[int] = 0
-    is_periodic: bool = False
-    periodic_days: Optional[int] = 0 
-    periodic_time: Optional[str] = None
-    
-    # Campos Extras do Front (Ignorados ou convertidos)
-    price_mode: Optional[str] = None
+    # Preço
+    price_mode: str = "original" # original, custom
     custom_price: Optional[float] = 0.0
-    expiration_mode: Optional[str] = None
+
+    # Validade (Expiração)
+    expiration_mode: str = "none" # none, minutes, hours, days
     expiration_value: Optional[int] = 0
-    
-    # Controle
+
+
+    # Controle de Teste
     is_test: bool = False
-    specific_user_id: Optional[str] = None 
-
-    class Config:
-        from_attributes = True
-
-class UserUpdate(BaseModel):
-    role: Optional[str] = None
-    status: Optional[str] = None
-    custom_expiration: Optional[str] = None
-
-# =========================================================
-# 📢 ROTA DE DISPARO (BLINDADA)
-# =========================================================
-@app.post("/api/admin/remarketing/send")
-def send_remarketing(data: RemarketingRequest, db: Session = Depends(get_db)):
-    
-    # 1. Envio Individual
-    if data.specific_user_id:
-        try:
-            bot = db.query(Bot).filter(Bot.id == data.bot_id).first()
-            if not bot: raise HTTPException(404, "Bot não encontrado")
-            
-            tb = telebot.TeleBot(bot.token)
-            
-            markup = None
-            if data.incluir_oferta and data.plano_oferta_id:
-                markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton(
-                    f"💎 Oferta R$ {data.valor_oferta}", 
-                    callback_data=f"buy_promo_{data.plano_oferta_id}_{data.valor_oferta}"
-                ))
-
-            target = data.specific_user_id
-            if data.media_url:
-                if data.media_url.endswith(('.jpg', '.png', '.jpeg')):
-                    tb.send_photo(target, data.media_url, caption=data.mensagem, reply_markup=markup)
-                elif data.media_url.endswith(('.mp4')):
-                    tb.send_video(target, data.media_url, caption=data.mensagem, reply_markup=markup)
-                else:
-                    tb.send_message(target, f"{data.mensagem}\n\n🔗 {data.media_url}", reply_markup=markup)
-            else:
-                tb.send_message(target, data.mensagem, reply_markup=markup)
-                
-            return {"status": "sent", "msg": "Enviado com sucesso"}
-        except Exception as e:
-            logger.error(f"Erro envio individual: {e}")
-            raise HTTPException(500, f"Erro: {str(e)}")
-
-    # 2. Envio em Massa (Cria Campanha)
-    try:
-        config_json = json.dumps({
-            "msg": data.mensagem,
-            "media": data.media_url,
-            "offer": data.incluir_oferta,
-            "plano_id": data.plano_oferta_id,
-            "promo_price": data.valor_oferta,
-            "expire_timestamp": data.expire_timestamp or 0
-        })
-
-        nova_campanha = RemarketingCampaign(
-            campaign_id=str(uuid.uuid4()),
-            bot_id=data.bot_id,
-            type='periodico' if data.is_periodic else 'massivo',
-            target=data.tipo_envio,
-            config=config_json,
-            status='ativo',
-            dia_atual=0,
-            data_inicio=datetime.utcnow(),
-            proxima_execucao=datetime.utcnow() 
-        )
-        db.add(nova_campanha)
-        db.commit()
-        return {"status": "queued", "msg": "Campanha criada com sucesso"}
-    except Exception as e:
-        logger.error(f"Erro ao criar campanha: {e}")
-        raise HTTPException(500, "Erro interno")
+    specific_user_id: Optional[str] = None # Telegram ID para teste
 
 # ===========================
 # ⚙️ GESTÃO DE BOTS
@@ -529,48 +440,6 @@ def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(bot_db)
     return {"status": "ok", "msg": "Bot atualizado com sucesso"}
-
-# =========================================================
-# 👥 ROTA: CONTATOS (CORRIGIDA COLUNA EXPIRAÇÃO)
-# =========================================================
-@app.get("/api/admin/contacts")
-def get_contacts(bot_id: int = None, status: str = 'todos', page: int = 1, limit: int = 50, db: Session = Depends(get_db)):
-    # Se não passar bot_id, tenta pegar o primeiro ou retorna vazio (ajuste conforme sua lógica)
-    if not bot_id:
-        return {"users": [], "total_pages": 0, "total_records": 0}
-
-    query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
-
-    # Filtros
-    if status == 'pendente':
-        query = query.filter(Pedido.status == 'pending')
-    elif status == 'active':
-        query = query.filter(Pedido.status.in_(['paid', 'approved', 'active']))
-    elif status == 'expired':
-        query = query.filter(Pedido.status == 'expired')
-
-    # Paginação
-    total_records = query.count()
-    users_raw = query.order_by(desc(Pedido.created_at)).offset((page - 1) * limit).limit(limit).all()
-    
-    users_formatted = []
-    for u in users_raw:
-        # Garante que expiration_date seja enviado
-        users_formatted.append({
-            "id": u.id,
-            "telegram_id": u.telegram_id,
-            "first_name": u.first_name,
-            "username": u.username,
-            "status": u.status,
-            "created_at": u.created_at,
-            "expiration_date": u.expiration_date # <--- CAMPO CRÍTICO PARA A TABELA
-        })
-
-    return {
-        "users": users_formatted,
-        "total_pages": (total_records // limit) + 1,
-        "total_records": total_records
-    }
 
 # --- NOVA ROTA: LIGAR/DESLIGAR BOT (TOGGLE) ---
 @app.post("/api/admin/bots/{bot_id}/toggle")
@@ -1368,79 +1237,6 @@ def enviar_remarketing(payload: RemarketingRequest, background_tasks: Background
     background_tasks.add_task(processar_envio_remarketing, payload.bot_id, payload, db)
     return {"status": "enviando", "msg": "Campanha iniciada!"}
 
-# =========================================================
-# 🛠️ ROTAS DE GESTÃO DE USUÁRIOS (CRM)
-# =========================================================
-
-@app.put("/api/admin/users/{user_id}")
-def atualizar_usuario(user_id: int, dados: UserUpdate, db: Session = Depends(get_db)):
-    usuario = db.query(Pedido).filter(Pedido.id == user_id).first()
-    if not usuario:
-        raise HTTPException(status_code=404, detail="Usuário não encontrado")
-    
-    if dados.role: usuario.role = dados.role
-    if dados.status: usuario.status = dados.status
-    
-    # Lógica de Data Personalizada
-    if dados.custom_expiration:
-        if dados.custom_expiration == "vitalicio":
-            # Define uma data muito distante (ano 3000) ou nula + flag
-            # Aqui vamos usar a convenção: nome do plano ganha (VITALÍCIO)
-            if "VITALÍCIO" not in (usuario.plano_nome or ""):
-                usuario.plano_nome = f"{usuario.plano_nome or 'Plano'} (VITALÍCIO)"
-            usuario.custom_expiration = None # Limpa data manual pois é vitalício pelo nome
-        elif dados.custom_expiration == "remover":
-            usuario.custom_expiration = None
-            # Remove tag vitalício se tiver
-            if usuario.plano_nome:
-                usuario.plano_nome = usuario.plano_nome.replace("(VITALÍCIO)", "").strip()
-        else:
-            # Data específica YYYY-MM-DD
-            try:
-                data_obj = datetime.strptime(dados.custom_expiration, "%Y-%m-%d")
-                usuario.custom_expiration = data_obj
-            except: pass
-            
-    db.commit()
-    return {"status": "ok", "msg": "Usuário atualizado"}
-
-@app.post("/api/admin/users/{user_id}/resend-access")
-def reenviar_acesso(user_id: int, db: Session = Depends(get_db)):
-    usuario = db.query(Pedido).filter(Pedido.id == user_id).first()
-    if not usuario or usuario.status != 'paid':
-        raise HTTPException(status_code=400, detail="Usuário não encontrado ou não pagante.")
-    
-    bot_data = db.query(Bot).filter(Bot.id == usuario.bot_id).first()
-    if not bot_data:
-        raise HTTPException(status_code=404, detail="Bot não encontrado.")
-        
-    try:
-        tb = telebot.TeleBot(bot_data.token)
-        
-        # Tenta converter ID do canal
-        try: canal_id = int(str(bot_data.id_canal_vip).strip())
-        except: canal_id = bot_data.id_canal_vip
-
-        # Tenta desbanir antes (garantia)
-        try: tb.unban_chat_member(canal_id, int(usuario.telegram_id))
-        except: pass
-
-        # Gera Link Único
-        convite = tb.create_chat_invite_link(
-            chat_id=canal_id, 
-            member_limit=1, 
-            name=f"Reenvio {usuario.first_name}"
-        )
-        
-        msg = f"🔄 <b>Reenvio de Acesso</b>\n\nSeu link de acesso ao canal VIP:\n👉 {convite.invite_link}\n\n<i>Este link é único e válido apenas para você.</i>"
-        tb.send_message(int(usuario.telegram_id), msg, parse_mode="HTML")
-        
-        return {"status": "sent", "msg": "Link reenviado com sucesso!"}
-        
-    except Exception as e:
-        logger.error(f"Erro ao reenviar acesso: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro no Telegram: {str(e)}")
-
 @app.get("/api/admin/remarketing/status")
 def status_remarketing():
     return CAMPAIGN_STATUS
@@ -1596,7 +1392,7 @@ Toque no link abaixo para entrar no Canal VIP:
         logger.error(f"❌ ERRO CRÍTICO NO WEBHOOK: {e}")
         # Mesmo com erro, retornamos 200 ou estrutura json para não travar o gateway (opcional, depende da estratégia)
         return {"status": "error"}
-        
+
 @app.get("/")
 def home():
     return {"status": "Zenyx SaaS Online - Banco Atualizado"}
