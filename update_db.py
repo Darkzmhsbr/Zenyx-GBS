@@ -10,11 +10,14 @@ if DATABASE_URL.startswith("postgres://"):
 engine = create_engine(DATABASE_URL)
 
 def adicionar_colunas():
-    print("🔄 Iniciando atualização do banco de dados (Zenyx V2)...")
+    print("🔄 Iniciando reparo e atualização do banco de dados...")
     with engine.connect() as conn:
         try:
             comandos = [
-                # --- FLUXO DE MENSAGENS (ANTIGO/FIXO) ---
+                # --- CORREÇÃO CRÍTICA (ERRO 500 CONTATOS) ---
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
+                
+                # --- FLUXO DE MENSAGENS ---
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
@@ -32,8 +35,7 @@ def adicionar_colunas():
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS data_inicio TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS proxima_execucao TIMESTAMP WITHOUT TIME ZONE;",
                 
-                # --- [NOVO] TABELA DE FLUXO DINÂMICO (V2) ---
-                # Cria a tabela de passos se ela não existir
+                # --- TABELA DE FLUXO DINÂMICO (V2) ---
                 """
                 CREATE TABLE IF NOT EXISTS bot_flow_steps (
                     id SERIAL PRIMARY KEY,
@@ -51,10 +53,10 @@ def adicionar_colunas():
                 try:
                     conn.execute(text(cmd))
                 except Exception as e_cmd:
-                    print(f"⚠️ Aviso (Comando pode já ter sido aplicado): {e_cmd}")
+                    print(f"⚠️ Aviso (Pode já existir): {e_cmd}")
 
             conn.commit()
-            print("✅ Banco de dados atualizado com sucesso!")
+            print("✅ Banco de dados REPARADO com sucesso!")
         except Exception as e:
             print(f"❌ Erro Crítico: {e}")
 
