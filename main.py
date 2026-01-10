@@ -19,7 +19,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta
 
 # Importa banco de dados
-from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, Pedido, SystemConfig, RemarketingCampaign, BotAdmin, engine
+from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, BotFlowStep, Pedido, SystemConfig, RemarketingCampaign, BotAdmin, engine
 
 # Configuração de Log
 logging.basicConfig(level=logging.INFO)
@@ -339,6 +339,18 @@ class FlowUpdate(BaseModel):
     msg_2_media: Optional[str] = None
     mostrar_planos_2: bool
 
+# --- MODELOS DO NOVO FLOW V2 (DINÂMICO) ---
+class FlowStepCreate(BaseModel):
+    msg_texto: str
+    msg_media: Optional[str] = None
+    btn_texto: str = "Próximo ▶️"
+    step_order: int
+
+# Modelo apenas para ordenação (se precisarmos reordenar no futuro)
+class StepReorder(BaseModel):
+    step_id: int
+    new_order: int
+
 # ✅ MODELO COMPLETO PARA O WIZARD DE REMARKETING
 class RemarketingRequest(BaseModel):
     bot_id: int
@@ -635,6 +647,43 @@ def salvar_fluxo(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
     return {"status": "saved"}
 
 # =========================================================
+# 🧩 ROTAS DE PASSOS DINÂMICOS (FLOW V2)
+# =========================================================
+
+@app.get("/api/admin/bots/{bot_id}/flow/steps")
+def listar_passos_flow(bot_id: int, db: Session = Depends(get_db)):
+    # Retorna os passos ordenados (1, 2, 3...)
+    steps = db.query(BotFlowStep).filter(BotFlowStep.bot_id == bot_id).order_by(BotFlowStep.step_order).all()
+    return steps
+
+@app.post("/api/admin/bots/{bot_id}/flow/steps")
+def adicionar_passo_flow(bot_id: int, payload: FlowStepCreate, db: Session = Depends(get_db)):
+    # Verifica se o bot existe
+    bot = db.query(Bot).filter(Bot.id == bot_id).first()
+    if not bot: raise HTTPException(404, "Bot não encontrado")
+
+    # Cria o novo passo
+    novo_passo = BotFlowStep(
+        bot_id=bot_id,
+        step_order=payload.step_order,
+        msg_texto=payload.msg_texto,
+        msg_media=payload.msg_media,
+        btn_texto=payload.btn_texto
+    )
+    db.add(novo_passo)
+    db.commit()
+    return {"status": "success", "msg": "Passo adicionado com sucesso!"}
+
+@app.delete("/api/admin/bots/{bot_id}/flow/steps/{step_id}")
+def remover_passo_flow(bot_id: int, step_id: int, db: Session = Depends(get_db)):
+    passo = db.query(BotFlowStep).filter(BotFlowStep.id == step_id, BotFlowStep.bot_id == bot_id).first()
+    if not passo: raise HTTPException(404, "Passo não encontrado")
+    
+    db.delete(passo)
+    db.commit()
+    return {"status": "deleted"}
+
+# =========================================================
 # 💰 ROTA WEBHOOK PIX (HÍBRIDA + CORREÇÃO DE ID + HTML)
 # =========================================================
 @app.post("/webhook/pix")
@@ -723,6 +772,39 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
     except Exception as e:
         print(f"❌ ERRO CRÍTICO NO WEBHOOK: {e}")
         return {"status": "error"}
+
+
+
+# --- FUNÇÃO AUXILIAR: ENVIAR OFERTA FINAL (USADA EM VÁRIOS LUGARES) ---
+def enviar_oferta_final(tb, chat_id, flow, bot_id, db):
+    """Envia a mensagem final de oferta com os planos."""
+    markup = types.InlineKeyboardMarkup()
+    
+    # Busca Planos
+    planos = db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
+    if flow and flow.mostrar_planos_2:
+        for plano in planos:
+            markup.add(types.InlineKeyboardButton(
+                text=f"💎 {plano.nome_exibicao} - R$ {plano.preco_atual:.2f}", 
+                callback_data=f"checkout_{plano.id}"
+            ))
+    
+    # Envia Mensagem (Texto ou Mídia)
+    msg_texto = flow.msg_2_texto if (flow and flow.msg_2_texto) else "Escolha seu plano abaixo:"
+    msg_media = flow.msg_2_media if (flow and flow.msg_2_media) else None
+    
+    if msg_media:
+        try:
+            if msg_media.lower().endswith(('.mp4', '.mov', '.avi')):
+                tb.send_video(chat_id, msg_media, caption=msg_texto, reply_markup=markup)
+            else:
+                tb.send_photo(chat_id, msg_media, caption=msg_texto, reply_markup=markup)
+        except:
+            tb.send_message(chat_id, msg_texto, reply_markup=markup)
+    else:
+        tb.send_message(chat_id, msg_texto, reply_markup=markup)
+
+
 
 # =========================================================
 # 🚀 WEBHOOK GERAL DO BOT (COM PORTEIRO + PAUSA)
@@ -831,7 +913,7 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             else:
                 bot_temp.send_message(chat_id, texto, reply_markup=markup)
 
-        # --- 2. CLIQUE NO BOTÃO (OFERTA) ---
+        # --- 2. CLIQUE NO BOTÃO (INÍCIO DO FLOW DINÂMICO V2) ---
         elif update.callback_query and update.callback_query.data == "passo_2":
             chat_id = update.callback_query.message.chat.id
             msg_id = update.callback_query.message.message_id
@@ -839,35 +921,92 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             
             # A) Autodestruição (Se configurado)
             if fluxo and fluxo.autodestruir_1:
-                try:
-                    bot_temp.delete_message(chat_id, msg_id)
-                except Exception as e:
-                    logger.warning(f"Falha ao deletar msg: {e}")
+                try: bot_temp.delete_message(chat_id, msg_id)
+                except: pass
 
-            # B) Prepara Segunda Mensagem
-            texto_2 = fluxo.msg_2_texto if (fluxo and fluxo.msg_2_texto) else "Escolha seu plano:"
-            media_2 = fluxo.msg_2_media if (fluxo and fluxo.msg_2_media) else None
-            
-            # C) Cria Botões dos Planos
-            markup = types.InlineKeyboardMarkup()
-            if fluxo and fluxo.mostrar_planos_2:
-                for p in bot_db.planos:
-                    # Cria botão com preço e callback de checkout
-                    markup.add(types.InlineKeyboardButton(text=f"{p.nome_exibicao} - R$ {p.preco_atual:.2f}", callback_data=f"checkout_{p.id}"))
-            
-            # D) Envia Mensagem 2 (Mídia ou Texto)
-            if media_2:
-                try:
-                    if media_2.lower().endswith(('.mp4', '.mov', '.avi')):
-                        bot_temp.send_video(chat_id, media_2, caption=texto_2, reply_markup=markup)
-                    else:
-                        bot_temp.send_photo(chat_id, media_2, caption=texto_2, reply_markup=markup)
-                except:
-                    bot_temp.send_message(chat_id, texto_2, reply_markup=markup)
+            # --- [NOVA LÓGICA] Verifica se tem passos intermediários no banco ---
+            primeiro_passo = db.query(BotFlowStep).filter(
+                BotFlowStep.bot_id == bot_db.id, 
+                BotFlowStep.step_order == 1
+            ).first()
+
+            if primeiro_passo:
+                # TEM PASSOS NOVOS -> Manda o Passo 1
+                markup_step = types.InlineKeyboardMarkup()
+                
+                # Verifica se existe Passo 2 para conectar o botão
+                segundo_passo = db.query(BotFlowStep).filter(
+                    BotFlowStep.bot_id == bot_db.id, 
+                    BotFlowStep.step_order == 2
+                ).first()
+                
+                # Se tiver passo 2, o botão chama ele. Se não, chama o checkout (go_checkout).
+                next_callback = "next_step_2" if segundo_passo else "go_checkout"
+                markup_step.add(types.InlineKeyboardButton(text=primeiro_passo.btn_texto, callback_data=next_callback))
+
+                # Envia Mídia ou Texto do Passo 1
+                if primeiro_passo.msg_media:
+                    try:
+                        if primeiro_passo.msg_media.lower().endswith(('.mp4', '.mov')):
+                            bot_temp.send_video(chat_id, primeiro_passo.msg_media, caption=primeiro_passo.msg_texto, reply_markup=markup_step)
+                        else:
+                            bot_temp.send_photo(chat_id, primeiro_passo.msg_media, caption=primeiro_passo.msg_texto, reply_markup=markup_step)
+                    except:
+                        bot_temp.send_message(chat_id, primeiro_passo.msg_texto, reply_markup=markup_step)
+                else:
+                    bot_temp.send_message(chat_id, primeiro_passo.msg_texto, reply_markup=markup_step)
             else:
-                bot_temp.send_message(chat_id, texto_2, reply_markup=markup)
+                # NÃO TEM PASSOS -> Vai direto pra oferta (Comportamento Original)
+                enviar_oferta_final(bot_temp, chat_id, fluxo, bot_db.id, db)
             
-            # Para o "reloginho" do botão
+            # Para o reloginho do botão no Telegram
+            bot_temp.answer_callback_query(update.callback_query.id)
+
+        # --- [NOVO] AÇÃO: PRÓXIMO PASSO (Navegação Dinâmica) ---
+        elif update.callback_query and update.callback_query.data.startswith("next_step_"):
+            chat_id = update.callback_query.message.chat.id
+            try:
+                step_order = int(update.callback_query.data.split("_")[2])
+            except: step_order = 1
+            
+            # Busca o passo atual no banco
+            passo_atual = db.query(BotFlowStep).filter(
+                BotFlowStep.bot_id == bot_db.id, 
+                BotFlowStep.step_order == step_order
+            ).first()
+
+            if passo_atual:
+                markup_step = types.InlineKeyboardMarkup()
+                
+                # Verifica o PRÓXIMO passo (atual + 1)
+                proximo_passo = db.query(BotFlowStep).filter(
+                    BotFlowStep.bot_id == bot_db.id, 
+                    BotFlowStep.step_order == step_order + 1
+                ).first()
+                
+                next_callback = f"next_step_{step_order + 1}" if proximo_passo else "go_checkout"
+                markup_step.add(types.InlineKeyboardButton(text=passo_atual.btn_texto, callback_data=next_callback))
+
+                if passo_atual.msg_media:
+                    try:
+                        if passo_atual.msg_media.lower().endswith(('.mp4', '.mov')):
+                            bot_temp.send_video(chat_id, passo_atual.msg_media, caption=passo_atual.msg_texto, reply_markup=markup_step)
+                        else:
+                            bot_temp.send_photo(chat_id, passo_atual.msg_media, caption=passo_atual.msg_texto, reply_markup=markup_step)
+                    except:
+                        bot_temp.send_message(chat_id, passo_atual.msg_texto, reply_markup=markup_step)
+                else:
+                    bot_temp.send_message(chat_id, passo_atual.msg_texto, reply_markup=markup_step)
+            else:
+                # Se o passo sumiu, joga pro checkout por segurança
+                enviar_oferta_final(bot_temp, chat_id, bot_db.fluxo, bot_db.id, db)
+            
+            bot_temp.answer_callback_query(update.callback_query.id)
+
+        # --- [NOVO] AÇÃO: IR PARA CHECKOUT (Fim do Flow) ---
+        elif update.callback_query and update.callback_query.data == "go_checkout":
+            chat_id = update.callback_query.message.chat.id
+            enviar_oferta_final(bot_temp, chat_id, bot_db.fluxo, bot_db.id, db)
             bot_temp.answer_callback_query(update.callback_query.id)
 
         # ==================================================================
