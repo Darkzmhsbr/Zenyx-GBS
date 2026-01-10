@@ -36,64 +36,84 @@ app.add_middleware(
 )
 
 # =========================================================
-# 🛠️ AUTO-REPARO DO BANCO DE DADOS (CORREÇÃO DE COLUNAS)
+# 2. AUTO-REPARO DO BANCO DE DADOS (LISTA MESTRA DE CORREÇÃO)
 # =========================================================
 @app.on_event("startup")
 def on_startup():
     # 1. Cria tabelas que não existem
     init_db()
     
-    # 2. FORÇA A CRIAÇÃO DAS COLUNAS NOVAS (Correção Crítica)
+    # 2. FORÇA A CRIAÇÃO DE TODAS AS COLUNAS FALTANTES (TODAS AS VERSÕES)
     try:
         with engine.connect() as conn:
-            logger.info("🔧 Verificando integridade do banco de dados...")
+            logger.info("🔧 [STARTUP] Verificando integridade completa do banco...")
             
             comandos_sql = [
-                # --- Campos antigos (para garantir) ---
+                # --- [CORREÇÃO 1] TABELA DE PLANOS (Causa do erro ao Criar Plano) ---
+                "ALTER TABLE planos_config ADD COLUMN IF NOT EXISTS key_id VARCHAR;",
+                "ALTER TABLE planos_config ADD COLUMN IF NOT EXISTS descricao TEXT;",
+                "ALTER TABLE planos_config ADD COLUMN IF NOT EXISTS preco_cheio FLOAT;",
+
+                # --- [CORREÇÃO 2] TABELA DE PEDIDOS (Datas e Frontend) ---
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_nome VARCHAR;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS txid VARCHAR;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS qr_code TEXT;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS transaction_id VARCHAR;", 
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS data_aprovacao TIMESTAMP WITHOUT TIME ZONE;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS data_expiracao TIMESTAMP WITHOUT TIME ZONE;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS custom_expiration TIMESTAMP WITHOUT TIME ZONE;", # <--- CRÍTICO PRO FRONTEND
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS link_acesso VARCHAR;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS mensagem_enviada BOOLEAN DEFAULT FALSE;",
+
+                # --- [CORREÇÃO 3] FLUXO DE MENSAGENS (Antigo mas necessário) ---
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;",
                 
-                # --- NOVOS CAMPOS DO REMARKETING (CRÍTICO) ---
+                # --- [CORREÇÃO 4] REMARKETING AVANÇADO (CRÍTICO) ---
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS target VARCHAR DEFAULT 'todos';",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS type VARCHAR DEFAULT 'massivo';",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS promo_price FLOAT;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS expiration_at TIMESTAMP WITHOUT TIME ZONE;",
-                
-                # --- Campos de Recorrência (Se faltar) ---
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS dia_atual INTEGER DEFAULT 0;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS data_inicio TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
-                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS proxima_execucao TIMESTAMP WITHOUT TIME ZONE;"
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS proxima_execucao TIMESTAMP WITHOUT TIME ZONE;",
+                
+                # --- [CORREÇÃO 5] TABELA NOVA (FLOW V2) ---
+                """
+                CREATE TABLE IF NOT EXISTS bot_flow_steps (
+                    id SERIAL PRIMARY KEY,
+                    bot_id INTEGER REFERENCES bots(id),
+                    step_order INTEGER DEFAULT 1,
+                    msg_texto TEXT,
+                    msg_media VARCHAR,
+                    btn_texto VARCHAR DEFAULT 'Próximo ▶️',
+                    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now()
+                );
+                """
             ]
             
             for cmd in comandos_sql:
                 try:
                     conn.execute(text(cmd))
+                    conn.commit()
                 except Exception as e_sql:
-                    # Ignora erro se a coluna já existir (dupla segurança)
+                    # Ignora erro se a coluna já existir (segurança)
                     logger.warning(f"Aviso SQL: {e_sql}")
             
-            conn.commit()
-            logger.info("✅ BANCO DE DADOS ATUALIZADO COM SUCESSO!")
-            
-        # --- 3. INICIA O CEIFADOR ---
-        thread = threading.Thread(target=loop_verificar_vencimentos)
-        thread.daemon = True
-        thread.start()
-        logger.info("💀 O Ceifador (Auto-Kick) foi iniciado!")
+            logger.info("✅ [STARTUP] Banco de dados 100% Verificado!")
             
     except Exception as e:
-        logger.error(f"❌ Erro crítico na inicialização do banco: {e}")
+        logger.error(f"❌ Falha no reparo do banco: {e}")
 
-def get_db():
-    """Gera conexão com o banco de dados"""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    # 3. Inicia o Ceifador
+    thread = threading.Thread(target=loop_verificar_vencimentos)
+    thread.daemon = True
+    thread.start()
+    logger.info("💀 O Ceifador (Auto-Kick) foi iniciado!")
 
 # =========================================================
 # 💀 O CEIFADOR: VERIFICA VENCIMENTOS E REMOVE (KICK SUAVE)
