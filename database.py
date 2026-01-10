@@ -75,19 +75,21 @@ class BotAdmin(Base):
     bot = relationship("Bot", back_populates="admins")
 
 # =========================================================
-# 💲 TABELA DE PLANOS DE ACESSO
+# 💎 TABELA DE PLANOS
 # =========================================================
 class PlanoConfig(Base):
     __tablename__ = "planos_config"
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, ForeignKey("bots.id"))
-    key_id = Column(String, nullable=True) # Identificador único textual (opcional)
-    
-    nome_exibicao = Column(String)  # Ex: "Plano Mensal"
-    preco_atual = Column(Float)     # Ex: 29.90
-    dias_duracao = Column(Integer)  # Ex: 30
-    
     bot = relationship("Bot", back_populates="planos")
+    key_id = Column(String, index=True)
+    nome_exibicao = Column(String)
+    descricao = Column(String)
+    preco_cheio = Column(Float)
+    preco_atual = Column(Float)
+    dias_duracao = Column(Integer)
+    oculto = Column(Boolean, default=False)
+    tag = Column(String, nullable=True) 
 
 # =========================================================
 # 📢 TABELA DE REMARKETING & CAMPANHAS
