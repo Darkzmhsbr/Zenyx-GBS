@@ -9,7 +9,7 @@ from telebot import types
 import json
 import uuid
 
-# --- CORREÇÃO AQUI: IMPORTS SEPARADOS CORRETAMENTE ---
+# --- IMPORTS ---
 from sqlalchemy import func, desc, text
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,7 +36,18 @@ app.add_middleware(
 )
 
 # =========================================================
-# 🛠️ AUTO-REPARO DO BANCO DE DADOS (CORREÇÃO DE COLUNAS)
+# 1. FUNÇÃO DE CONEXÃO COM BANCO (DEVE VIR PRIMEIRO)
+# =========================================================
+def get_db():
+    """Gera conexão com o banco de dados"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# =========================================================
+# 2. AUTO-REPARO DO BANCO DE DADOS (CORREÇÃO DE COLUNAS)
 # =========================================================
 @app.on_event("startup")
 def on_startup():
@@ -66,7 +77,7 @@ def loop_verificar_vencimentos():
     """Roda a cada 60 minutos para remover usuários vencidos"""
     while True:
         try:
-            logger.info("⏳ Verificando assinaturas vencidas...")
+            # logger.info("⏳ Verificando assinaturas vencidas...")
             verificar_expiracao_massa()
         except Exception as e:
             logger.error(f"Erro no loop de vencimento: {e}")
@@ -94,7 +105,6 @@ def verificar_expiracao_massa():
                 
                 for user in usuarios_ativos:
                     # Determina a duração baseada no nome do plano
-                    # (Como não salvamos dias no pedido antes, usamos o nome como referência)
                     dias_duracao = 30 # Padrão Mensal
                     nome_plano = (user.plano_nome or "").lower()
                     
@@ -125,10 +135,9 @@ def verificar_expiracao_massa():
                             tb.ban_chat_member(canal_id, int(user.telegram_id))
                             
                             # 3. Desbanir Imediatamente (Limpa a Blacklist)
-                            # Isso permite que ele compre de novo e entre sem erro de "User was kicked"
                             tb.unban_chat_member(canal_id, int(user.telegram_id))
                             
-                            # 4. Atualiza DB para 'expired' (Para o Porteiro barrar depois)
+                            # 4. Atualiza DB para 'expired'
                             user.status = 'expired'
                             db.commit()
                             
@@ -138,7 +147,6 @@ def verificar_expiracao_massa():
                             except: pass
                             
                         except Exception as e_kick:
-                            # Se der erro (ex: user já saiu), marca como expirado mesmo assim
                             logger.error(f"Erro ao remover membro {user.telegram_id}: {e_kick}")
                             user.status = 'expired'
                             db.commit()
@@ -213,11 +221,6 @@ def notificar_admin_principal(bot_db: Bot, mensagem: str):
         sender.send_message(bot_db.admin_principal_id, mensagem, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Falha ao notificar admin principal {bot_db.admin_principal_id}: {e}")
-
-# --- ROTAS DE INTEGRAÇÃO (SALVAR TOKEN) ---
-# =========================================================
-# 🔌 ROTAS DE INTEGRAÇÃO (SALVAR TOKEN PUSHIN PAY)
-# =========================================================
 
 # --- FUNÇÃO AUXILIAR: ENVIAR OFERTA FINAL ---
 def enviar_oferta_final(tb, chat_id, flow, bot_id, db):
@@ -390,29 +393,20 @@ def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
     bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
     if not bot_db: raise HTTPException(404, "Bot não encontrado")
     
-    # Guarda token antigo para verificar mudança
     old_token = bot_db.token
 
-    # Atualiza campos básicos
     if dados.nome: bot_db.nome = dados.nome
     if dados.token: bot_db.token = dados.token
     if dados.id_canal_vip: bot_db.id_canal_vip = dados.id_canal_vip
+    if dados.admin_principal_id is not None: bot_db.admin_principal_id = dados.admin_principal_id
     
-    # --- SALVA O ADMIN PRINCIPAL ---
-    # Aceita string vazia para limpar o campo, ou valor novo
-    if dados.admin_principal_id is not None: 
-        bot_db.admin_principal_id = dados.admin_principal_id
-    
-    # Se houver troca de token, atualiza Webhook
     if dados.token and dados.token != old_token:
         try:
-            # 1. Tenta remover webhook do token antigo
             try:
                 old_tb = telebot.TeleBot(old_token)
                 old_tb.delete_webhook()
             except: pass
 
-            # 2. Configura o novo webhook
             tb = telebot.TeleBot(dados.token)
             public_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "zenyx-gbs-production.up.railway.app")
             if public_url.startswith("https://"): public_url = public_url.replace("https://", "")
@@ -421,7 +415,7 @@ def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
             tb.set_webhook(url=webhook_url)
             
             logger.info(f"♻️ Webhook atualizado para o bot {bot_db.nome}")
-            bot_db.status = "ativo" # Reseta para ativo ao trocar token
+            bot_db.status = "ativo" 
         except Exception as e:
             logger.error(f"Erro ao atualizar webhook: {e}")
             bot_db.status = "erro_token"
@@ -430,18 +424,15 @@ def update_bot(bot_id: int, dados: BotCreate, db: Session = Depends(get_db)):
     db.refresh(bot_db)
     return {"status": "ok", "msg": "Bot atualizado com sucesso"}
 
-# --- NOVA ROTA: LIGAR/DESLIGAR BOT (TOGGLE) ---
 @app.post("/api/admin/bots/{bot_id}/toggle")
 def toggle_bot(bot_id: int, db: Session = Depends(get_db)):
     bot = db.query(Bot).filter(Bot.id == bot_id).first()
     if not bot: raise HTTPException(404, "Bot não encontrado")
     
-    # Inverte o status
     novo_status = "ativo" if bot.status != "ativo" else "pausado"
     bot.status = novo_status
     db.commit()
     
-    # 🔔 Notifica Admin
     try:
         emoji = "🟢" if novo_status == "ativo" else "🔴"
         msg = f"{emoji} *STATUS DO BOT ALTERADO*\n\nO bot *{bot.nome}* agora está: *{novo_status.upper()}*"
@@ -451,58 +442,39 @@ def toggle_bot(bot_id: int, db: Session = Depends(get_db)):
     
     return {"status": novo_status}
 
-# --- NOVA ROTA: EXCLUIR BOT ---
 @app.delete("/api/admin/bots/{bot_id}")
 def deletar_bot(bot_id: int, db: Session = Depends(get_db)):
     bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
     if not bot_db:
         raise HTTPException(status_code=404, detail="Bot não encontrado")
     
-    # 1. Tenta remover o Webhook do Telegram para limpar
     try:
         tb = telebot.TeleBot(bot_db.token)
         tb.delete_webhook()
-    except:
-        pass # Se der erro (ex: token inválido), continua e apaga do banco
+    except: pass
     
-    # 2. Apaga do Banco de Dados
     db.delete(bot_db)
     db.commit()
-    
     return {"status": "deleted", "msg": "Bot removido com sucesso"}
 
 # =========================================================
-# 🛡️ GESTÃO DE ADMINISTRADORES (FASE 1)
+# 🛡️ GESTÃO DE ADMINISTRADORES
 # =========================================================
 
 @app.get("/api/admin/bots/{bot_id}/admins")
 def listar_admins(bot_id: int, db: Session = Depends(get_db)):
-    """Lista todos os admins de um bot específico"""
     admins = db.query(BotAdmin).filter(BotAdmin.bot_id == bot_id).all()
     return admins
 
 @app.post("/api/admin/bots/{bot_id}/admins")
 def adicionar_admin(bot_id: int, dados: BotAdminCreate, db: Session = Depends(get_db)):
-    """Adiciona um novo admin ao bot"""
-    # Verifica se o bot existe
     bot = db.query(Bot).filter(Bot.id == bot_id).first()
-    if not bot:
-        raise HTTPException(status_code=404, detail="Bot não encontrado")
+    if not bot: raise HTTPException(status_code=404, detail="Bot não encontrado")
     
-    # Verifica se já é admin
-    existente = db.query(BotAdmin).filter(
-        BotAdmin.bot_id == bot_id, 
-        BotAdmin.telegram_id == dados.telegram_id
-    ).first()
+    existente = db.query(BotAdmin).filter(BotAdmin.bot_id == bot_id, BotAdmin.telegram_id == dados.telegram_id).first()
+    if existente: raise HTTPException(status_code=400, detail="Este ID já é administrador.")
     
-    if existente:
-        raise HTTPException(status_code=400, detail="Este ID já é administrador deste bot.")
-    
-    novo_admin = BotAdmin(
-        bot_id=bot_id,
-        telegram_id=dados.telegram_id,
-        nome=dados.nome
-    )
+    novo_admin = BotAdmin(bot_id=bot_id, telegram_id=dados.telegram_id, nome=dados.nome)
     db.add(novo_admin)
     db.commit()
     db.refresh(novo_admin)
@@ -510,23 +482,15 @@ def adicionar_admin(bot_id: int, dados: BotAdminCreate, db: Session = Depends(ge
 
 @app.delete("/api/admin/bots/{bot_id}/admins/{telegram_id}")
 def remover_admin(bot_id: int, telegram_id: str, db: Session = Depends(get_db)):
-    """Remove um admin pelo Telegram ID"""
-    admin_db = db.query(BotAdmin).filter(
-        BotAdmin.bot_id == bot_id,
-        BotAdmin.telegram_id == telegram_id
-    ).first()
-    
-    if not admin_db:
-        raise HTTPException(status_code=404, detail="Administrador não encontrado")
+    admin_db = db.query(BotAdmin).filter(BotAdmin.bot_id == bot_id, BotAdmin.telegram_id == telegram_id).first()
+    if not admin_db: raise HTTPException(status_code=404, detail="Administrador não encontrado")
     
     db.delete(admin_db)
     db.commit()
     return {"status": "deleted", "msg": "Administrador removido com sucesso"}
 
-# --- NOVA ROTA: LISTAR BOTS ---
-
 # =========================================================
-# 🤖 LISTAR BOTS (COM KPI TOTAIS E USERNAME CORRIGIDO)
+# 🤖 LISTAR BOTS
 # =========================================================
 @app.get("/api/admin/bots")
 def list_bots(db: Session = Depends(get_db)):
@@ -534,17 +498,10 @@ def list_bots(db: Session = Depends(get_db)):
     resultado = []
     
     for bot in bots:
-        # [CORREÇÃO] Remove todos os @ existentes e adiciona apenas um limpo
         u_name = bot.username or "..."
-        if u_name != "...":
-            u_name = f"@{u_name.lstrip('@')}"
+        if u_name != "...": u_name = f"@{u_name.lstrip('@')}"
 
-        # Leads (Total de pessoas únicas que iniciaram checkout)
         leads = db.query(func.count(Pedido.telegram_id.distinct())).filter(Pedido.bot_id == bot.id).scalar() or 0
-        
-        # [CORREÇÃO FINANCEIRA] 
-        # Soma TODAS as vendas aprovadas, INCLUSIVE as expiradas.
-        # Dinheiro recebido não pode sumir só porque o tempo acabou.
         receita = db.query(func.sum(Pedido.valor)).filter(
             Pedido.bot_id == bot.id, 
             Pedido.status.in_(['paid', 'approved', 'completed', 'succeeded', 'active', 'expired'])
@@ -585,6 +542,14 @@ def criar_plano(plano: PlanoCreate, db: Session = Depends(get_db)):
 @app.get("/api/admin/plans/{bot_id}")
 def listar_planos(bot_id: int, db: Session = Depends(get_db)):
     return db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
+
+@app.delete("/api/admin/plans/{plan_id}")
+def deletar_plano(plan_id: int, db: Session = Depends(get_db)):
+    plano = db.query(PlanoConfig).filter(PlanoConfig.id == plan_id).first()
+    if plano:
+        db.delete(plano)
+        db.commit()
+    return {"status": "deleted"}
 
 @app.get("/api/admin/bots/{bot_id}/flow")
 def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
@@ -653,7 +618,7 @@ def remover_passo_flow(bot_id: int, step_id: int, db: Session = Depends(get_db))
     return {"status": "deleted"}
 
 # =========================================================
-# 💰 ROTA WEBHOOK PIX (HÍBRIDA + CORREÇÃO DE ID + HTML)
+# 💰 ROTA WEBHOOK PIX (HÍBRIDA + CORREÇÃO DE ID)
 # =========================================================
 @app.post("/webhook/pix")
 async def webhook_pix(request: Request, db: Session = Depends(get_db)):
@@ -727,54 +692,16 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         logger.error(f"❌ ERRO CRÍTICO NO WEBHOOK: {e}")
         return {"status": "error"}
 
-
-
-
-# --- FUNÇÃO AUXILIAR: ENVIAR OFERTA FINAL (USADA EM VÁRIOS LUGARES) ---
-def enviar_oferta_final(tb, chat_id, flow, bot_id, db):
-    """Envia a mensagem final de oferta com os planos."""
-    markup = types.InlineKeyboardMarkup()
-    
-    # Busca Planos
-    planos = db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
-    if flow and flow.mostrar_planos_2:
-        for plano in planos:
-            markup.add(types.InlineKeyboardButton(
-                text=f"💎 {plano.nome_exibicao} - R$ {plano.preco_atual:.2f}", 
-                callback_data=f"checkout_{plano.id}"
-            ))
-    
-    # Envia Mensagem (Texto ou Mídia)
-    msg_texto = flow.msg_2_texto if (flow and flow.msg_2_texto) else "Escolha seu plano abaixo:"
-    msg_media = flow.msg_2_media if (flow and flow.msg_2_media) else None
-    
-    if msg_media:
-        try:
-            if msg_media.lower().endswith(('.mp4', '.mov', '.avi')):
-                tb.send_video(chat_id, msg_media, caption=msg_texto, reply_markup=markup)
-            else:
-                tb.send_photo(chat_id, msg_media, caption=msg_texto, reply_markup=markup)
-        except:
-            tb.send_message(chat_id, msg_texto, reply_markup=markup)
-    else:
-        tb.send_message(chat_id, msg_texto, reply_markup=markup)
-
-
-
 # =========================================================
 # 🚀 WEBHOOK GERAL DO BOT (COM PORTEIRO + PAUSA)
 # =========================================================
 @app.post("/webhook/{bot_token}")
 async def receber_update_telegram(bot_token: str, request: Request, db: Session = Depends(get_db)):
-    
-    # Proteção contra loop do pix
     if bot_token == "pix": return {"status": "ignored_loop"}
     
     bot_db = db.query(Bot).filter(Bot.token == bot_token).first()
     if not bot_db: return {"status": "ignored"}
 
-    # --- 🛑 NOVA VERIFICAÇÃO: BOT PAUSADO? ---
-    # Se você clicou no botão de desligar no painel, ele para aqui.
     if bot_db.status == "pausado":
         return {"status": "paused_by_admin"}
 
@@ -784,54 +711,39 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
         bot_temp = telebot.TeleBot(bot_token)
         
         # --- 🚪 O PORTEIRO (VERIFICA ENTRADA NO GRUPO) ---
-        # Se alguém tentar entrar no grupo pelo link...
         if update.message and update.message.new_chat_members:
             chat_id_atual = str(update.message.chat.id)
-            # Normaliza o ID do canal do banco
             canal_vip_db = str(bot_db.id_canal_vip).strip()
             
-            # Verifica se o evento aconteceu no Canal VIP protegido
             if chat_id_atual == canal_vip_db:
                 for member in update.message.new_chat_members:
-                    if member.is_bot: continue # Ignora bots
-                    
+                    if member.is_bot: continue
                     user_id = str(member.id)
-                    logger.info(f"👤 Verificando entrada de {user_id} no canal {canal_vip_db}")
                     
                     # 1. Busca se tem pedido PAGO e VÁLIDO no banco
                     pedido = db.query(Pedido).filter(
                         Pedido.bot_id == bot_db.id,
                         Pedido.telegram_id == user_id
-                    ).order_by(text("created_at DESC")).first() # Pega o último
+                    ).order_by(text("created_at DESC")).first()
                     
                     acesso_autorizado = False
-                    
                     if pedido and pedido.status == 'paid':
-                        # Verifica data de validade (Dupla checagem)
                         dias = 30
                         nome = (pedido.plano_nome or "").lower()
                         
-                        if "vital" in nome or "mega" in nome: 
-                            acesso_autorizado = True
+                        if "vital" in nome or "mega" in nome: acesso_autorizado = True
                         else:
                             if "diario" in nome or "24" in nome: dias = 1
                             elif "trimestral" in nome: dias = 90
                             elif "semanal" in nome: dias = 7
                             
                             validade = pedido.created_at + timedelta(days=dias)
-                            # Se a data atual for MENOR que a validade, deixa entrar
-                            if datetime.utcnow() < validade:
-                                acesso_autorizado = True
+                            if datetime.utcnow() < validade: acesso_autorizado = True
                     
-                    # 2. Se não tiver autorizado, CHUTA!
                     if not acesso_autorizado:
-                        logger.warning(f"🚫 Intruso detectado! Removendo {user_id}...")
                         try:
-                            # Ban + Unban (Kick Suave para não poluir a blacklist)
                             bot_temp.ban_chat_member(chat_id_atual, int(user_id))
                             bot_temp.unban_chat_member(chat_id_atual, int(user_id))
-                            
-                            # Avisa no privado
                             try:
                                 bot_temp.send_message(int(user_id), "🚫 **Acesso Negado**\n\nSua assinatura venceu ou não foi encontrada. Faça um novo pagamento para entrar.")
                             except: pass
@@ -868,7 +780,7 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             data = call.data
             cid = call.message.chat.id
 
-           # --- 2. PASSO 2 (LÓGICA V2: VERIFICA PASSOS INTERMEDIÁRIOS) ---
+            # --- 2. PASSO 2 (LÓGICA V2: VERIFICA PASSOS INTERMEDIÁRIOS) ---
             if data == "passo_2":
                 if bot_db.fluxo and bot_db.fluxo.autodestruir_1:
                     try: bot_temp.delete_message(cid, call.message.message_id)
@@ -938,13 +850,12 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                 enviar_oferta_final(bot_temp, cid, bot_db.fluxo, bot_db.id, db)
                 bot_temp.answer_callback_query(call.id)
 
-            # --- 5. CHECKOUT E OFERTAS (GERAR PIX) ---
+            # --- 5. CHECKOUT (GERAR PIX) ---
             elif data.startswith("checkout_") or data.startswith("promo_"):
                 plano_id = None
                 preco_final = 0.0
                 nome_plano_str = ""
                 
-                # A) Lógica para Checkout Padrão
                 if "checkout_" in data:
                     plano_id = data.split("_")[1]
                     plano = db.query(PlanoConfig).filter(PlanoConfig.id == plano_id).first()
@@ -952,42 +863,30 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                         preco_final = plano.preco_atual
                         nome_plano_str = plano.nome_exibicao
                 
-                # B) Lógica para Promoção / Remarketing (Que estava faltando)
                 elif "promo_" in data:
                     campanha_uuid = data.split("_")[1]
                     campanha = db.query(RemarketingCampaign).filter(RemarketingCampaign.campaign_id == campanha_uuid).first()
-                    
                     if campanha and campanha.plano_id:
-                        # Verifica expiração
-                        if campanha.expiration_at and datetime.utcnow() > campanha.expiration_at:
-                            bot_temp.answer_callback_query(call.id, "🚫 Esta oferta expirou!")
-                            bot_temp.send_message(cid, "🚫 **OFERTA ENCERRADA!**\n\nO tempo limite desta promoção acabou.", parse_mode="Markdown")
-                            return {"status": "expired"}
-
                         plano = db.query(PlanoConfig).filter(PlanoConfig.id == campanha.plano_id).first()
                         if plano:
                             preco_final = campanha.promo_price if campanha.promo_price else plano.preco_atual
                             nome_plano_str = f"{plano.nome_exibicao} (OFERTA)"
                             plano_id = campanha.plano_id
-                    else:
-                        bot_temp.answer_callback_query(call.id, "Oferta não encontrada.")
-                        return {"status": "error"}
 
-                # C) Geração do Pagamento
                 if preco_final > 0:
-                    msg_aguarde = bot_temp.send_message(cid, f"⏳ Gerando PIX de R$ {preco_final:.2f}...")
+                    msg_aguarde = bot_temp.send_message(cid, "⏳ Gerando seu PIX, aguarde...")
                     temp_uuid = str(uuid.uuid4())
                     pix_data = gerar_pix_pushinpay(preco_final, temp_uuid)
                     
                     if pix_data:
                         qr_code_text = pix_data.get("qr_code_text") or pix_data.get("qr_code")
+                        # [CORREÇÃO FINAL: USA txid AO INVÉS DE transaction_id]
                         provider_id = pix_data.get("id") or temp_uuid
                         final_tx_id = str(provider_id).lower()
 
-                        # [CORREÇÃO CRÍTICA] Usamos 'txid' para alinhar com o database V2
                         novo_pedido = Pedido(
                             bot_id=bot_db.id,
-                            txid=final_tx_id, # <-- Aqui estava o erro 'transaction_id invalid'
+                            txid=final_tx_id, # <--- AQUI ESTAVA O PROBLEMA DO WEBHOOK (CORRIGIDO)
                             telegram_id=str(cid),
                             first_name=call.from_user.first_name,
                             username=call.from_user.username,
@@ -1019,75 +918,6 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                         bot_temp.send_message(cid, "❌ Erro ao gerar PIX. Tente novamente.")
                 
                 bot_temp.answer_callback_query(call.id)
-            return {"status": "processed"}
-
-        # ==================================================================
-        # 🛒 CHECKOUT PADRÃO (SEM VALIDADE / PREÇO CHEIO)
-        # ==================================================================
-        elif update.callback_query and update.callback_query.data.startswith("checkout_"):
-            chat_id = update.callback_query.message.chat.id
-            plano_id = update.callback_query.data.split("_")[1]
-            
-            plano = db.query(PlanoConfig).filter(PlanoConfig.id == plano_id).first()
-            if not plano:
-                bot_temp.send_message(chat_id, "Plano não encontrado.")
-                return {"status": "error"}
-
-            msg_aguarde = bot_temp.send_message(chat_id, "⏳ Gerando seu PIX, aguarde...")
-            
-            temp_uuid = str(uuid.uuid4())
-            pix_data = gerar_pix_pushinpay(plano.preco_atual, temp_uuid)
-            
-            if pix_data:
-                qr_code_text = pix_data.get("qr_code_text") or pix_data.get("qr_code")
-                provider_id = pix_data.get("id") or temp_uuid
-                final_tx_id = str(provider_id).lower()
-
-                novo_pedido = Pedido(
-                    bot_id=bot_db.id,
-                    transaction_id=final_tx_id, 
-                    telegram_id=str(chat_id),
-                    first_name=update.callback_query.from_user.first_name,
-                    username=update.callback_query.from_user.username,
-                    plano_nome=plano.nome_exibicao,
-                    valor=plano.preco_atual,
-                    status="pending",
-                    qr_code=qr_code_text
-                )
-                db.add(novo_pedido)
-                db.commit()
-
-                # --- AQUI VOCÊ PODE NOTIFICAR NOVO LEAD (OPCIONAL) ⬇️ ---
-                try:
-                    # Correção: Usamos plano.preco_atual aqui, pois 'preco_final' não existe neste bloco
-                    msg_lead = f"🆕 *Novo Lead (PIX Gerado)*\n👤 {update.callback_query.from_user.first_name}\n💰 R$ {plano.preco_atual:.2f}"
-                    notificar_admin_principal(bot_db, msg_lead)
-                except Exception as e:
-                    # Loga o erro mas não trava o bot se a notificação falhar
-                    logger.error(f"Erro ao notificar lead: {e}")
-                # --------------------------------------------------------
-
-                try: bot_temp.delete_message(chat_id, msg_aguarde.message_id)
-                except: pass
-
-
-                legenda_pix = f"""🌟 Seu pagamento foi gerado com sucesso:
-🎁 Plano: {plano.nome_exibicao}
-💰 Valor: R$ {plano.preco_atual:.2f}
-🔐 Pague via Pix Copia e Cola:
-
-```
-{qr_code_text}
-```
-
-👆 Toque na chave PIX acima para copiá-la
-‼️ Após o pagamento, o acesso será liberado automaticamente!"""
-
-                bot_temp.send_message(chat_id, legenda_pix, parse_mode="Markdown")
-            else:
-                bot_temp.send_message(chat_id, "❌ Erro ao gerar PIX. Tente novamente ou contate o suporte.")
-
-            bot_temp.answer_callback_query(update.callback_query.id)
 
         return {"status": "processed"}
         
@@ -1096,7 +926,7 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
         return {"status": "error"}
 
 # =========================================================
-# 👥 ROTAS DE CRM (BASE DE CONTATOS CORRIGIDA + FILTROS INTELIGENTES)
+# 👥 ROTAS DE CRM (BASE DE CONTATOS CORRIGIDA)
 # =========================================================
 @app.get("/api/admin/contacts")
 def listar_contatos(bot_id: Optional[int] = None, status: str = "todos", db: Session = Depends(get_db)):
@@ -1111,409 +941,37 @@ def listar_contatos(bot_id: Optional[int] = None, status: str = "todos", db: Ses
 class IndividualRemarketingRequest(BaseModel):
     bot_id: int
     user_telegram_id: str
-    campaign_history_id: int # ID do histórico para copiar a msg
+    campaign_history_id: int
 
 @app.post("/api/admin/remarketing/send-individual")
 def enviar_remarketing_individual(payload: IndividualRemarketingRequest, db: Session = Depends(get_db)):
-    # 1. Busca os dados da campanha antiga
     campanha = db.query(RemarketingCampaign).filter(RemarketingCampaign.id == payload.campaign_history_id).first()
-    if not campanha:
-        raise HTTPException(404, "Campanha original não encontrada")
+    if not campanha: raise HTTPException(404, "Campanha não encontrada")
     
-    # 2. Decodifica a configuração
-    try:
-        config = json.loads(campanha.config) if isinstance(campanha.config, str) else campanha.config
-        # Se config for string dentro de um json (caso antigo), tenta parsear de novo
-        if isinstance(config, str): config = json.loads(config)
-    except:
-        config = {}
-
-    # 3. Reconstrói o Payload
-    msg = config.get("msg", "")
-    media = config.get("media", "")
+    try: config = json.loads(campanha.config)
+    except: config = {}
     
-    # [CORREÇÃO CRÍTICA] Não buscamos mais 'offer' do config JSON, pois ele pode não ter sido salvo lá.
-    # A verificação será feita direto pelo ID do plano na tabela.
-
-    # 4. Prepara envio
     bot_db = db.query(Bot).filter(Bot.id == payload.bot_id).first()
-    if not bot_db: raise HTTPException(404, "Bot não encontrado")
-    
     sender = telebot.TeleBot(bot_db.token)
     
-    # 5. Monta Botão (CORRIGIDO: Se tiver plano_id no banco, TEM oferta)
     markup = None
     if campanha.plano_id:
-        # Recupera plano
         plano = db.query(PlanoConfig).filter(PlanoConfig.id == campanha.plano_id).first()
         if plano:
             markup = types.InlineKeyboardMarkup()
-            # Usa o preço promocional salvo na campanha ou o atual
             preco = campanha.promo_price or plano.preco_atual
-            btn_text = f"🔥 {plano.nome_exibicao} - R$ {preco:.2f}"
-            
-            # OBS: Usamos um checkout direto aqui para garantir que funcione, 
-            # já que links de promoções antigas poderiam estar expirados.
-            # Se quiser forçar a mesma campanha, use f"promo_{campanha.campaign_id}"
-            # Mas checkout direto é mais seguro para disparo individual manual.
-            markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"checkout_{plano.id}"))
+            markup.add(types.InlineKeyboardButton(f"🔥 {plano.nome_exibicao} - R$ {preco:.2f}", callback_data=f"checkout_{plano.id}"))
 
-    # 6. Envia
     try:
-        if media:
-            try:
-                # Tenta enviar como vídeo ou foto
-                if media.lower().endswith(('.mp4', '.mov', '.avi')):
-                    sender.send_video(payload.user_telegram_id, media, caption=msg, reply_markup=markup)
-                else:
-                    sender.send_photo(payload.user_telegram_id, media, caption=msg, reply_markup=markup)
-            except Exception as e_media:
-                # Se falhar a mídia (link quebrado), envia só texto com o botão
-                logger.warning(f"Falha ao enviar mídia: {e_media}. Tentando texto.")
-                sender.send_message(payload.user_telegram_id, msg, reply_markup=markup)
+        if config.get("media"):
+            try: sender.send_photo(payload.user_telegram_id, config["media"], caption=config["msg"], reply_markup=markup)
+            except: sender.send_message(payload.user_telegram_id, config["msg"], reply_markup=markup)
         else:
-            sender.send_message(payload.user_telegram_id, msg, reply_markup=markup)
-            
-        return {"status": "sent", "msg": "Mensagem enviada com sucesso!"}
+            sender.send_message(payload.user_telegram_id, config["msg"], reply_markup=markup)
+        return {"status": "sent"}
     except Exception as e:
-        logger.error(f"Erro envio individual: {e}")
-        # Retorna erro 500 para o frontend saber
-        raise HTTPException(status_code=500, detail=f"Falha ao enviar: {str(e)}")
-
-# =========================================================
-# 📢 ROTAS DE REMARKETING (DISPARADOR AVANÇADO)
-# =========================================================
-
-# Variável Global para monitorar o envio em tempo real
-CAMPAIGN_STATUS = {
-    "running": False,
-    "sent": 0,
-    "total": 0,
-    "blocked": 0
-}
-
-# =========================================================
-# 📢 LÓGICA DE REMARKETING (OFERTA + VALIDADE + TESTE)
-# =========================================================
-# Variável Global para monitorar o envio em tempo real
-CAMPAIGN_STATUS = {
-    "running": False,
-    "sent": 0,
-    "total": 0,
-    "blocked": 0
-}
-
-def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Session):
-    global CAMPAIGN_STATUS
-    # Reinicia status
-    CAMPAIGN_STATUS = {"running": True, "sent": 0, "total": 0, "blocked": 0}
-    
-    bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
-    if not bot_db: 
-        CAMPAIGN_STATUS["running"] = False
-        return
-
-    # --- 1. CONFIGURAÇÃO DA OFERTA (PREÇO E DATA) ---
-    uuid_campanha = str(uuid.uuid4())
-    data_expiracao = None
-    preco_final = 0.0
-    plano_db = None
-
-    if payload.incluir_oferta and payload.plano_oferta_id:
-        # Busca plano (aceita ID numérico ou string chave)
-        plano_db = db.query(PlanoConfig).filter(
-            (PlanoConfig.key_id == str(payload.plano_oferta_id)) | 
-            (PlanoConfig.id == int(payload.plano_oferta_id) if str(payload.plano_oferta_id).isdigit() else False)
-        ).first()
-
-        if plano_db:
-            # Define Preço
-            if payload.price_mode == "custom" and payload.custom_price > 0:
-                preco_final = payload.custom_price
-            else:
-                preco_final = plano_db.preco_atual
-            
-            # Define Expiração
-            if payload.expiration_mode != "none" and payload.expiration_value > 0:
-                agora = datetime.utcnow()
-                val = payload.expiration_value
-                if payload.expiration_mode == "minutes":
-                    data_expiracao = agora + timedelta(minutes=val)
-                elif payload.expiration_mode == "hours":
-                    data_expiracao = agora + timedelta(hours=val)
-                elif payload.expiration_mode == "days":
-                    data_expiracao = agora + timedelta(days=val)
-
-    # --- 2. SALVAR A CAMPANHA NO BANCO (ANTES DE ENVIAR) ---
-    # Precisamos salvar antes para que o ID da campanha exista quando o usuário clicar
-    # Se for teste, NÃO salvamos no banco para não sujar o histórico, a menos que queira log
-    nova_campanha = None
-    if not payload.is_test:
-        nova_campanha = RemarketingCampaign(
-            bot_id=bot_id,
-            campaign_id=uuid_campanha,
-            type="massivo",
-            target=payload.target,
-            config=json.dumps({"msg": payload.mensagem, "media": payload.media_url}),
-            status="enviando",
-            
-            # Dados da Oferta
-            plano_id=plano_db.id if plano_db else None,
-            promo_price=preco_final if plano_db else None,
-            expiration_at=data_expiracao
-        )
-        db.add(nova_campanha)
-        db.commit()
-
-    # --- 3. DEFINIR PÚBLICO ALVO ---
-    bot_sender = telebot.TeleBot(bot_db.token)
-    usuarios_para_envio = []
-
-    if payload.is_test:
-        # Se for teste, manda só para o ID específico (Admin)
-        if payload.specific_user_id:
-            class MockUser:
-                def __init__(self, tid): self.telegram_id = tid
-            usuarios_para_envio = [MockUser(payload.specific_user_id)]
-    else:
-        # Lógica normal de busca no banco
-        query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
-        if payload.target == "pendentes": query = query.filter(Pedido.status == "pending")
-        elif payload.target == "pagantes": query = query.filter(Pedido.status == "paid")
-        elif payload.target == "expirados": query = query.filter(Pedido.status == "expired")
-        usuarios_para_envio = query.distinct(Pedido.telegram_id).all()
-
-    CAMPAIGN_STATUS["total"] = len(usuarios_para_envio)
-
-    # --- 4. PREPARAR BOTÃO (CALLBACK ESPECIAL) ---
-    markup = None
-    if plano_db:
-        markup = types.InlineKeyboardMarkup()
-        btn_text = f"🔥 {plano_db.nome_exibicao} - R$ {preco_final:.2f}"
-        
-        # Se for teste, usamos um callback fictício ou direto para checkout padrão (pois não tem campanha salva)
-        if payload.is_test:
-             # No teste, forçamos um checkout direto só pra ver o botão, mas sem validação de tempo do banco
-             markup.add(types.InlineKeyboardButton(f"[TESTE] {btn_text}", callback_data=f"checkout_{plano_db.id}"))
-        else:
-             # O callback 'promo_' leva o ID da campanha. O Webhook vai checar se expirou.
-             markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"promo_{uuid_campanha}"))
-
-    # --- 5. DISPARO ---
-    sent_count = 0
-    blocked_count = 0
-
-    for u in usuarios_para_envio:
-        try:
-            midia_ok = False
-            if payload.media_url and len(payload.media_url) > 5:
-                try:
-                    if payload.media_url.lower().endswith(('.mp4', '.mov', '.avi')):
-                        bot_sender.send_video(u.telegram_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
-                    else:
-                        bot_sender.send_photo(u.telegram_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
-                    midia_ok = True
-                except: pass
-            
-            if not midia_ok:
-                bot_sender.send_message(u.telegram_id, payload.mensagem, reply_markup=markup)
-            
-            sent_count += 1
-        except Exception as e:
-            if "blocked" in str(e).lower() or "kicked" in str(e).lower(): blocked_count += 1
-        
-        time.sleep(0.05) # Evita flood
-
-    CAMPAIGN_STATUS["running"] = False
-    
-    # Atualiza status final no banco (Se não for teste)
-    if not payload.is_test and nova_campanha:
-        nova_campanha.status = "concluido"
-        nova_campanha.total_leads = len(usuarios_para_envio)
-        nova_campanha.sent_success = sent_count
-        nova_campanha.blocked_count = blocked_count
-        db.commit()
-
-# --- ROTAS DA API ---
-
-@app.post("/api/admin/remarketing/send")
-def enviar_remarketing(payload: RemarketingRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    # Lógica para Teste: Se for teste e não tiver ID, pega o último do banco
-    if payload.is_test and not payload.specific_user_id:
-        ultimo = db.query(Pedido).filter(Pedido.bot_id == payload.bot_id).order_by(Pedido.id.desc()).first()
-        if ultimo:
-            payload.specific_user_id = ultimo.telegram_id
-        else:
-            # Tenta pegar um admin se não tiver clientes
-            admin = db.query(BotAdmin).filter(BotAdmin.bot_id == payload.bot_id).first()
-            if admin: payload.specific_user_id = admin.telegram_id
-            else: raise HTTPException(400, "Nenhum usuário encontrado para teste. Interaja com o bot primeiro (/start).")
-
-    background_tasks.add_task(processar_envio_remarketing, payload.bot_id, payload, db)
-    return {"status": "enviando", "msg": "Campanha iniciada!"}
-
-@app.get("/api/admin/remarketing/status")
-def status_remarketing():
-    return CAMPAIGN_STATUS
-
-@app.get("/api/admin/remarketing/history/{bot_id}")
-def historico_remarketing(bot_id: int, db: Session = Depends(get_db)):
-    history = db.query(RemarketingCampaign).filter(RemarketingCampaign.bot_id == bot_id).order_by(RemarketingCampaign.data_envio.desc()).all()
-    return [{
-        "id": h.id, 
-        "data": h.data_envio.strftime("%d/%m/%Y %H:%M"), 
-        "total": h.total_leads, 
-        "sent": h.sent_success, 
-        "blocked": h.blocked_count, 
-        "config": {"content_data": h.config}
-    } for h in history]
-
-# =========================================================
-# 📊 ROTA DE DASHBOARD (KPIs REAIS E CUMULATIVOS)
-# =========================================================
-@app.get("/api/admin/dashboard/stats")
-def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db)): 
-    """Calcula métricas. Se bot_id for passado, filtra por ele."""
-    
-    # [CORREÇÃO FINANCEIRA] - Faturamento Total
-    # Soma vendas ativas E expiradas. O dinheiro entrou, conta como receita.
-    q_revenue = db.query(func.sum(Pedido.valor)).filter(
-        Pedido.status.in_(['paid', 'active', 'approved', 'expired', 'completed', 'succeeded'])
-    )
-    
-    # Usuários Ativos (Aqui SIM ignoramos os expirados, pois queremos saber quem está no canal agora)
-    q_users = db.query(Pedido.telegram_id).filter(
-        Pedido.status.in_(['paid', 'active', 'approved', 'completed', 'succeeded'])
-    )
-    
-    # Vendas Hoje (Considera qualquer venda feita hoje, mesmo que tenha sido teste curto e expirou)
-    today = datetime.utcnow().date()
-    start_of_day = datetime.combine(today, datetime.min.time())
-    q_sales_today = db.query(func.sum(Pedido.valor)).filter(
-        Pedido.status.in_(['paid', 'active', 'approved', 'expired', 'completed', 'succeeded']),
-        Pedido.created_at >= start_of_day
-    )
-
-    # APLICA FILTRO DE BOT (SE SELECIONADO)
-    if bot_id:
-        q_revenue = q_revenue.filter(Pedido.bot_id == bot_id)
-        q_users = q_users.filter(Pedido.bot_id == bot_id)
-        q_sales_today = q_sales_today.filter(Pedido.bot_id == bot_id)
-
-    total_revenue = q_revenue.scalar() or 0.0
-    active_users = q_users.distinct().count()
-    sales_today = q_sales_today.scalar() or 0.0
-
-    return {
-        "total_revenue": total_revenue,
-        "active_users": active_users,
-        "sales_today": sales_today
-    }
-# =========================================================
-# 💸 WEBHOOK DE PAGAMENTO (BLINDADO E TAGARELA)
-# =========================================================
-@app.post("/api/webhook")
-async def webhook(req: Request, bg_tasks: BackgroundTasks):
-    try:
-        raw = await req.body()
-        try: 
-            payload = json.loads(raw)
-        except: 
-            # Fallback para formato x-www-form-urlencoded
-            payload = {k: v[0] for k,v in parse_qs(raw.decode()).items()}
-        
-        # Log para debug (opcional, pode remover em produção)
-        # logger.info(f"Webhook recebido: {payload}")
-
-        # Se for pagamento APROVADO (Vários status possíveis de gateways)
-        if str(payload.get('status')).upper() in ['PAID', 'APPROVED', 'COMPLETED', 'SUCCEEDED']:
-            db = SessionLocal()
-            tx = str(payload.get('id')).lower() # ID da transação
-            
-            # Busca o pedido pelo ID da transação
-            p = db.query(Pedido).filter(Pedido.transaction_id == tx).first()
-            
-            # Se achou o pedido e ele ainda não estava pago
-            if p and p.status != 'paid':
-                p.status = 'paid'
-                db.commit() # Salva o status pago
-                
-                # --- 🔔 NOTIFICAÇÃO AO ADMIN (NOVO) ---
-                try:
-                    bot_db = db.query(Bot).filter(Bot.id == p.bot_id).first()
-                    
-                    # Verifica se o bot tem um Admin configurado para receber o aviso
-                    if bot_db and bot_db.admin_principal_id:
-                        msg_venda = (
-                            f"💰 *VENDA APROVADA!*\n\n"
-                            f"👤 Cliente: {p.first_name}\n"
-                            f"💎 Plano: {p.plano_nome}\n"
-                            f"💵 Valor: R$ {p.valor:.2f}\n"
-                            f"📅 Data: {datetime.now().strftime('%d/%m %H:%M')}"
-                        )
-                        # Chama a função auxiliar de notificação
-                        notificar_admin_principal(bot_db, msg_venda) 
-                except Exception as e_notify:
-                    logger.error(f"Erro ao notificar admin: {e_notify}")
-                # --------------------------------------
-
-                # --- ENVIO DO LINK DE ACESSO AO CLIENTE ---
-                if not p.mensagem_enviada:
-                    try:
-                        bot_data = db.query(Bot).filter(Bot.id == p.bot_id).first()
-                        tb = telebot.TeleBot(bot_data.token)
-                        
-                        # Tenta converter o ID do canal VIP com segurança
-                        try: canal_vip_id = int(str(bot_data.id_canal_vip).strip())
-                        except: canal_vip_id = bot_data.id_canal_vip
-
-                        # Tenta desbanir o usuário antes (garantia caso ele tenha sido expulso antes)
-                        try: tb.unban_chat_member(canal_vip_id, int(p.telegram_id))
-                        except: pass
-
-                        # Gera Link Único (Válido para 1 pessoa)
-                        convite = tb.create_chat_invite_link(
-                            chat_id=canal_vip_id, 
-                            member_limit=1, 
-                            name=f"Venda {p.first_name}"
-                        )
-                        link_acesso = convite.invite_link
-
-                        msg_sucesso = f"""
-✅ <b>Pagamento Confirmado!</b>
-
-Seu acesso ao <b>{bot_data.nome}</b> foi liberado.
-Toque no link abaixo para entrar no Canal VIP:
-
-👉 {link_acesso}
-
-⚠️ <i>Este link é único e válido apenas para você.</i>
-"""
-                        # Envia a mensagem com o link para o usuário
-                        tb.send_message(int(p.telegram_id), msg_sucesso, parse_mode="HTML")
-                        
-                        # Marca que a mensagem foi enviada para não enviar duplicado
-                        p.mensagem_enviada = True
-                        db.commit()
-                        logger.info(f"🏆 Link enviado para {p.first_name}")
-
-                    except Exception as e_telegram:
-                        logger.error(f"❌ ERRO TELEGRAM: {e_telegram}")
-                        # Fallback: Avisa o cliente que deu erro no envio do link, mas confirma o pagamento
-                        try:
-                            tb.send_message(int(p.telegram_id), "✅ Pagamento recebido! \n\n⚠️ Houve um erro ao gerar seu link automático. Um administrador entrará em contato em breve.")
-                        except: pass
-
-            db.close()
-        
-        # Retorna 200 OK para o Gateway de Pagamento parar de mandar o Webhook
-        return {"status": "received"}
-
-    except Exception as e:
-        logger.error(f"❌ ERRO CRÍTICO NO WEBHOOK: {e}")
-        # Mesmo com erro, retornamos 200 ou estrutura json para não travar o gateway (opcional, depende da estratégia)
-        return {"status": "error"}
+        raise HTTPException(500, str(e))
 
 @app.get("/")
 def home():
-    return {"status": "Zenyx SaaS Online - Banco Atualizado"}
+    return {"status": "Zenyx V2.0 Online (Fixed)"}
