@@ -46,19 +46,15 @@ class Bot(Base):
     id = Column(Integer, primary_key=True, index=True)
     nome = Column(String)
     token = Column(String, unique=True, index=True)
-    username = Column(String, nullable=True) # @username do bot
+    username = Column(String, nullable=True)
     id_canal_vip = Column(String)
     admin_principal_id = Column(String, nullable=True)
-    status = Column(String, default="ativo") # ativo, pausado
+    status = Column(String, default="ativo")
     created_at = Column(DateTime, default=datetime.utcnow)
     
-    # Relacionamentos
     planos = relationship("PlanoConfig", back_populates="bot", cascade="all, delete-orphan")
     fluxo = relationship("BotFlow", back_populates="bot", uselist=False, cascade="all, delete-orphan")
-    
-    # [NOVO] Relacionamento com os passos dinâmicos do Flow V2
     steps = relationship("BotFlowStep", back_populates="bot", cascade="all, delete-orphan")
-    
     admins = relationship("BotAdmin", back_populates="bot", cascade="all, delete-orphan")
 
 # =========================================================
@@ -71,7 +67,6 @@ class BotAdmin(Base):
     telegram_id = Column(String)
     nome = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-    
     bot = relationship("Bot", back_populates="admins")
 
 # =========================================================
@@ -81,12 +76,12 @@ class PlanoConfig(Base):
     __tablename__ = "planos_config"
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, ForeignKey("bots.id"))
-    key_id = Column(String, nullable=True) # Identificador único textual (opcional)
-    
-    nome_exibicao = Column(String)  # Ex: "Plano Mensal"
-    preco_atual = Column(Float)     # Ex: 29.90
-    dias_duracao = Column(Integer)  # Ex: 30
-    
+    key_id = Column(String, nullable=True)
+    nome_exibicao = Column(String)
+    descricao = Column(String, nullable=True)
+    preco_cheio = Column(Float, nullable=True)
+    preco_atual = Column(Float)
+    dias_duracao = Column(Integer)
     bot = relationship("Bot", back_populates="planos")
 
 # =========================================================
@@ -96,32 +91,27 @@ class RemarketingCampaign(Base):
     __tablename__ = "remarketing_campaigns"
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, ForeignKey("bots.id"))
-    campaign_id = Column(String, unique=True) # UUID único para tracking
+    campaign_id = Column(String, unique=True)
+    target = Column(String, default="todos")
+    type = Column(String, default="massivo")
+    config = Column(String)
+    status = Column(String, default="agendado")
     
-    # Configuração
-    target = Column(String, default="todos") # todos, pendentes, pagantes, expirados
-    type = Column(String, default="massivo") # massivo, individual
-    config = Column(String) # JSON com msg, media, etc
-    status = Column(String, default="agendado") # agendado, enviando, concluido, erro
-    
-    # Controle de execução (Recorrência)
     dia_atual = Column(Integer, default=0)
     data_inicio = Column(DateTime, default=datetime.utcnow)
     proxima_execucao = Column(DateTime, nullable=True)
     
-    # Oferta e Expiração
-    plano_id = Column(Integer, nullable=True)       # Qual plano é a base
-    promo_price = Column(Float, nullable=True)      # Valor com desconto
-    expiration_at = Column(DateTime, nullable=True) # Data exata que expira
+    plano_id = Column(Integer, nullable=True)
+    promo_price = Column(Float, nullable=True)
+    expiration_at = Column(DateTime, nullable=True)
     
-    # Métricas
     total_leads = Column(Integer, default=0)
     sent_success = Column(Integer, default=0)
     blocked_count = Column(Integer, default=0)
     data_envio = Column(DateTime, default=datetime.utcnow)
 
 # =========================================================
-# 💬 TABELA DE FLUXO DE CHAT (MENSAGENS FIXAS)
+# 💬 TABELA DE FLUXO DE CHAT (FIXO)
 # =========================================================
 class BotFlow(Base):
     __tablename__ = "bot_flows"
@@ -129,61 +119,53 @@ class BotFlow(Base):
     bot_id = Column(Integer, ForeignKey("bots.id"), unique=True)
     bot = relationship("Bot", back_populates="fluxo")
     
-    # Passo 1 (Fixo): Boas Vindas
     msg_boas_vindas = Column(Text, default="Olá! Bem-vindo.")
     media_url = Column(String, nullable=True)
     btn_text_1 = Column(String, default="🔓 DESBLOQUEAR")
     autodestruir_1 = Column(Boolean, default=False)
     
-    # Passo Final (Fixo): Oferta/Checkout
     msg_2_texto = Column(Text, nullable=True)
     msg_2_media = Column(String, nullable=True)
     mostrar_planos_2 = Column(Boolean, default=True)
 
 # =========================================================
-# 🧩 [NOVO] TABELA DE PASSOS DO FLUXO (DINÂMICO V2)
+# 🧩 TABELA DE PASSOS DO FLUXO (DINÂMICO V2)
 # =========================================================
 class BotFlowStep(Base):
     __tablename__ = "bot_flow_steps"
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, ForeignKey("bots.id"))
-    
-    # Ordem de exibição (1, 2, 3...)
-    # Nota: A mensagem de boas vindas é o "0" e a oferta é o "999" (último)
     step_order = Column(Integer, default=1)
-    
-    # Conteúdo
     msg_texto = Column(Text, nullable=True)
-    msg_media = Column(String, nullable=True) # Foto ou Vídeo
-    
-    # Botão para ir ao próximo passo
+    msg_media = Column(String, nullable=True)
     btn_texto = Column(String, default="Próximo ▶️")
-    
     created_at = Column(DateTime, default=datetime.utcnow)
-    
-    # Relacionamento
     bot = relationship("Bot", back_populates="steps")
 
 # =========================================================
-# 🛒 TABELA DE PEDIDOS / TRANSAÇÕES
+# 🛒 TABELA DE PEDIDOS (CORRIGIDA)
 # =========================================================
 class Pedido(Base):
     __tablename__ = "pedidos"
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, ForeignKey("bots.id"))
     
-    # Dados do Cliente
+    # Cliente
     telegram_id = Column(String)
     first_name = Column(String, nullable=True)
     username = Column(String, nullable=True)
     
-    # Dados da Compra
-    plano_id = Column(Integer, ForeignKey("planos_config.id"))
+    # Compra
+    plano_nome = Column(String, nullable=True)
+    plano_id = Column(Integer, nullable=True) # [CRÍTICO] Coluna que faltava
     valor = Column(Float)
-    status = Column(String, default="pending") 
-    txid = Column(String, unique=True, index=True) 
+    status = Column(String, default="pending")
     
-    # Controle de Acesso
+    # [CRÍTICO] Mantendo 'txid' para compatibilidade com V1
+    txid = Column(String, unique=True, index=True) 
+    qr_code = Column(Text, nullable=True)
+    
+    # Acesso
     data_aprovacao = Column(DateTime, nullable=True)
     data_expiracao = Column(DateTime, nullable=True)
     link_acesso = Column(String, nullable=True)
