@@ -36,6 +36,17 @@ app.add_middleware(
 )
 
 # =========================================================
+# 1. FUNÇÃO DE CONEXÃO COM BANCO (TEM QUE SER A PRIMEIRA)
+# =========================================================
+def get_db():
+    """Gera conexão com o banco de dados"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# =========================================================
 # 2. AUTO-REPARO DO BANCO DE DADOS (LISTA MESTRA DE CORREÇÃO)
 # =========================================================
 @app.on_event("startup")
