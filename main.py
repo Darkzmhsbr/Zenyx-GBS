@@ -48,23 +48,39 @@ def on_startup():
             logger.info("🔧 Verificando integridade do banco de dados...")
             
             comandos_sql = [
+                # --- CORREÇÃO CRÍTICA (ADICIONA A COLUNA QUE FALTAVA) ---
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
+
                 # --- Campos antigos (para garantir) ---
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;",
                 
-                # --- NOVOS CAMPOS DO REMARKETING (CRÍTICO) ---
+                # --- NOVOS CAMPOS DO REMARKETING ---
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS target VARCHAR DEFAULT 'todos';",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS type VARCHAR DEFAULT 'massivo';",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS promo_price FLOAT;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS expiration_at TIMESTAMP WITHOUT TIME ZONE;",
                 
-                # --- Campos de Recorrência (Se faltar) ---
+                # --- Campos de Recorrência ---
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS dia_atual INTEGER DEFAULT 0;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS data_inicio TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
-                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS proxima_execucao TIMESTAMP WITHOUT TIME ZONE;"
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS proxima_execucao TIMESTAMP WITHOUT TIME ZONE;",
+
+                # --- TABELA DE FLUXO DINÂMICO (V2) ---
+                """
+                CREATE TABLE IF NOT EXISTS bot_flow_steps (
+                    id SERIAL PRIMARY KEY,
+                    bot_id INTEGER REFERENCES bots(id),
+                    step_order INTEGER DEFAULT 1,
+                    msg_texto TEXT,
+                    msg_media VARCHAR,
+                    btn_texto VARCHAR DEFAULT 'Próximo ▶️',
+                    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now()
+                );
+                """
             ]
             
             for cmd in comandos_sql:
@@ -718,8 +734,8 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         if status_pix not in ["paid", "approved", "completed", "succeeded"]:
             return {"status": "ignored"}
 
-        # 4. BUSCA O PEDIDO
-        pedido = db.query(Pedido).filter(Pedido.transaction_id == tx_id).first()
+        # 4. BUSCA O PEDIDO (USANDO txid CORRETO)
+        pedido = db.query(Pedido).filter(Pedido.txid == tx_id).first()
 
         if not pedido:
             print(f"❌ Pedido {tx_id} não encontrado no banco.")
@@ -1056,7 +1072,7 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                 # Cria o pedido como "Pendente"
                 novo_pedido = Pedido(
                     bot_id=bot_db.id,
-                    transaction_id=final_tx_id,
+                    txid=final_tx_id,
                     telegram_id=str(chat_id),
                     first_name=update.callback_query.from_user.first_name,
                     username=update.callback_query.from_user.username,
