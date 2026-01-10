@@ -6,3 +6,5 @@ requests
 pydantic
 pytelegrambotapi
 python-multipart
+apscheduler
+pytz
