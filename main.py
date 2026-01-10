@@ -656,6 +656,39 @@ def criar_plano(plano: PlanoCreate, db: Session = Depends(get_db)):
 def listar_planos(bot_id: int, db: Session = Depends(get_db)):
     return db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
 
+# =========================================================
+# 🗑️ ROTA DELETAR PLANO (COM DESVINCULAÇÃO SEGURA)
+# =========================================================
+@app.delete("/api/admin/plans/{pid}")
+def del_plano(pid: int, db: Session = Depends(get_db)):
+    try:
+        # 1. Busca o plano
+        p = db.query(PlanoConfig).filter(PlanoConfig.id == pid).first()
+        if not p:
+            return {"status": "deleted", "msg": "Plano não existia"}
+
+        # 2. Desvincula de Campanhas de Remarketing (Para não travar)
+        db.query(RemarketingCampaign).filter(RemarketingCampaign.plano_id == pid).update(
+            {RemarketingCampaign.plano_id: None}, 
+            synchronize_session=False
+        )
+
+        # 3. Desvincula de Pedidos/Vendas (Para manter o histórico mas permitir deletar)
+        db.query(Pedido).filter(Pedido.plano_id == pid).update(
+            {Pedido.plano_id: None}, 
+            synchronize_session=False
+        )
+
+        # 4. Deleta o plano
+        db.delete(p)
+        db.commit()
+        
+        return {"status": "deleted"}
+        
+    except Exception as e:
+        logger.error(f"Erro ao deletar plano {pid}: {e}")
+        raise HTTPException(status_code=400, detail=f"Erro ao deletar: {str(e)}")
+
 @app.get("/api/admin/bots/{bot_id}/flow")
 def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
     fluxo = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
