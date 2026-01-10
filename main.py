@@ -1067,17 +1067,19 @@ def enviar_remarketing_individual(payload: IndividualRemarketingRequest, db: Ses
     # 3. Reconstrói o Payload
     msg = config.get("msg", "")
     media = config.get("media", "")
-    offer = config.get("offer", False) or config.get("incluir_oferta", False)
     
+    # [CORREÇÃO CRÍTICA] Não buscamos mais 'offer' do config JSON, pois ele pode não ter sido salvo lá.
+    # A verificação será feita direto pelo ID do plano na tabela.
+
     # 4. Prepara envio
     bot_db = db.query(Bot).filter(Bot.id == payload.bot_id).first()
     if not bot_db: raise HTTPException(404, "Bot não encontrado")
     
     sender = telebot.TeleBot(bot_db.token)
     
-    # 5. Monta Botão (Se tiver oferta)
+    # 5. Monta Botão (CORRIGIDO: Se tiver plano_id no banco, TEM oferta)
     markup = None
-    if offer and campanha.plano_id:
+    if campanha.plano_id:
         # Recupera plano
         plano = db.query(PlanoConfig).filter(PlanoConfig.id == campanha.plano_id).first()
         if plano:
@@ -1085,19 +1087,25 @@ def enviar_remarketing_individual(payload: IndividualRemarketingRequest, db: Ses
             # Usa o preço promocional salvo na campanha ou o atual
             preco = campanha.promo_price or plano.preco_atual
             btn_text = f"🔥 {plano.nome_exibicao} - R$ {preco:.2f}"
-            # Usa o ID da campanha antiga para manter a referência de expiração se ainda for válida
-            # OU cria um checkout direto se a campanha já expirou. Vamos usar checkout direto para garantir.
+            
+            # OBS: Usamos um checkout direto aqui para garantir que funcione, 
+            # já que links de promoções antigas poderiam estar expirados.
+            # Se quiser forçar a mesma campanha, use f"promo_{campanha.campaign_id}"
+            # Mas checkout direto é mais seguro para disparo individual manual.
             markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"checkout_{plano.id}"))
 
     # 6. Envia
     try:
         if media:
             try:
+                # Tenta enviar como vídeo ou foto
                 if media.lower().endswith(('.mp4', '.mov', '.avi')):
                     sender.send_video(payload.user_telegram_id, media, caption=msg, reply_markup=markup)
                 else:
                     sender.send_photo(payload.user_telegram_id, media, caption=msg, reply_markup=markup)
-            except:
+            except Exception as e_media:
+                # Se falhar a mídia (link quebrado), envia só texto com o botão
+                logger.warning(f"Falha ao enviar mídia: {e_media}. Tentando texto.")
                 sender.send_message(payload.user_telegram_id, msg, reply_markup=markup)
         else:
             sender.send_message(payload.user_telegram_id, msg, reply_markup=markup)
@@ -1105,7 +1113,8 @@ def enviar_remarketing_individual(payload: IndividualRemarketingRequest, db: Ses
         return {"status": "sent", "msg": "Mensagem enviada com sucesso!"}
     except Exception as e:
         logger.error(f"Erro envio individual: {e}")
-        raise HTTPException(500, f"Falha ao enviar: {str(e)}")
+        # Retorna erro 500 para o frontend saber
+        raise HTTPException(status_code=500, detail=f"Falha ao enviar: {str(e)}")
 
 # =========================================================
 # 📢 ROTAS DE REMARKETING (DISPARADOR AVANÇADO)
