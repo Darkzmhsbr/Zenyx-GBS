@@ -368,13 +368,6 @@ class RemarketingRequest(BaseModel):
     is_test: bool = False
     specific_user_id: Optional[str] = None # Telegram ID para teste
 
-    # ---   
-# Modelo para Atualização de Usuário (CRM)
-class UserUpdate(BaseModel):
-    role: Optional[str] = None
-    status: Optional[str] = None
-    custom_expiration: Optional[str] = None # 'vitalicio', 'remover' ou data YYYY-MM-DD
-
 # ===========================
 # ⚙️ GESTÃO DE BOTS
 # ===========================
