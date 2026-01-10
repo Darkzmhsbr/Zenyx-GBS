@@ -281,6 +281,7 @@ def save_pushin_token(data: IntegrationUpdate, db: Session = Depends(get_db)):
         return {"status": "erro", "msg": "Token parece inválido."}
 
 # --- MODELOS ---
+# --- MODELOS ---
 class BotCreate(BaseModel):
     nome: str
     token: str
@@ -298,13 +299,6 @@ class BotUpdate(BaseModel):
 class BotAdminCreate(BaseModel):
     telegram_id: str
     nome: Optional[str] = "Admin"
-
-# Modelo para Criar/Atualizar Bot (Com suporte ao Admin ID)
-class BotCreate(BaseModel):
-    nome: str
-    token: str
-    id_canal_vip: str
-    admin_principal_id: Optional[str] = None
 
 class BotResponse(BotCreate):
     id: int
@@ -441,25 +435,20 @@ def toggle_bot(bot_id: int, db: Session = Depends(get_db)):
     bot = db.query(Bot).filter(Bot.id == bot_id).first()
     if not bot: raise HTTPException(404, "Bot não encontrado")
     
+    # Inverte o status
     novo_status = "ativo" if bot.status != "ativo" else "pausado"
     bot.status = novo_status
     db.commit()
     
     # 🔔 Notifica Admin
-    emoji = "🟢" if novo_status == "ativo" else "🔴"
-    msg = f"{emoji} *STATUS DO BOT ALTERADO*\n\nO bot *{bot.nome}* agora está: *{novo_status.upper()}*"
-    notificar_admin_principal(bot, msg)
+    try:
+        emoji = "🟢" if novo_status == "ativo" else "🔴"
+        msg = f"{emoji} *STATUS DO BOT ALTERADO*\n\nO bot *{bot.nome}* agora está: *{novo_status.upper()}*"
+        notificar_admin_principal(bot, msg)
+    except Exception as e:
+        logger.error(f"Erro ao notificar admin sobre toggle: {e}")
     
     return {"status": novo_status}
-    
-    # Inverte o status atual
-    if bot_db.status == "pausado":
-        bot_db.status = "conectado" # Liga
-    else:
-        bot_db.status = "pausado" # Desliga
-        
-    db.commit()
-    return {"id": bot_db.id, "status": bot_db.status}
 
 # --- NOVA ROTA: EXCLUIR BOT ---
 @app.delete("/api/admin/bots/{bot_id}")
@@ -1133,10 +1122,17 @@ CAMPAIGN_STATUS = {
 # =========================================================
 # 📢 LÓGICA DE REMARKETING (OFERTA + VALIDADE + TESTE)
 # =========================================================
-CAMPAIGN_STATUS = {"running": False, "sent": 0, "total": 0, "blocked": 0}
+# Variável Global para monitorar o envio em tempo real
+CAMPAIGN_STATUS = {
+    "running": False,
+    "sent": 0,
+    "total": 0,
+    "blocked": 0
+}
 
 def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Session):
     global CAMPAIGN_STATUS
+    # Reinicia status
     CAMPAIGN_STATUS = {"running": True, "sent": 0, "total": 0, "blocked": 0}
     
     bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
