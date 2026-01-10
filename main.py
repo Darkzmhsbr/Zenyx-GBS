@@ -1022,32 +1022,101 @@ Copie o código abaixo para garantir sua vaga:
         return {"status": "error"}
 
 # =========================================================
-# 👥 ROTAS DE CRM (BASE DE CONTATOS)
+# 👥 ROTAS DE CRM (BASE DE CONTATOS CORRIGIDA + FILTROS INTELIGENTES)
 # =========================================================
 @app.get("/api/admin/contacts")
 def listar_contatos(bot_id: Optional[int] = None, status: str = "todos", db: Session = Depends(get_db)):
-    """
-    Lista usuários. Se bot_id for passado, filtra apenas daquele bot.
-    """
     query = db.query(Pedido)
     
-    # 1. FILTRO DE BOT (Novo e Essencial)
+    # 1. Filtro de Bot
     if bot_id:
         query = query.filter(Pedido.bot_id == bot_id)
     
-    # 2. Filtros de Status
+    # 2. Filtros de Status (Lógica Reforçada)
     if status == "pagantes":
-        query = query.filter(Pedido.status == "paid")
+        # Pega quem pagou ou foi aprovado manualmente
+        query = query.filter(Pedido.status.in_(['paid', 'active', 'approved']))
+    
     elif status == "pendentes":
+        # Pega pendentes (e garante que não pega os expirados antigos)
         query = query.filter(Pedido.status == "pending")
+    
     elif status == "expirados":
+        # Pega quem está marcado como expired OU quem já venceu a data (mesmo que status seja paid)
+        # Nota: Para performance, focamos no status, mas podemos adicionar verificação de data se precisar
         query = query.filter(Pedido.status == "expired")
     
-    # Ordena pelos mais recentes
-    contatos = query.order_by(desc(Pedido.created_at)).all()
+    # Ordena: Pendentes primeiro (para cobrar), depois data
+    contatos = query.order_by(
+        desc(Pedido.status == 'pending'), 
+        desc(Pedido.created_at)
+    ).all()
     
-    # Retorna lista direta (Mantendo compatibilidade com seu front V1)
     return contatos
+
+# --- NOVA ROTA: DISPARO INDIVIDUAL (VIA HISTÓRICO) ---
+class IndividualRemarketingRequest(BaseModel):
+    bot_id: int
+    user_telegram_id: str
+    campaign_history_id: int # ID do histórico para copiar a msg
+
+@app.post("/api/admin/remarketing/send-individual")
+def enviar_remarketing_individual(payload: IndividualRemarketingRequest, db: Session = Depends(get_db)):
+    # 1. Busca os dados da campanha antiga
+    campanha = db.query(RemarketingCampaign).filter(RemarketingCampaign.id == payload.campaign_history_id).first()
+    if not campanha:
+        raise HTTPException(404, "Campanha original não encontrada")
+    
+    # 2. Decodifica a configuração
+    try:
+        config = json.loads(campanha.config) if isinstance(campanha.config, str) else campanha.config
+        # Se config for string dentro de um json (caso antigo), tenta parsear de novo
+        if isinstance(config, str): config = json.loads(config)
+    except:
+        config = {}
+
+    # 3. Reconstrói o Payload
+    msg = config.get("msg", "")
+    media = config.get("media", "")
+    offer = config.get("offer", False) or config.get("incluir_oferta", False)
+    
+    # 4. Prepara envio
+    bot_db = db.query(Bot).filter(Bot.id == payload.bot_id).first()
+    if not bot_db: raise HTTPException(404, "Bot não encontrado")
+    
+    sender = telebot.TeleBot(bot_db.token)
+    
+    # 5. Monta Botão (Se tiver oferta)
+    markup = None
+    if offer and campanha.plano_id:
+        # Recupera plano
+        plano = db.query(PlanoConfig).filter(PlanoConfig.id == campanha.plano_id).first()
+        if plano:
+            markup = types.InlineKeyboardMarkup()
+            # Usa o preço promocional salvo na campanha ou o atual
+            preco = campanha.promo_price or plano.preco_atual
+            btn_text = f"🔥 {plano.nome_exibicao} - R$ {preco:.2f}"
+            # Usa o ID da campanha antiga para manter a referência de expiração se ainda for válida
+            # OU cria um checkout direto se a campanha já expirou. Vamos usar checkout direto para garantir.
+            markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"checkout_{plano.id}"))
+
+    # 6. Envia
+    try:
+        if media:
+            try:
+                if media.lower().endswith(('.mp4', '.mov', '.avi')):
+                    sender.send_video(payload.user_telegram_id, media, caption=msg, reply_markup=markup)
+                else:
+                    sender.send_photo(payload.user_telegram_id, media, caption=msg, reply_markup=markup)
+            except:
+                sender.send_message(payload.user_telegram_id, msg, reply_markup=markup)
+        else:
+            sender.send_message(payload.user_telegram_id, msg, reply_markup=markup)
+            
+        return {"status": "sent", "msg": "Mensagem enviada com sucesso!"}
+    except Exception as e:
+        logger.error(f"Erro envio individual: {e}")
+        raise HTTPException(500, f"Falha ao enviar: {str(e)}")
 
 # =========================================================
 # 📢 ROTAS DE REMARKETING (DISPARADOR AVANÇADO)
