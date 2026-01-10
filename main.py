@@ -47,28 +47,76 @@ def get_db():
         db.close()
 
 # =========================================================
-# 2. AUTO-REPARO DO BANCO DE DADOS (CORREÇÃO DE COLUNAS)
+# 2. AUTO-REPARO DO BANCO DE DADOS (REPARO TOTAL)
 # =========================================================
 @app.on_event("startup")
 def on_startup():
     # 1. Cria tabelas que não existem
     init_db()
     
-    # 2. FORÇA A CRIAÇÃO DAS COLUNAS NOVAS (Correção Crítica)
+    # 2. FORÇA A CRIAÇÃO DE TODAS AS COLUNAS QUE PODEM FALTAR
     try:
-        # Importação local para garantir execução
-        import update_db 
-        update_db.adicionar_colunas()
-        logger.info("✅ BANCO DE DADOS VERIFICADO E ATUALIZADO!")
+        with engine.connect() as conn:
+            logger.info("🔧 [STARTUP] Forçando verificação COMPLETA do banco...")
             
-        # 3. INICIA O CEIFADOR
-        thread = threading.Thread(target=loop_verificar_vencimentos)
-        thread.daemon = True
-        thread.start()
-        logger.info("💀 O Ceifador (Auto-Kick) foi iniciado!")
+            comandos = [
+                # --- TABELA PEDIDOS (Onde está dando erro agora) ---
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_nome VARCHAR;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS txid VARCHAR;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS qr_code TEXT;",
+                # Adicionamos transaction_id para evitar erro de mapeamento antigo
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS transaction_id VARCHAR;", 
+                
+                # Colunas de data e acesso (Causa do erro atual)
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS data_aprovacao TIMESTAMP WITHOUT TIME ZONE;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS data_expiracao TIMESTAMP WITHOUT TIME ZONE;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS link_acesso VARCHAR;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS mensagem_enviada BOOLEAN DEFAULT FALSE;",
+
+                # --- OUTRAS TABELAS (Para garantir que nada mais quebre) ---
+                "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
+                "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
+                "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
+                "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;",
+                
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS target VARCHAR DEFAULT 'todos';",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS type VARCHAR DEFAULT 'massivo';",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS promo_price FLOAT;",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS expiration_at TIMESTAMP WITHOUT TIME ZONE;",
+                
+                # --- TABELA NOVA (V2) ---
+                """
+                CREATE TABLE IF NOT EXISTS bot_flow_steps (
+                    id SERIAL PRIMARY KEY,
+                    bot_id INTEGER REFERENCES bots(id),
+                    step_order INTEGER DEFAULT 1,
+                    msg_texto TEXT,
+                    msg_media VARCHAR,
+                    btn_texto VARCHAR DEFAULT 'Próximo ▶️',
+                    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now()
+                );
+                """
+            ]
+            
+            for cmd in comandos:
+                try:
+                    conn.execute(text(cmd))
+                    conn.commit()
+                except Exception as e_sql:
+                    logger.warning(f"SQL Warning: {e_sql}")
+            
+            logger.info("✅ [STARTUP] Banco de dados TOTALMENTE verificado!")
             
     except Exception as e:
-        logger.error(f"❌ Erro crítico na inicialização do banco: {e}")
+        logger.error(f"❌ Falha no reparo do banco: {e}")
+
+    # 3. Inicia o Ceifador
+    thread = threading.Thread(target=loop_verificar_vencimentos)
+    thread.daemon = True
+    thread.start()
+    logger.info("💀 O Ceifador (Auto-Kick) foi iniciado!")
 
 # =========================================================
 # 💀 O CEIFADOR: VERIFICA VENCIMENTOS E REMOVE (KICK SUAVE)
