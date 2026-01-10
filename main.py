@@ -250,37 +250,53 @@ def notificar_admin_principal(bot_db: Bot, mensagem: str):
         logger.error(f"Falha ao notificar admin principal {bot_db.admin_principal_id}: {e}")
 
 # --- ROTAS DE INTEGRAÇÃO (SALVAR TOKEN) ---
+# =========================================================
+# 🔌 ROTAS DE INTEGRAÇÃO (SALVAR TOKEN PUSHIN PAY)
+# =========================================================
+
+# Modelo para receber o JSON do frontend
 class IntegrationUpdate(BaseModel):
     token: str
 
 @app.get("/api/admin/integrations/pushinpay")
 def get_pushin_status(db: Session = Depends(get_db)):
+    # Busca token no banco
     config = db.query(SystemConfig).filter(SystemConfig.key == "pushin_pay_token").first()
+    
+    # Se não achar no banco, tenta variável de ambiente (backup)
     token = config.value if config else os.getenv("PUSHIN_PAY_TOKEN")
     
     if not token:
         return {"status": "desconectado", "token_mask": ""}
     
+    # Cria máscara para segurança (ex: "abc1...890")
     mask = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "****"
     return {"status": "conectado", "token_mask": mask}
 
 @app.post("/api/admin/integrations/pushinpay")
 def save_pushin_token(data: IntegrationUpdate, db: Session = Depends(get_db)):
+    # 1. Busca ou Cria a configuração
     config = db.query(SystemConfig).filter(SystemConfig.key == "pushin_pay_token").first()
     if not config:
         config = SystemConfig(key="pushin_pay_token")
         db.add(config)
     
-    config.value = data.token
+    # 2. Limpa espaços em branco acidentais
+    token_limpo = data.token.strip()
+    
+    # 3. Validação básica
+    if len(token_limpo) < 10:
+        return {"status": "erro", "msg": "Token muito curto ou inválido."}
+
+    # 4. Salva
+    config.value = token_limpo
     config.updated_at = datetime.utcnow()
     db.commit()
     
-    if len(data.token) > 10:
-        return {"status": "conectado", "msg": "Token salvo com sucesso!"}
-    else:
-        return {"status": "erro", "msg": "Token parece inválido."}
+    logger.info(f"🔑 Token PushinPay atualizado: {token_limpo[:5]}...")
+    
+    return {"status": "conectado", "msg": "Integração salva com sucesso!"}
 
-# --- MODELOS ---
 # --- MODELOS ---
 class BotCreate(BaseModel):
     nome: str
