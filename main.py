@@ -47,7 +47,7 @@ def get_db():
         db.close()
 
 # =========================================================
-# 2. AUTO-REPARO DO BANCO DE DADOS (REPARO TOTAL)
+# 2. AUTO-REPARO DO BANCO DE DADOS (REPARO TOTAL V3)
 # =========================================================
 @app.on_event("startup")
 def on_startup():
@@ -60,21 +60,23 @@ def on_startup():
             logger.info("🔧 [STARTUP] Forçando verificação COMPLETA do banco...")
             
             comandos = [
-                # --- TABELA PEDIDOS (Onde está dando erro agora) ---
+                # --- CORREÇÃO PLANOS (O CAUSADOR DO ERRO ATUAL) ---
+                "ALTER TABLE planos_config ADD COLUMN IF NOT EXISTS key_id VARCHAR;",
+                "ALTER TABLE planos_config ADD COLUMN IF NOT EXISTS descricao TEXT;",
+                "ALTER TABLE planos_config ADD COLUMN IF NOT EXISTS preco_cheio FLOAT;",
+
+                # --- CORREÇÃO PEDIDOS ---
                 "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
                 "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_nome VARCHAR;",
                 "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS txid VARCHAR;",
                 "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS qr_code TEXT;",
-                # Adicionamos transaction_id para evitar erro de mapeamento antigo
                 "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS transaction_id VARCHAR;", 
-                
-                # Colunas de data e acesso (Causa do erro atual)
                 "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS data_aprovacao TIMESTAMP WITHOUT TIME ZONE;",
                 "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS data_expiracao TIMESTAMP WITHOUT TIME ZONE;",
                 "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS link_acesso VARCHAR;",
                 "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS mensagem_enviada BOOLEAN DEFAULT FALSE;",
 
-                # --- OUTRAS TABELAS (Para garantir que nada mais quebre) ---
+                # --- CORREÇÃO FLOW & REMARKETING ---
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
