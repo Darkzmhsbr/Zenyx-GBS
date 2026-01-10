@@ -9,7 +9,7 @@ from telebot import types
 import json
 import uuid
 
-# --- CORREÇÃO AQUI: IMPORTS SEPARADOS CORRETAMENTE ---
+# --- IMPORTS CORRIGIDOS ---
 from sqlalchemy import func, desc, text
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,8 +18,9 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
 
-# Importa banco de dados
-from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, Pedido, SystemConfig, RemarketingCampaign, BotAdmin, engine
+# Importa o banco e o script de reparo
+from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, BotFlowStep, Pedido, SystemConfig, RemarketingCampaign, BotAdmin, engine
+import update_db 
 
 # Configuração de Log
 logging.basicConfig(level=logging.INFO)
@@ -339,6 +340,22 @@ class FlowUpdate(BaseModel):
     msg_2_media: Optional[str] = None
     mostrar_planos_2: bool
 
+class FlowStepCreate(BaseModel):
+    msg_texto: str
+    msg_media: Optional[str] = None
+    btn_texto: str = "Próximo ▶️"
+    step_order: int
+
+class UserUpdateCRM(BaseModel):
+    first_name: Optional[str] = None
+    username: Optional[str] = None
+    # Recebe a data como string do frontend
+    custom_expiration: Optional[str] = None 
+    status: Optional[str] = None
+
+class IntegrationUpdate(BaseModel):
+    token: str
+
 # ✅ MODELO COMPLETO PARA O WIZARD DE REMARKETING
 class RemarketingRequest(BaseModel):
     bot_id: int
@@ -367,6 +384,13 @@ class RemarketingRequest(BaseModel):
     # Controle de Teste
     is_test: bool = False
     specific_user_id: Optional[str] = None # Telegram ID para teste
+
+    # ---   
+# Modelo para Atualização de Usuário (CRM)
+class UserUpdate(BaseModel):
+    role: Optional[str] = None
+    status: Optional[str] = None
+    custom_expiration: Optional[str] = None # 'vitalicio', 'remover' ou data YYYY-MM-DD
 
 # ===========================
 # ⚙️ GESTÃO DE BOTS
@@ -1032,33 +1056,80 @@ Copie o código abaixo para garantir sua vaga:
 # =========================================================
 @app.get("/api/admin/contacts")
 def listar_contatos(bot_id: Optional[int] = None, status: str = "todos", db: Session = Depends(get_db)):
-    query = db.query(Pedido)
+    q = db.query(Pedido)
+    if bot_id: q = q.filter(Pedido.bot_id == bot_id)
+    if status == "pagantes": q = q.filter(Pedido.status.in_(['paid', 'active', 'approved']))
+    elif status == "pendentes": q = q.filter(Pedido.status == "pending")
+    elif status == "expirados": q = q.filter(Pedido.status == "expired")
+    return q.order_by(desc(Pedido.created_at)).all()
+
+# [NOVA ROTA] Atualização Manual de Usuário
+@app.put("/api/admin/users/{user_id}")
+def update_user_crm(user_id: str, dados: UserUpdateCRM, db: Session = Depends(get_db)):
+    # Tenta achar por ID ou TelegramID
+    p = db.query(Pedido).filter(
+        (Pedido.id == int(user_id) if user_id.isdigit() else False) | 
+        (Pedido.telegram_id == user_id)
+    ).first()
     
-    # 1. Filtro de Bot
-    if bot_id:
-        query = query.filter(Pedido.bot_id == bot_id)
-    
-    # 2. Filtros de Status (Lógica Reforçada)
-    if status == "pagantes":
-        # Pega quem pagou ou foi aprovado manualmente
-        query = query.filter(Pedido.status.in_(['paid', 'active', 'approved']))
-    
-    elif status == "pendentes":
-        # Pega pendentes (e garante que não pega os expirados antigos)
-        query = query.filter(Pedido.status == "pending")
-    
-    elif status == "expirados":
-        # Pega quem está marcado como expired OU quem já venceu a data (mesmo que status seja paid)
-        # Nota: Para performance, focamos no status, mas podemos adicionar verificação de data se precisar
-        query = query.filter(Pedido.status == "expired")
-    
-    # Ordena: Pendentes primeiro (para cobrar), depois data
-    contatos = query.order_by(
-        desc(Pedido.status == 'pending'), 
-        desc(Pedido.created_at)
-    ).all()
-    
-    return contatos
+    if not p: raise HTTPException(404, "Usuário não encontrado")
+
+    if dados.first_name: p.first_name = dados.first_name
+    if dados.username: p.username = dados.username
+    if dados.status: p.status = dados.status
+
+    # Lógica da Data Manual (Dual Write)
+    if dados.custom_expiration:
+        try:
+            # Converte string ISO para datetime
+            dt = datetime.fromisoformat(dados.custom_expiration.replace("Z", ""))
+            p.data_expiracao = dt
+            p.custom_expiration = dt # Salva na coluna que o Front lê
+        except: pass 
+
+    db.commit()
+    return {"status": "success"}
+
+# --- ROTAS FLOW V2 (HÍBRIDO) ---
+@app.get("/api/admin/bots/{bot_id}/flow")
+def get_flow(bot_id: int, db: Session = Depends(get_db)):
+    f = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
+    if not f: return {"msg_boas_vindas": "Olá!", "btn_text_1": "DESBLOQUEAR"}
+    return f
+
+@app.post("/api/admin/bots/{bot_id}/flow")
+def save_flow(bot_id: int, flow: FlowUpdate, db: Session = Depends(get_db)):
+    f = db.query(BotFlow).filter(BotFlow.bot_id == bot_id).first()
+    if not f: f = BotFlow(bot_id=bot_id)
+    db.add(f)
+    f.msg_boas_vindas = flow.msg_boas_vindas
+    f.media_url = flow.media_url
+    f.btn_text_1 = flow.btn_text_1
+    f.autodestruir_1 = flow.autodestruir_1
+    f.msg_2_texto = flow.msg_2_texto
+    f.msg_2_media = flow.msg_2_media
+    f.mostrar_planos_2 = flow.mostrar_planos_2
+    db.commit()
+    return {"status": "saved"}
+
+@app.get("/api/admin/bots/{bot_id}/flow/steps")
+def list_steps(bot_id: int, db: Session = Depends(get_db)):
+    return db.query(BotFlowStep).filter(BotFlowStep.bot_id == bot_id).order_by(BotFlowStep.step_order).all()
+
+@app.post("/api/admin/bots/{bot_id}/flow/steps")
+def add_step(bot_id: int, p: FlowStepCreate, db: Session = Depends(get_db)):
+    ns = BotFlowStep(bot_id=bot_id, step_order=p.step_order, msg_texto=p.msg_texto, msg_media=p.msg_media, btn_texto=p.btn_texto)
+    db.add(ns)
+    db.commit()
+    return {"status": "ok"}
+
+@app.delete("/api/admin/bots/{bot_id}/flow/steps/{sid}")
+def del_step(bot_id: int, sid: int, db: Session = Depends(get_db)):
+    s = db.query(BotFlowStep).filter(BotFlowStep.id == sid).first()
+    if s:
+        db.delete(s)
+        db.commit()
+    return {"status": "deleted"}
 
 # --- NOVA ROTA: DISPARO INDIVIDUAL (VIA HISTÓRICO) ---
 class IndividualRemarketingRequest(BaseModel):
@@ -1466,6 +1537,190 @@ Toque no link abaixo para entrar no Canal VIP:
         logger.error(f"❌ ERRO CRÍTICO NO WEBHOOK: {e}")
         # Mesmo com erro, retornamos 200 ou estrutura json para não travar o gateway (opcional, depende da estratégia)
         return {"status": "error"}
+
+# --- WEBHOOKS (LÓGICA V2) ---
+@app.post("/webhook/pix")
+async def wh_pix(req: Request, db: Session = Depends(get_db)):
+    try:
+        raw = await req.body()
+        try: js = json.loads(raw)
+        except: js = {k: v[0] for k,v in urllib.parse.parse_qs(raw.decode()).items()}
+        
+        st = str(js.get('status', '')).upper()
+        tx = str(js.get('id') or js.get('external_reference') or js.get('uuid') or '').lower()
+        
+        if st in ['PAID', 'APPROVED', 'COMPLETED', 'SUCCEEDED'] and tx:
+            ped = db.query(Pedido).filter(Pedido.txid == tx).first()
+            if ped and ped.status != 'paid':
+                # CÁLCULO DE DATA (DUAL WRITE)
+                now = datetime.utcnow()
+                exp = None
+                
+                # Tenta pelo ID do Plano
+                if ped.plano_id:
+                    pl = db.query(PlanoConfig).filter(PlanoConfig.id == ped.plano_id).first()
+                    if pl and pl.dias_duracao > 0:
+                        exp = now + timedelta(days=pl.dias_duracao)
+                
+                # Fallback pelo Nome
+                if not exp and ped.plano_nome:
+                    nm = ped.plano_nome.lower()
+                    if "vital" not in nm and "mega" not in nm:
+                        d = 30
+                        if "diario" in nm or "24" in nm: d = 1
+                        elif "semanal" in nm: d = 7
+                        elif "trimestral" in nm: d = 90
+                        exp = now + timedelta(days=d)
+                
+                ped.status = 'paid'
+                ped.data_aprovacao = now
+                ped.data_expiracao = exp      # Backend V2
+                ped.custom_expiration = exp   # Frontend V1
+                ped.mensagem_enviada = True
+                db.commit()
+                
+                # Entrega
+                bot = db.query(Bot).filter(Bot.id == ped.bot_id).first()
+                if bot:
+                    tb = telebot.TeleBot(bot.token)
+                    try:
+                        cid = int(str(bot.id_canal_vip).strip())
+                        tb.unban_chat_member(cid, int(ped.telegram_id))
+                        lnk = tb.create_chat_invite_link(cid, member_limit=1, name=f"Venda {ped.first_name}").invite_link
+                        tb.send_message(int(ped.telegram_id), f"✅ Pagamento Aprovado!\n\nSeu link: {lnk}")
+                        notificar_admin_principal(bot, f"💰 Venda: R$ {ped.valor} - {ped.first_name}")
+                    except: pass
+        return {"status": "received"}
+    except: return {"status": "error"}
+
+@app.post("/webhook/{token}")
+async def tg_wh(token: str, req: Request, db: Session = Depends(get_db)):
+    if token == "pix": return {"status": "ignored"}
+    b = db.query(Bot).filter(Bot.token == token).first()
+    if not b or b.status == "pausado": return {"status": "ignored"}
+    
+    try:
+        js = await req.json()
+        u = telebot.types.Update.de_json(js)
+        tb = telebot.TeleBot(token)
+        
+        # Porteiro
+        if u.message and u.message.new_chat_members:
+            cid = str(u.message.chat.id)
+            vip = str(b.id_canal_vip).strip()
+            if cid == vip:
+                for m in u.message.new_chat_members:
+                    if m.is_bot: continue
+                    p = db.query(Pedido).filter(Pedido.bot_id == b.id, Pedido.telegram_id == str(m.id), Pedido.status == 'paid').order_by(desc(Pedido.created_at)).first()
+                    allowed = False
+                    if p:
+                        if p.data_expiracao:
+                            if datetime.utcnow() < p.data_expiracao: allowed = True
+                        else:
+                            nm = (p.plano_nome or "").lower()
+                            if "vital" in nm or "mega" in nm: allowed = True
+                            else:
+                                d = 30
+                                if "diario" in nm: d = 1
+                                elif "semanal" in nm: d = 7
+                                if datetime.utcnow() < (p.created_at + timedelta(days=d)): allowed = True
+                    if not allowed:
+                        try:
+                            tb.ban_chat_member(cid, m.id)
+                            tb.unban_chat_member(cid, m.id)
+                        except: pass
+            return {"status": "checked"}
+
+        # Flow
+        if u.message and u.message.text == "/start":
+            cid = u.message.chat.id
+            fl = b.fluxo
+            txt = fl.msg_boas_vindas if fl else f"Olá!"
+            btn = fl.btn_text_1 if fl else "🔓 ABRIR"
+            med = fl.media_url if fl else None
+            mk = types.InlineKeyboardMarkup()
+            mk.add(types.InlineKeyboardButton(btn, callback_data="passo_2"))
+            try:
+                if med:
+                    if med.endswith(('.mp4','.mov')): tb.send_video(cid, med, caption=txt, reply_markup=mk)
+                    else: tb.send_photo(cid, med, caption=txt, reply_markup=mk)
+                else: tb.send_message(cid, txt, reply_markup=mk)
+            except: tb.send_message(cid, txt, reply_markup=mk)
+
+        elif u.callback_query:
+            call = u.callback_query
+            cid = call.message.chat.id
+            dat = call.data
+            
+            # --- LÓGICA HÍBRIDA V2 (Passos Intermediários) ---
+            if dat == "passo_2":
+                if b.fluxo and b.fluxo.autodestruir_1:
+                    try: tb.delete_message(cid, call.message.message_id)
+                    except: pass
+                
+                # Checa steps
+                s1 = db.query(BotFlowStep).filter(BotFlowStep.bot_id == b.id, BotFlowStep.step_order == 1).first()
+                if s1:
+                    mk = types.InlineKeyboardMarkup()
+                    s2 = db.query(BotFlowStep).filter(BotFlowStep.bot_id == b.id, BotFlowStep.step_order == 2).first()
+                    nxt = "next_step_2" if s2 else "go_checkout"
+                    mk.add(types.InlineKeyboardButton(s1.btn_texto, callback_data=nxt))
+                    try:
+                        if s1.msg_media:
+                            if s1.msg_media.endswith(('.mp4','.mov')): tb.send_video(cid, s1.msg_media, caption=s1.msg_texto, reply_markup=mk)
+                            else: tb.send_photo(cid, s1.msg_media, caption=s1.msg_texto, reply_markup=mk)
+                        else: tb.send_message(cid, s1.msg_texto, reply_markup=mk)
+                    except: tb.send_message(cid, s1.msg_texto, reply_markup=mk)
+                else:
+                    enviar_oferta_final(tb, cid, b.fluxo, b.id, db)
+            
+            elif dat.startswith("next_step_"):
+                try: od = int(dat.split("_")[2])
+                except: od = 1
+                curr = db.query(BotFlowStep).filter(BotFlowStep.bot_id == b.id, BotFlowStep.step_order == od).first()
+                if curr:
+                    mk = types.InlineKeyboardMarkup()
+                    nxt = db.query(BotFlowStep).filter(BotFlowStep.bot_id == b.id, BotFlowStep.step_order == od+1).first()
+                    cb = f"next_step_{od+1}" if nxt else "go_checkout"
+                    mk.add(types.InlineKeyboardButton(curr.btn_texto, callback_data=cb))
+                    try:
+                        if curr.msg_media:
+                            if curr.msg_media.endswith(('.mp4','.mov')): tb.send_video(cid, curr.msg_media, caption=curr.msg_texto, reply_markup=mk)
+                            else: tb.send_photo(cid, curr.msg_media, caption=curr.msg_texto, reply_markup=mk)
+                        else: tb.send_message(cid, curr.msg_texto, reply_markup=mk)
+                    except: tb.send_message(cid, curr.msg_texto, reply_markup=mk)
+                else:
+                    enviar_oferta_final(tb, cid, b.fluxo, b.id, db)
+
+            elif dat == "go_checkout":
+                enviar_oferta_final(tb, cid, b.fluxo, b.id, db)
+
+            elif dat.startswith("checkout_"):
+                pid = dat.split("_")[1]
+                pl = db.query(PlanoConfig).filter(PlanoConfig.id == pid).first()
+                if pl:
+                    msg = tb.send_message(cid, "⏳ Gerando PIX...")
+                    mytx = str(uuid.uuid4())
+                    pix = gerar_pix_pushinpay(pl.preco_atual, mytx)
+                    if pix:
+                        qr = pix.get('qr_code_text') or pix.get('qr_code')
+                        txid = str(pix.get('id') or mytx).lower()
+                        np = Pedido(
+                            bot_id=b.id, telegram_id=str(cid),
+                            first_name=call.from_user.first_name, username=call.from_user.username,
+                            plano_nome=pl.nome_exibicao, plano_id=pl.id, valor=pl.preco_atual,
+                            txid=txid, qr_code=qr, status="pending"
+                        )
+                        db.add(np)
+                        db.commit()
+                        try: tb.delete_message(cid, msg.message_id)
+                        except: pass
+                        tb.send_message(cid, f"💠 Pagamento Gerado!\nValor: R$ {pl.preco_atual:.2f}\n\nCopia e Cola:\n`{qr}`", parse_mode="Markdown")
+                    else: tb.send_message(cid, "Erro PIX")
+            
+            tb.answer_callback_query(call.id)
+    except: pass
+    return {"status": "ok"}
 
 @app.get("/")
 def home():
