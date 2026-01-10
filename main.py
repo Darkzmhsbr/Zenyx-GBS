@@ -989,36 +989,408 @@ def listar_contatos(bot_id: Optional[int] = None, status: str = "todos", db: Ses
 class IndividualRemarketingRequest(BaseModel):
     bot_id: int
     user_telegram_id: str
-    campaign_history_id: int
+    campaign_history_id: int # ID do histórico para copiar a msg
 
 @app.post("/api/admin/remarketing/send-individual")
 def enviar_remarketing_individual(payload: IndividualRemarketingRequest, db: Session = Depends(get_db)):
+    # 1. Busca os dados da campanha antiga
     campanha = db.query(RemarketingCampaign).filter(RemarketingCampaign.id == payload.campaign_history_id).first()
-    if not campanha: raise HTTPException(404, "Campanha não encontrada")
+    if not campanha:
+        raise HTTPException(404, "Campanha original não encontrada")
     
-    try: config = json.loads(campanha.config)
-    except: config = {}
+    # 2. Decodifica a configuração
+    try:
+        config = json.loads(campanha.config) if isinstance(campanha.config, str) else campanha.config
+        # Se config for string dentro de um json (caso antigo), tenta parsear de novo
+        if isinstance(config, str): config = json.loads(config)
+    except:
+        config = {}
+
+    # 3. Reconstrói o Payload
+    msg = config.get("msg", "")
+    media = config.get("media", "")
     
+    # [CORREÇÃO CRÍTICA] Não buscamos mais 'offer' do config JSON, pois ele pode não ter sido salvo lá.
+    # A verificação será feita direto pelo ID do plano na tabela.
+
+    # 4. Prepara envio
     bot_db = db.query(Bot).filter(Bot.id == payload.bot_id).first()
+    if not bot_db: raise HTTPException(404, "Bot não encontrado")
+    
     sender = telebot.TeleBot(bot_db.token)
     
+    # 5. Monta Botão (CORRIGIDO: Se tiver plano_id no banco, TEM oferta)
     markup = None
     if campanha.plano_id:
+        # Recupera plano
         plano = db.query(PlanoConfig).filter(PlanoConfig.id == campanha.plano_id).first()
         if plano:
             markup = types.InlineKeyboardMarkup()
+            # Usa o preço promocional salvo na campanha ou o atual
             preco = campanha.promo_price or plano.preco_atual
-            markup.add(types.InlineKeyboardButton(f"🔥 {plano.nome_exibicao} - R$ {preco:.2f}", callback_data=f"checkout_{plano.id}"))
+            btn_text = f"🔥 {plano.nome_exibicao} - R$ {preco:.2f}"
+            
+            # OBS: Usamos um checkout direto aqui para garantir que funcione, 
+            # já que links de promoções antigas poderiam estar expirados.
+            # Se quiser forçar a mesma campanha, use f"promo_{campanha.campaign_id}"
+            # Mas checkout direto é mais seguro para disparo individual manual.
+            markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"checkout_{plano.id}"))
 
+    # 6. Envia
     try:
-        if config.get("media"):
-            try: sender.send_photo(payload.user_telegram_id, config["media"], caption=config["msg"], reply_markup=markup)
-            except: sender.send_message(payload.user_telegram_id, config["msg"], reply_markup=markup)
+        if media:
+            try:
+                # Tenta enviar como vídeo ou foto
+                if media.lower().endswith(('.mp4', '.mov', '.avi')):
+                    sender.send_video(payload.user_telegram_id, media, caption=msg, reply_markup=markup)
+                else:
+                    sender.send_photo(payload.user_telegram_id, media, caption=msg, reply_markup=markup)
+            except Exception as e_media:
+                # Se falhar a mídia (link quebrado), envia só texto com o botão
+                logger.warning(f"Falha ao enviar mídia: {e_media}. Tentando texto.")
+                sender.send_message(payload.user_telegram_id, msg, reply_markup=markup)
         else:
-            sender.send_message(payload.user_telegram_id, config["msg"], reply_markup=markup)
-        return {"status": "sent"}
+            sender.send_message(payload.user_telegram_id, msg, reply_markup=markup)
+            
+        return {"status": "sent", "msg": "Mensagem enviada com sucesso!"}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        logger.error(f"Erro envio individual: {e}")
+        # Retorna erro 500 para o frontend saber
+        raise HTTPException(status_code=500, detail=f"Falha ao enviar: {str(e)}")
+
+# =========================================================
+# 📢 ROTAS DE REMARKETING (DISPARADOR AVANÇADO)
+# =========================================================
+
+# Variável Global para monitorar o envio em tempo real
+CAMPAIGN_STATUS = {
+    "running": False,
+    "sent": 0,
+    "total": 0,
+    "blocked": 0
+}
+
+# =========================================================
+# 📢 LÓGICA DE REMARKETING (OFERTA + VALIDADE + TESTE)
+# =========================================================
+# Variável Global para monitorar o envio em tempo real
+CAMPAIGN_STATUS = {
+    "running": False,
+    "sent": 0,
+    "total": 0,
+    "blocked": 0
+}
+
+def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Session):
+    global CAMPAIGN_STATUS
+    # Reinicia status
+    CAMPAIGN_STATUS = {"running": True, "sent": 0, "total": 0, "blocked": 0}
+    
+    bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
+    if not bot_db: 
+        CAMPAIGN_STATUS["running"] = False
+        return
+
+    # --- 1. CONFIGURAÇÃO DA OFERTA (PREÇO E DATA) ---
+    uuid_campanha = str(uuid.uuid4())
+    data_expiracao = None
+    preco_final = 0.0
+    plano_db = None
+
+    if payload.incluir_oferta and payload.plano_oferta_id:
+        # Busca plano (aceita ID numérico ou string chave)
+        plano_db = db.query(PlanoConfig).filter(
+            (PlanoConfig.key_id == str(payload.plano_oferta_id)) | 
+            (PlanoConfig.id == int(payload.plano_oferta_id) if str(payload.plano_oferta_id).isdigit() else False)
+        ).first()
+
+        if plano_db:
+            # Define Preço
+            if payload.price_mode == "custom" and payload.custom_price > 0:
+                preco_final = payload.custom_price
+            else:
+                preco_final = plano_db.preco_atual
+            
+            # Define Expiração
+            if payload.expiration_mode != "none" and payload.expiration_value > 0:
+                agora = datetime.utcnow()
+                val = payload.expiration_value
+                if payload.expiration_mode == "minutes":
+                    data_expiracao = agora + timedelta(minutes=val)
+                elif payload.expiration_mode == "hours":
+                    data_expiracao = agora + timedelta(hours=val)
+                elif payload.expiration_mode == "days":
+                    data_expiracao = agora + timedelta(days=val)
+
+    # --- 2. SALVAR A CAMPANHA NO BANCO (ANTES DE ENVIAR) ---
+    # Precisamos salvar antes para que o ID da campanha exista quando o usuário clicar
+    # Se for teste, NÃO salvamos no banco para não sujar o histórico, a menos que queira log
+    nova_campanha = None
+    if not payload.is_test:
+        nova_campanha = RemarketingCampaign(
+            bot_id=bot_id,
+            campaign_id=uuid_campanha,
+            type="massivo",
+            target=payload.target,
+            config=json.dumps({"msg": payload.mensagem, "media": payload.media_url}),
+            status="enviando",
+            
+            # Dados da Oferta
+            plano_id=plano_db.id if plano_db else None,
+            promo_price=preco_final if plano_db else None,
+            expiration_at=data_expiracao
+        )
+        db.add(nova_campanha)
+        db.commit()
+
+    # --- 3. DEFINIR PÚBLICO ALVO ---
+    bot_sender = telebot.TeleBot(bot_db.token)
+    usuarios_para_envio = []
+
+    if payload.is_test:
+        # Se for teste, manda só para o ID específico (Admin)
+        if payload.specific_user_id:
+            class MockUser:
+                def __init__(self, tid): self.telegram_id = tid
+            usuarios_para_envio = [MockUser(payload.specific_user_id)]
+    else:
+        # Lógica normal de busca no banco
+        query = db.query(Pedido).filter(Pedido.bot_id == bot_id)
+        if payload.target == "pendentes": query = query.filter(Pedido.status == "pending")
+        elif payload.target == "pagantes": query = query.filter(Pedido.status == "paid")
+        elif payload.target == "expirados": query = query.filter(Pedido.status == "expired")
+        usuarios_para_envio = query.distinct(Pedido.telegram_id).all()
+
+    CAMPAIGN_STATUS["total"] = len(usuarios_para_envio)
+
+    # --- 4. PREPARAR BOTÃO (CALLBACK ESPECIAL) ---
+    markup = None
+    if plano_db:
+        markup = types.InlineKeyboardMarkup()
+        btn_text = f"🔥 {plano_db.nome_exibicao} - R$ {preco_final:.2f}"
+        
+        # Se for teste, usamos um callback fictício ou direto para checkout padrão (pois não tem campanha salva)
+        if payload.is_test:
+             # No teste, forçamos um checkout direto só pra ver o botão, mas sem validação de tempo do banco
+             markup.add(types.InlineKeyboardButton(f"[TESTE] {btn_text}", callback_data=f"checkout_{plano_db.id}"))
+        else:
+             # O callback 'promo_' leva o ID da campanha. O Webhook vai checar se expirou.
+             markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"promo_{uuid_campanha}"))
+
+    # --- 5. DISPARO ---
+    sent_count = 0
+    blocked_count = 0
+
+    for u in usuarios_para_envio:
+        try:
+            midia_ok = False
+            if payload.media_url and len(payload.media_url) > 5:
+                try:
+                    if payload.media_url.lower().endswith(('.mp4', '.mov', '.avi')):
+                        bot_sender.send_video(u.telegram_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
+                    else:
+                        bot_sender.send_photo(u.telegram_id, payload.media_url, caption=payload.mensagem, reply_markup=markup)
+                    midia_ok = True
+                except: pass
+            
+            if not midia_ok:
+                bot_sender.send_message(u.telegram_id, payload.mensagem, reply_markup=markup)
+            
+            sent_count += 1
+        except Exception as e:
+            if "blocked" in str(e).lower() or "kicked" in str(e).lower(): blocked_count += 1
+        
+        time.sleep(0.05) # Evita flood
+
+    CAMPAIGN_STATUS["running"] = False
+    
+    # Atualiza status final no banco (Se não for teste)
+    if not payload.is_test and nova_campanha:
+        nova_campanha.status = "concluido"
+        nova_campanha.total_leads = len(usuarios_para_envio)
+        nova_campanha.sent_success = sent_count
+        nova_campanha.blocked_count = blocked_count
+        db.commit()
+
+# --- ROTAS DA API ---
+
+@app.post("/api/admin/remarketing/send")
+def enviar_remarketing(payload: RemarketingRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    # Lógica para Teste: Se for teste e não tiver ID, pega o último do banco
+    if payload.is_test and not payload.specific_user_id:
+        ultimo = db.query(Pedido).filter(Pedido.bot_id == payload.bot_id).order_by(Pedido.id.desc()).first()
+        if ultimo:
+            payload.specific_user_id = ultimo.telegram_id
+        else:
+            # Tenta pegar um admin se não tiver clientes
+            admin = db.query(BotAdmin).filter(BotAdmin.bot_id == payload.bot_id).first()
+            if admin: payload.specific_user_id = admin.telegram_id
+            else: raise HTTPException(400, "Nenhum usuário encontrado para teste. Interaja com o bot primeiro (/start).")
+
+    background_tasks.add_task(processar_envio_remarketing, payload.bot_id, payload, db)
+    return {"status": "enviando", "msg": "Campanha iniciada!"}
+
+@app.get("/api/admin/remarketing/status")
+def status_remarketing():
+    return CAMPAIGN_STATUS
+
+@app.get("/api/admin/remarketing/history/{bot_id}")
+def historico_remarketing(bot_id: int, db: Session = Depends(get_db)):
+    history = db.query(RemarketingCampaign).filter(RemarketingCampaign.bot_id == bot_id).order_by(RemarketingCampaign.data_envio.desc()).all()
+    return [{
+        "id": h.id, 
+        "data": h.data_envio.strftime("%d/%m/%Y %H:%M"), 
+        "total": h.total_leads, 
+        "sent": h.sent_success, 
+        "blocked": h.blocked_count, 
+        "config": {"content_data": h.config}
+    } for h in history]
+
+# =========================================================
+# 📊 ROTA DE DASHBOARD (KPIs REAIS E CUMULATIVOS)
+# =========================================================
+@app.get("/api/admin/dashboard/stats")
+def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db)): 
+    """Calcula métricas. Se bot_id for passado, filtra por ele."""
+    
+    # [CORREÇÃO FINANCEIRA] - Faturamento Total
+    # Soma vendas ativas E expiradas. O dinheiro entrou, conta como receita.
+    q_revenue = db.query(func.sum(Pedido.valor)).filter(
+        Pedido.status.in_(['paid', 'active', 'approved', 'expired', 'completed', 'succeeded'])
+    )
+    
+    # Usuários Ativos (Aqui SIM ignoramos os expirados, pois queremos saber quem está no canal agora)
+    q_users = db.query(Pedido.telegram_id).filter(
+        Pedido.status.in_(['paid', 'active', 'approved', 'completed', 'succeeded'])
+    )
+    
+    # Vendas Hoje (Considera qualquer venda feita hoje, mesmo que tenha sido teste curto e expirou)
+    today = datetime.utcnow().date()
+    start_of_day = datetime.combine(today, datetime.min.time())
+    q_sales_today = db.query(func.sum(Pedido.valor)).filter(
+        Pedido.status.in_(['paid', 'active', 'approved', 'expired', 'completed', 'succeeded']),
+        Pedido.created_at >= start_of_day
+    )
+
+    # APLICA FILTRO DE BOT (SE SELECIONADO)
+    if bot_id:
+        q_revenue = q_revenue.filter(Pedido.bot_id == bot_id)
+        q_users = q_users.filter(Pedido.bot_id == bot_id)
+        q_sales_today = q_sales_today.filter(Pedido.bot_id == bot_id)
+
+    total_revenue = q_revenue.scalar() or 0.0
+    active_users = q_users.distinct().count()
+    sales_today = q_sales_today.scalar() or 0.0
+
+    return {
+        "total_revenue": total_revenue,
+        "active_users": active_users,
+        "sales_today": sales_today
+    }
+# =========================================================
+# 💸 WEBHOOK DE PAGAMENTO (BLINDADO E TAGARELA)
+# =========================================================
+@app.post("/api/webhook")
+async def webhook(req: Request, bg_tasks: BackgroundTasks):
+    try:
+        raw = await req.body()
+        try: 
+            payload = json.loads(raw)
+        except: 
+            # Fallback para formato x-www-form-urlencoded
+            payload = {k: v[0] for k,v in parse_qs(raw.decode()).items()}
+        
+        # Log para debug (opcional, pode remover em produção)
+        # logger.info(f"Webhook recebido: {payload}")
+
+        # Se for pagamento APROVADO (Vários status possíveis de gateways)
+        if str(payload.get('status')).upper() in ['PAID', 'APPROVED', 'COMPLETED', 'SUCCEEDED']:
+            db = SessionLocal()
+            tx = str(payload.get('id')).lower() # ID da transação
+            
+            # Busca o pedido pelo ID da transação
+            p = db.query(Pedido).filter(Pedido.transaction_id == tx).first()
+            
+            # Se achou o pedido e ele ainda não estava pago
+            if p and p.status != 'paid':
+                p.status = 'paid'
+                db.commit() # Salva o status pago
+                
+                # --- 🔔 NOTIFICAÇÃO AO ADMIN (NOVO) ---
+                try:
+                    bot_db = db.query(Bot).filter(Bot.id == p.bot_id).first()
+                    
+                    # Verifica se o bot tem um Admin configurado para receber o aviso
+                    if bot_db and bot_db.admin_principal_id:
+                        msg_venda = (
+                            f"💰 *VENDA APROVADA!*\n\n"
+                            f"👤 Cliente: {p.first_name}\n"
+                            f"💎 Plano: {p.plano_nome}\n"
+                            f"💵 Valor: R$ {p.valor:.2f}\n"
+                            f"📅 Data: {datetime.now().strftime('%d/%m %H:%M')}"
+                        )
+                        # Chama a função auxiliar de notificação
+                        notificar_admin_principal(bot_db, msg_venda) 
+                except Exception as e_notify:
+                    logger.error(f"Erro ao notificar admin: {e_notify}")
+                # --------------------------------------
+
+                # --- ENVIO DO LINK DE ACESSO AO CLIENTE ---
+                if not p.mensagem_enviada:
+                    try:
+                        bot_data = db.query(Bot).filter(Bot.id == p.bot_id).first()
+                        tb = telebot.TeleBot(bot_data.token)
+                        
+                        # Tenta converter o ID do canal VIP com segurança
+                        try: canal_vip_id = int(str(bot_data.id_canal_vip).strip())
+                        except: canal_vip_id = bot_data.id_canal_vip
+
+                        # Tenta desbanir o usuário antes (garantia caso ele tenha sido expulso antes)
+                        try: tb.unban_chat_member(canal_vip_id, int(p.telegram_id))
+                        except: pass
+
+                        # Gera Link Único (Válido para 1 pessoa)
+                        convite = tb.create_chat_invite_link(
+                            chat_id=canal_vip_id, 
+                            member_limit=1, 
+                            name=f"Venda {p.first_name}"
+                        )
+                        link_acesso = convite.invite_link
+
+                        msg_sucesso = f"""
+✅ <b>Pagamento Confirmado!</b>
+
+Seu acesso ao <b>{bot_data.nome}</b> foi liberado.
+Toque no link abaixo para entrar no Canal VIP:
+
+👉 {link_acesso}
+
+⚠️ <i>Este link é único e válido apenas para você.</i>
+"""
+                        # Envia a mensagem com o link para o usuário
+                        tb.send_message(int(p.telegram_id), msg_sucesso, parse_mode="HTML")
+                        
+                        # Marca que a mensagem foi enviada para não enviar duplicado
+                        p.mensagem_enviada = True
+                        db.commit()
+                        logger.info(f"🏆 Link enviado para {p.first_name}")
+
+                    except Exception as e_telegram:
+                        logger.error(f"❌ ERRO TELEGRAM: {e_telegram}")
+                        # Fallback: Avisa o cliente que deu erro no envio do link, mas confirma o pagamento
+                        try:
+                            tb.send_message(int(p.telegram_id), "✅ Pagamento recebido! \n\n⚠️ Houve um erro ao gerar seu link automático. Um administrador entrará em contato em breve.")
+                        except: pass
+
+            db.close()
+        
+        # Retorna 200 OK para o Gateway de Pagamento parar de mandar o Webhook
+        return {"status": "received"}
+
+    except Exception as e:
+        logger.error(f"❌ ERRO CRÍTICO NO WEBHOOK: {e}")
+        # Mesmo com erro, retornamos 200 ou estrutura json para não travar o gateway (opcional, depende da estratégia)
+        return {"status": "error"}
 
 @app.get("/")
 def home():
