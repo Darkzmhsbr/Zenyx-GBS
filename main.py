@@ -744,42 +744,35 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         if not pedido: return {"status": "ok", "msg": "Order not found"}
         if pedido.status == "paid": return {"status": "ok", "msg": "Already paid"}
 
-        # --- [CORREÇÃO] CÁLCULO DE EXPIRAÇÃO NO PAGAMENTO ---
+        
+       # --- [CORREÇÃO] CÁLCULO DE EXPIRAÇÃO NO PAGAMENTO ---
         agora = datetime.utcnow()
         data_final = None # Se ficar None, é vitalício
         
-       # -----------------------------------------------------------
-        # 🗓️ CÁLCULO DE DATAS INTELIGENTE (ESPELHAMENTO)
-        # -----------------------------------------------------------
-        agora = datetime.utcnow()
-        data_final = None 
-        
-        # 1. Pega a duração configurada no Plano (Prioridade)
+        # Busca o plano original para saber a duração
         if pedido.plano_id:
             plano_db = db.query(PlanoConfig).filter(PlanoConfig.id == pedido.plano_id).first()
-            if plano_db and plano_db.dias_duracao and plano_db.dias_duracao > 0:
+            if plano_db and plano_db.dias_duracao > 0:
+                # Adiciona os dias configurados (Ex: 1 dia, 30 dias)
                 data_final = agora + timedelta(days=plano_db.dias_duracao)
         
-        # 2. Fallback pelo nome (Caso não ache o ID)
-        if not data_final and pedido.plano_nome:
-            nome = pedido.plano_nome.lower()
-            if "vital" not in nome and "mega" not in nome:
-                dias = 30 # Padrão
-                if "diario" in nome or "24" in nome: dias = 1
-                elif "semanal" in nome: dias = 7
-                elif "trimestral" in nome: dias = 90
-                elif "anual" in nome: dias = 365
-                data_final = agora + timedelta(days=dias)
+        # Se não achou pelo ID, tenta fallback pelo nome (lógica antiga de segurança)
+        if not data_final:
+            nome = (pedido.plano_nome or "").lower()
+            if "24" in nome or "diario" in nome or "1 dia" in nome:
+                data_final = agora + timedelta(days=1)
+            elif "semanal" in nome:
+                data_final = agora + timedelta(days=7)
+            elif "trimestral" in nome:
+                data_final = agora + timedelta(days=90)
+            elif "mensal" in nome:
+                data_final = agora + timedelta(days=30)
+            # Se for "vital" ou "mega", data_final continua None (Vitalício)
 
-        # 3. ATUALIZA O BANCO (GRAVA NAS DUAS COLUNAS!)
         pedido.status = "paid"
         pedido.mensagem_enviada = True
         pedido.data_aprovacao = agora
-        
-        # AQUI RESOLVE O "VITALÍCIO":
-        pedido.data_expiracao = data_final      # Para o futuro
-        pedido.custom_expiration = data_final   # Para o Frontend V1 (AGORA VAI APARECER!)
-        
+        pedido.data_expiracao = data_final # <--- SALVA A DATA AQUI
         db.commit()
         
         # Entrega o Acesso
