@@ -536,23 +536,24 @@ def list_bots(db: Session = Depends(get_db)):
         # [CORREÇÃO] Remove todos os @ existentes e adiciona apenas um limpo
         u_name = bot.username or "..."
         if u_name != "...":
-            # lstrip remove os @ do início, f"@..." adiciona um novo limpo
             u_name = f"@{u_name.lstrip('@')}"
 
-        # Corrige Leads
+        # Leads (Total de pessoas únicas que iniciaram checkout)
         leads = db.query(func.count(Pedido.telegram_id.distinct())).filter(Pedido.bot_id == bot.id).scalar() or 0
         
-        # Corrige Receita
+        # [CORREÇÃO FINANCEIRA] 
+        # Soma TODAS as vendas aprovadas, INCLUSIVE as expiradas.
+        # Dinheiro recebido não pode sumir só porque o tempo acabou.
         receita = db.query(func.sum(Pedido.valor)).filter(
             Pedido.bot_id == bot.id, 
-            Pedido.status.in_(['paid', 'approved', 'completed', 'succeeded', 'active'])
+            Pedido.status.in_(['paid', 'approved', 'completed', 'succeeded', 'active', 'expired'])
         ).scalar() or 0.0
 
         resultado.append({
             "id": bot.id,
             "nome": bot.nome,
             "token": bot.token,
-            "username": u_name, # Agora vai sempre limpo: @usuario
+            "username": u_name,
             "status": bot.status,
             "admin_principal_id": bot.admin_principal_id,
             "id_canal_vip": bot.id_canal_vip,
@@ -1304,26 +1305,33 @@ def historico_remarketing(bot_id: int, db: Session = Depends(get_db)):
         "config": {"content_data": h.config}
     } for h in history]
 
-
 # =========================================================
-# 📊 ROTA DE DASHBOARD (KPIs REAIS)
+# 📊 ROTA DE DASHBOARD (KPIs REAIS E CUMULATIVOS)
 # =========================================================
 @app.get("/api/admin/dashboard/stats")
-def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db)): # <--- Adicione bot_id
+def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db)): 
     """Calcula métricas. Se bot_id for passado, filtra por ele."""
     
-    # Base das queries
-    q_revenue = db.query(func.sum(Pedido.valor)).filter(Pedido.status == "paid")
-    q_users = db.query(Pedido.telegram_id).filter(Pedido.status == "paid")
+    # [CORREÇÃO FINANCEIRA] - Faturamento Total
+    # Soma vendas ativas E expiradas. O dinheiro entrou, conta como receita.
+    q_revenue = db.query(func.sum(Pedido.valor)).filter(
+        Pedido.status.in_(['paid', 'active', 'approved', 'expired', 'completed', 'succeeded'])
+    )
     
+    # Usuários Ativos (Aqui SIM ignoramos os expirados, pois queremos saber quem está no canal agora)
+    q_users = db.query(Pedido.telegram_id).filter(
+        Pedido.status.in_(['paid', 'active', 'approved', 'completed', 'succeeded'])
+    )
+    
+    # Vendas Hoje (Considera qualquer venda feita hoje, mesmo que tenha sido teste curto e expirou)
     today = datetime.utcnow().date()
     start_of_day = datetime.combine(today, datetime.min.time())
     q_sales_today = db.query(func.sum(Pedido.valor)).filter(
-        Pedido.status == "paid", 
+        Pedido.status.in_(['paid', 'active', 'approved', 'expired', 'completed', 'succeeded']),
         Pedido.created_at >= start_of_day
     )
 
-    # APLICA FILTRO SE TIVER BOT_ID
+    # APLICA FILTRO DE BOT (SE SELECIONADO)
     if bot_id:
         q_revenue = q_revenue.filter(Pedido.bot_id == bot_id)
         q_users = q_users.filter(Pedido.bot_id == bot_id)
@@ -1338,7 +1346,6 @@ def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db))
         "active_users": active_users,
         "sales_today": sales_today
     }
-
 # =========================================================
 # 💸 WEBHOOK DE PAGAMENTO (BLINDADO E TAGARELA)
 # =========================================================
