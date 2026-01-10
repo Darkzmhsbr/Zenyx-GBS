@@ -1452,6 +1452,25 @@ Toque no link abaixo para entrar no Canal VIP:
         # Mesmo com erro, retornamos 200 ou estrutura json para não travar o gateway (opcional, depende da estratégia)
         return {"status": "error"}
 
+# =========================================================
+# 🚑 ROTA DE RESGATE (CLIQUE AQUI PARA CONSERTAR O BANCO)
+# =========================================================
+@app.get("/api/force-fix-db")
+def force_fix_db():
+    try:
+        with engine.connect() as conn:
+            # Força a criação da coluna que falta para o Frontend
+            conn.execute(text("ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS custom_expiration TIMESTAMP WITHOUT TIME ZONE;"))
+            
+            # Força as outras colunas também, só para garantir
+            conn.execute(text("ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS data_expiracao TIMESTAMP WITHOUT TIME ZONE;"))
+            conn.execute(text("ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_id INTEGER;"))
+            
+            conn.commit()
+            return {"status": "SUCCESS", "msg": "Banco de dados reparado! A página de contatos deve voltar."}
+    except Exception as e:
+        return {"status": "ERROR", "msg": str(e)}
+
 @app.get("/")
 def home():
     return {"status": "Zenyx V2.0 Online (Fixed)"}
