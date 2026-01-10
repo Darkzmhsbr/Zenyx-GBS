@@ -137,73 +137,58 @@ def loop_verificar_vencimentos():
 def verificar_expiracao_massa():
     db = SessionLocal()
     try:
-        # Busca todos os bots para processar cada um
         bots = db.query(Bot).all()
-        
         for bot_data in bots:
-            if not bot_data.token or not bot_data.id_canal_vip:
-                continue
-                
+            if not bot_data.token or not bot_data.id_canal_vip: continue
+            
             try:
                 tb = telebot.TeleBot(bot_data.token)
-                
-                # Busca pedidos PAGOS deste bot
-                usuarios_ativos = db.query(Pedido).filter(
-                    Pedido.bot_id == bot_data.id,
-                    Pedido.status == 'paid'
-                ).all()
+                # Busca apenas usuários PAGOS
+                usuarios_ativos = db.query(Pedido).filter(Pedido.bot_id == bot_data.id, Pedido.status == 'paid').all()
                 
                 for user in usuarios_ativos:
-                    # Determina a duração baseada no nome do plano
-                    dias_duracao = 30 # Padrão Mensal
-                    nome_plano = (user.plano_nome or "").lower()
+                    deve_expirar = False
                     
-                    if "vital" in nome_plano or "mega" in nome_plano:
-                        continue # Nunca vence
+                    # 1. Verifica pela Data Exata (Prioridade)
+                    if user.data_expiracao:
+                        if datetime.utcnow() > user.data_expiracao:
+                            deve_expirar = True
                     
-                    if "24" in nome_plano or "diario" in nome_plano or "1 dia" in nome_plano:
-                        dias_duracao = 1
-                    elif "trimestral" in nome_plano:
-                        dias_duracao = 90
-                    elif "semanal" in nome_plano:
-                        dias_duracao = 7
-                    
-                    # Calcula data de vencimento
-                    data_vencimento = user.created_at + timedelta(days=dias_duracao)
-                    agora = datetime.utcnow()
-                    
-                    if agora > data_vencimento:
-                        logger.info(f"🚫 Assinatura vencida: {user.telegram_id} (Bot: {bot_data.nome})")
+                    # 2. Verifica pelo Nome (Fallback antigo)
+                    else:
+                        dias_duracao = 30
+                        nome_plano = (user.plano_nome or "").lower()
+                        if "vital" in nome_plano or "mega" in nome_plano: continue
                         
-                        # --- A LÓGICA DO KICK SUAVE (REMOVE DA BLACKLIST) ---
-                        try:
-                            # 1. Identifica o Canal
-                            try: canal_id = int(str(bot_data.id_canal_vip).strip())
-                            except: canal_id = bot_data.id_canal_vip
+                        if "24" in nome_plano or "diario" in nome_plano: dias_duracao = 1
+                        elif "trimestral" in nome_plano: dias_duracao = 90
+                        elif "semanal" in nome_plano: dias_duracao = 7
+                        
+                        validade = user.created_at + timedelta(days=dias_duracao)
+                        if datetime.utcnow() > validade:
+                            deve_expirar = True
 
-                            # 2. Banir (Remove do canal)
-                            tb.ban_chat_member(canal_id, int(user.telegram_id))
+                    # 3. Executa o Banimento
+                    if deve_expirar:
+                        logger.info(f"🚫 Expirou: {user.telegram_id}")
+                        try:
+                            try: c_id = int(str(bot_data.id_canal_vip).strip())
+                            except: c_id = bot_data.id_canal_vip
                             
-                            # 3. Desbanir Imediatamente (Limpa a Blacklist)
-                            tb.unban_chat_member(canal_id, int(user.telegram_id))
+                            # Kick Suave
+                            tb.ban_chat_member(c_id, int(user.telegram_id))
+                            tb.unban_chat_member(c_id, int(user.telegram_id))
                             
-                            # 4. Atualiza DB para 'expired'
                             user.status = 'expired'
                             db.commit()
                             
-                            # 5. Avisa o usuário
-                            try:
-                                tb.send_message(user.telegram_id, "Seu plano VIP expirou! 😢\nPara voltar ao canal, renove sua assinatura digitando /start")
+                            try: tb.send_message(user.telegram_id, "Seu plano venceu! Digite /start para renovar.")
                             except: pass
-                            
                         except Exception as e_kick:
-                            logger.error(f"Erro ao remover membro {user.telegram_id}: {e_kick}")
+                            logger.error(f"Erro kick: {e_kick}")
                             user.status = 'expired'
                             db.commit()
-                            
-            except Exception as e_bot:
-                logger.error(f"Erro ao processar bot {bot_data.nome}: {e_bot}")
-                
+            except: pass
     finally:
         db.close()
 
@@ -668,15 +653,13 @@ def remover_passo_flow(bot_id: int, step_id: int, db: Session = Depends(get_db))
     return {"status": "deleted"}
 
 # =========================================================
-# 💰 ROTA WEBHOOK PIX (HÍBRIDA + CORREÇÃO DE ID)
+# 💰 ROTA WEBHOOK PIX (HÍBRIDA + CÁLCULO DE DATA)
 # =========================================================
 @app.post("/webhook/pix")
 async def webhook_pix(request: Request, db: Session = Depends(get_db)):
-    # print("🔔 WEBHOOK PIX CHEGOU!") 
     try:
         body_bytes = await request.body()
         body_str = body_bytes.decode("utf-8")
-        
         if not body_str: return {"status": "ignored", "reason": "empty_body"}
 
         data = {}
@@ -687,7 +670,6 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
                 data = {k: v[0] for k, v in parsed.items()}
             except: return {"status": "error", "reason": "invalid_format"}
 
-        # 3. EXTRAÇÃO INTELIGENTE DO ID (CORREÇÃO DE OURO)
         raw_tx_id = data.get("id") or data.get("external_reference") or data.get("uuid")
         tx_id = str(raw_tx_id).lower() if raw_tx_id else None
         status_pix = str(data.get("status", "")).lower()
@@ -695,23 +677,42 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         if status_pix not in ["paid", "approved", "completed", "succeeded"]:
             return {"status": "ignored"}
 
-        # 4. BUSCA O PEDIDO (USANDO txid CORRETO)
+        # Busca Pedido
         pedido = db.query(Pedido).filter(Pedido.txid == tx_id).first()
+        if not pedido: return {"status": "ok", "msg": "Order not found"}
+        if pedido.status == "paid": return {"status": "ok", "msg": "Already paid"}
 
-        if not pedido:
-            # print(f"❌ Pedido {tx_id} não encontrado no banco.")
-            return {"status": "ok", "msg": "Order not found"}
+        # --- [CORREÇÃO] CÁLCULO DE EXPIRAÇÃO NO PAGAMENTO ---
+        agora = datetime.utcnow()
+        data_final = None # Se ficar None, é vitalício
+        
+        # Busca o plano original para saber a duração
+        if pedido.plano_id:
+            plano_db = db.query(PlanoConfig).filter(PlanoConfig.id == pedido.plano_id).first()
+            if plano_db and plano_db.dias_duracao > 0:
+                # Adiciona os dias configurados (Ex: 1 dia, 30 dias)
+                data_final = agora + timedelta(days=plano_db.dias_duracao)
+        
+        # Se não achou pelo ID, tenta fallback pelo nome (lógica antiga de segurança)
+        if not data_final:
+            nome = (pedido.plano_nome or "").lower()
+            if "24" in nome or "diario" in nome or "1 dia" in nome:
+                data_final = agora + timedelta(days=1)
+            elif "semanal" in nome:
+                data_final = agora + timedelta(days=7)
+            elif "trimestral" in nome:
+                data_final = agora + timedelta(days=90)
+            elif "mensal" in nome:
+                data_final = agora + timedelta(days=30)
+            # Se for "vital" ou "mega", data_final continua None (Vitalício)
 
-        if pedido.status == "paid":
-            return {"status": "ok", "msg": "Already paid"}
-
-        # 5. ATUALIZA BANCO
         pedido.status = "paid"
         pedido.mensagem_enviada = True
+        pedido.data_aprovacao = agora
+        pedido.data_expiracao = data_final # <--- SALVA A DATA AQUI
         db.commit()
-        # print(f"✅ Pedido {tx_id} APROVADO!")
         
-        # 6. ENTREGA O ACESSO
+        # Entrega o Acesso
         try:
             bot_data = db.query(Bot).filter(Bot.id == pedido.bot_id).first()
             if bot_data:
@@ -723,23 +724,15 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
                 except: pass
 
                 convite = tb.create_chat_invite_link(chat_id=canal_id, member_limit=1, name=f"Venda {pedido.first_name}")
-                
                 msg = f"✅ <b>Pagamento Confirmado!</b>\n\nSeu acesso exclusivo:\n👉 {convite.invite_link}"
                 tb.send_message(int(pedido.telegram_id), msg, parse_mode="HTML")
-                # print("🏆 LINK ENVIADO!")
-            else:
-                pass
-                # print("❌ Bot não encontrado.")
-
         except Exception as e_tg:
             logger.error(f"❌ Erro Telegram: {e_tg}")
-            try: tb.send_message(int(pedido.telegram_id), "✅ Pagamento recebido! Link sendo gerado.")
-            except: pass
 
         return {"status": "received"}
 
     except Exception as e:
-        logger.error(f"❌ ERRO CRÍTICO NO WEBHOOK: {e}")
+        logger.error(f"❌ ERRO WEBHOOK: {e}")
         return {"status": "error"}
 
 # =========================================================
@@ -770,25 +763,35 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                     if member.is_bot: continue
                     user_id = str(member.id)
                     
-                    # 1. Busca se tem pedido PAGO e VÁLIDO no banco
+                    # 1. Busca pedido PAGO
                     pedido = db.query(Pedido).filter(
                         Pedido.bot_id == bot_db.id,
-                        Pedido.telegram_id == user_id
+                        Pedido.telegram_id == user_id,
+                        Pedido.status == 'paid'
                     ).order_by(text("created_at DESC")).first()
                     
                     acesso_autorizado = False
-                    if pedido and pedido.status == 'paid':
-                        dias = 30
-                        nome = (pedido.plano_nome or "").lower()
-                        
-                        if "vital" in nome or "mega" in nome: acesso_autorizado = True
+                    
+                    if pedido:
+                        # [CORREÇÃO] Lógica Híbrida: Usa data salva OU calcula na hora
+                        if pedido.data_expiracao:
+                            # Se tem data salva, usa ela (Mais preciso)
+                            if datetime.utcnow() < pedido.data_expiracao:
+                                acesso_autorizado = True
                         else:
-                            if "diario" in nome or "24" in nome: dias = 1
-                            elif "trimestral" in nome: dias = 90
-                            elif "semanal" in nome: dias = 7
-                            
-                            validade = pedido.created_at + timedelta(days=dias)
-                            if datetime.utcnow() < validade: acesso_autorizado = True
+                            # Lógica Antiga (Fallback por nome se a data for Null)
+                            nome = (pedido.plano_nome or "").lower()
+                            if "vital" in nome or "mega" in nome: 
+                                acesso_autorizado = True
+                            else:
+                                dias = 30
+                                if "diario" in nome or "24" in nome: dias = 1
+                                elif "trimestral" in nome: dias = 90
+                                elif "semanal" in nome: dias = 7
+                                
+                                # Calcula baseado na criação + dias
+                                if datetime.utcnow() < (pedido.created_at + timedelta(days=dias)):
+                                    acesso_autorizado = True
                     
                     if not acesso_autorizado:
                         try:
