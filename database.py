@@ -192,12 +192,13 @@ class Pedido(Base):
     # --- [ATENÇÃO AQUI: Mantivemos txid para compatibilidade] ---
     txid = Column(String, unique=True, index=True) 
     qr_code = Column(Text, nullable=True)
-    transaction_id = Column(String, nullable=True) # Fallback antigo se necessário
+    transaction_id = Column(String, unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+    role = Column(String, default="user")
     
     # Controle de Acesso
     data_aprovacao = Column(DateTime, nullable=True)
     data_expiracao = Column(DateTime, nullable=True)
     link_acesso = Column(String, nullable=True)
     mensagem_enviada = Column(Boolean, default=False)
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
