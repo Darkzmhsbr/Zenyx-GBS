@@ -166,35 +166,22 @@ class BotFlowStep(Base):
     bot = relationship("Bot", back_populates="steps")
 
 # =========================================================
-# 🛒 TABELA DE PEDIDOS / TRANSAÇÕES
+# 🛒 TABELA DE PEDIDOS
 # =========================================================
 class Pedido(Base):
     __tablename__ = "pedidos"
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, ForeignKey("bots.id"))
-    
-    # Dados do Cliente
-    telegram_id = Column(String)
+    bot = relationship("Bot", back_populates="pedidos")
+    transaction_id = Column(String, unique=True, index=True)
+    telegram_id = Column(String, index=True)
     first_name = Column(String, nullable=True)
     username = Column(String, nullable=True)
-    
-    # Dados da Compra
-    # --- [CORREÇÃO CRÍTICA: Mantendo nomes antigos + novo] ---
-    plano_nome = Column(String, nullable=True) # Mantido da V1
-    plano_id = Column(Integer, nullable=True)  # Novo da V2 (Que estava faltando)
-    
+    role = Column(String, default="user") 
+    custom_expiration = Column(DateTime, nullable=True) 
+    plano_nome = Column(String)
     valor = Column(Float)
-    status = Column(String, default="pending") 
-    
-    # --- [ATENÇÃO AQUI: Mantivemos txid para compatibilidade] ---
-    txid = Column(String, unique=True, index=True) 
-    qr_code = Column(Text, nullable=True)
-    transaction_id = Column(String, nullable=True) # Fallback antigo se necessário
-    
-    # Controle de Acesso
-    data_aprovacao = Column(DateTime, nullable=True)
-    data_expiracao = Column(DateTime, nullable=True)
-    link_acesso = Column(String, nullable=True)
-    mensagem_enviada = Column(Boolean, default=False)
-    
     created_at = Column(DateTime, default=datetime.utcnow)
+    status = Column(String, default="pending") 
+    qr_code = Column(String, nullable=True)
+    mensagem_enviada = Column(Boolean, default=False)
