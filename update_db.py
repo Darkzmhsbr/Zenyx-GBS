@@ -14,39 +14,47 @@ def adicionar_colunas():
     with engine.connect() as conn:
         # LISTA DE COMANDOS CRÍTICOS
         comandos = [
-            # 1. Correção para o erro da Tabela Pedidos
-            "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
-            "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_nome VARCHAR;",
-            
-            # 2. Correção para o erro Transaction ID (Garante que txid exista)
-            "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS txid VARCHAR;",
-            
-            # 3. Campos da V2 (Flow Dinâmico)
-            "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
-            "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
-            "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
-            "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;",
-            
-            # 4. Remarketing Avançado
-            "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS target VARCHAR DEFAULT 'todos';",
-            "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS type VARCHAR DEFAULT 'massivo';",
-            "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
-            "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS promo_price FLOAT;",
-            "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS expiration_at TIMESTAMP WITHOUT TIME ZONE;",
-            
-            # 5. Tabela Nova (Passos do Flow)
-            """
-            CREATE TABLE IF NOT EXISTS bot_flow_steps (
-                id SERIAL PRIMARY KEY,
-                bot_id INTEGER REFERENCES bots(id),
-                step_order INTEGER DEFAULT 1,
-                msg_texto TEXT,
-                msg_media VARCHAR,
-                btn_texto VARCHAR DEFAULT 'Próximo ▶️',
-                created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now()
-            );
-            """
-        ]
+                # --- CORREÇÃO PLANOS (O CAUSADOR DO ERRO ATUAL) ---
+                "ALTER TABLE planos_config ADD COLUMN IF NOT EXISTS key_id VARCHAR;",
+                "ALTER TABLE planos_config ADD COLUMN IF NOT EXISTS descricao TEXT;",
+                "ALTER TABLE planos_config ADD COLUMN IF NOT EXISTS preco_cheio FLOAT;",
+
+                # --- CORREÇÃO PEDIDOS ---
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS plano_nome VARCHAR;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS txid VARCHAR;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS qr_code TEXT;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS transaction_id VARCHAR;", 
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS data_aprovacao TIMESTAMP WITHOUT TIME ZONE;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS data_expiracao TIMESTAMP WITHOUT TIME ZONE;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS link_acesso VARCHAR;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS mensagem_enviada BOOLEAN DEFAULT FALSE;",
+
+                # --- CORREÇÃO FLOW & REMARKETING ---
+                "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
+                "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
+                "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
+                "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;",
+                
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS target VARCHAR DEFAULT 'todos';",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS type VARCHAR DEFAULT 'massivo';",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS promo_price FLOAT;",
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS expiration_at TIMESTAMP WITHOUT TIME ZONE;",
+                
+                # --- TABELA NOVA (V2) ---
+                """
+                CREATE TABLE IF NOT EXISTS bot_flow_steps (
+                    id SERIAL PRIMARY KEY,
+                    bot_id INTEGER REFERENCES bots(id),
+                    step_order INTEGER DEFAULT 1,
+                    msg_texto TEXT,
+                    msg_media VARCHAR,
+                    btn_texto VARCHAR DEFAULT 'Próximo ▶️',
+                    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now()
+                );
+                """
+            ]
 
         for cmd in comandos:
             try:
