@@ -1035,45 +1035,37 @@ Copie o código abaixo para garantir sua vaga:
         return {"status": "error"}
 
 # =========================================================
-# 👥 ROTAS DE CRM (BASE DE CONTATOS)
+# 👥 ROTAS DE CRM (BASE DE CONTATOS CORRIGIDA + FILTROS INTELIGENTES)
 # =========================================================
 @app.get("/api/admin/contacts")
-def listar_contatos(status: str = "todos", page: int = 1, limit: int = 100, db: Session = Depends(get_db)):
-    query = db.query(Pedido).order_by(Pedido.created_at.desc())
+def listar_contatos(bot_id: Optional[int] = None, status: str = "todos", db: Session = Depends(get_db)):
+    query = db.query(Pedido)
     
-    if status == "pagantes": query = query.filter(Pedido.status == 'paid')
-    elif status == "pendentes": query = query.filter(Pedido.status == 'pending')
-    elif status == "expirados": query = query.filter(Pedido.status == 'expired')
+    # 1. Filtro de Bot
+    if bot_id:
+        query = query.filter(Pedido.bot_id == bot_id)
     
-    total_registros = query.count()
+    # 2. Filtros de Status (Lógica Reforçada)
+    if status == "pagantes":
+        # Pega quem pagou ou foi aprovado manualmente
+        query = query.filter(Pedido.status.in_(['paid', 'active', 'approved']))
     
-    # Paginação
-    offset = (page - 1) * limit
-    pedidos = query.offset(offset).limit(limit).all()
+    elif status == "pendentes":
+        # Pega pendentes (e garante que não pega os expirados antigos)
+        query = query.filter(Pedido.status == "pending")
     
-    # Formata retorno
-    users_list = []
-    for p in pedidos:
-        users_list.append({
-            "id": p.id,
-            "telegram_id": p.telegram_id,
-            "first_name": p.first_name,
-            "username": p.username,
-            "plano_nome": p.plano_nome,
-            "valor": p.valor,
-            "status": p.status,
-            "created_at": p.created_at,
-            "custom_expiration": p.custom_expiration,
-            "role": p.role
-        })
-        
-    return {
-        "users": users_list,
-        "total": total_registros,
-        "page": page,
-        "pages": (total_registros + limit - 1) // limit
-    }
-
+    elif status == "expirados":
+        # Pega quem está marcado como expired OU quem já venceu a data (mesmo que status seja paid)
+        # Nota: Para performance, focamos no status, mas podemos adicionar verificação de data se precisar
+        query = query.filter(Pedido.status == "expired")
+    
+    # Ordena: Pendentes primeiro (para cobrar), depois data
+    contatos = query.order_by(
+        desc(Pedido.status == 'pending'), 
+        desc(Pedido.created_at)
+    ).all()
+    
+    return contatos
 
 # --- NOVA ROTA: DISPARO INDIVIDUAL (VIA HISTÓRICO) ---
 class IndividualRemarketingRequest(BaseModel):
@@ -1319,80 +1311,6 @@ def enviar_remarketing(payload: RemarketingRequest, background_tasks: Background
 
     background_tasks.add_task(processar_envio_remarketing, payload.bot_id, payload, db)
     return {"status": "enviando", "msg": "Campanha iniciada!"}
-
-# =========================================================
-# 🛠️ ROTAS DE GESTÃO DE USUÁRIOS (CRM)
-# =========================================================
-
-@app.put("/api/admin/users/{user_id}")
-def atualizar_usuario(user_id: int, dados: UserUpdate, db: Session = Depends(get_db)):
-    usuario = db.query(Pedido).filter(Pedido.id == user_id).first()
-    if not usuario:
-        raise HTTPException(status_code=404, detail="Usuário não encontrado")
-    
-    if dados.role: usuario.role = dados.role
-    if dados.status: usuario.status = dados.status
-    
-    # Lógica de Data Personalizada
-    if dados.custom_expiration:
-        if dados.custom_expiration == "vitalicio":
-            # Define uma data muito distante (ano 3000) ou nula + flag
-            # Aqui vamos usar a convenção: nome do plano ganha (VITALÍCIO)
-            if "VITALÍCIO" not in (usuario.plano_nome or ""):
-                usuario.plano_nome = f"{usuario.plano_nome or 'Plano'} (VITALÍCIO)"
-            usuario.custom_expiration = None # Limpa data manual pois é vitalício pelo nome
-        elif dados.custom_expiration == "remover":
-            usuario.custom_expiration = None
-            # Remove tag vitalício se tiver
-            if usuario.plano_nome:
-                usuario.plano_nome = usuario.plano_nome.replace("(VITALÍCIO)", "").strip()
-        else:
-            # Data específica YYYY-MM-DD
-            try:
-                data_obj = datetime.strptime(dados.custom_expiration, "%Y-%m-%d")
-                usuario.custom_expiration = data_obj
-            except: pass
-            
-    db.commit()
-    return {"status": "ok", "msg": "Usuário atualizado"}
-
-@app.post("/api/admin/users/{user_id}/resend-access")
-def reenviar_acesso(user_id: int, db: Session = Depends(get_db)):
-    usuario = db.query(Pedido).filter(Pedido.id == user_id).first()
-    if not usuario or usuario.status != 'paid':
-        raise HTTPException(status_code=400, detail="Usuário não encontrado ou não pagante.")
-    
-    bot_data = db.query(Bot).filter(Bot.id == usuario.bot_id).first()
-    if not bot_data:
-        raise HTTPException(status_code=404, detail="Bot não encontrado.")
-        
-    try:
-        tb = telebot.TeleBot(bot_data.token)
-        
-        # Tenta converter ID do canal
-        try: canal_id = int(str(bot_data.id_canal_vip).strip())
-        except: canal_id = bot_data.id_canal_vip
-
-        # Tenta desbanir antes (garantia)
-        try: tb.unban_chat_member(canal_id, int(usuario.telegram_id))
-        except: pass
-
-        # Gera Link Único
-        convite = tb.create_chat_invite_link(
-            chat_id=canal_id, 
-            member_limit=1, 
-            name=f"Reenvio {usuario.first_name}"
-        )
-        
-        msg = f"🔄 <b>Reenvio de Acesso</b>\n\nSeu link de acesso ao canal VIP:\n👉 {convite.invite_link}\n\n<i>Este link é único e válido apenas para você.</i>"
-        tb.send_message(int(usuario.telegram_id), msg, parse_mode="HTML")
-        
-        return {"status": "sent", "msg": "Link reenviado com sucesso!"}
-        
-    except Exception as e:
-        logger.error(f"Erro ao reenviar acesso: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro no Telegram: {str(e)}")
-
 
 @app.get("/api/admin/remarketing/status")
 def status_remarketing():
