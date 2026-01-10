@@ -380,6 +380,14 @@ class StepReorder(BaseModel):
     step_id: int
     new_order: int
 
+# Modelo para edição manual de usuário
+class UserUpdateCRM(BaseModel):
+    first_name: Optional[str] = None
+    username: Optional[str] = None
+    # O Frontend manda data como string ou timestamp, vamos aceitar string
+    custom_expiration: Optional[str] = None 
+    status: Optional[str] = None
+
 # [V2] Modelo Novo
 class RemarketingRequest(BaseModel):
     bot_id: int
@@ -509,6 +517,42 @@ def deletar_bot(bot_id: int, db: Session = Depends(get_db)):
     db.delete(bot_db)
     db.commit()
     return {"status": "deleted", "msg": "Bot removido com sucesso"}
+
+
+# =========================================================
+# ✏️ ROTA DE EDIÇÃO MANUAL (CRM) - CORRIGIDA
+# =========================================================
+@app.put("/api/admin/users/{user_id}") # Verifique se o front chama por ID ou telegram_id
+def update_user_crm(user_id: str, dados: UserUpdateCRM, db: Session = Depends(get_db)):
+    # Tenta achar pelo ID numérico do banco OU pelo Telegram ID
+    pedido = db.query(Pedido).filter(
+        (Pedido.id == int(user_id) if user_id.isdigit() else False) | 
+        (Pedido.telegram_id == user_id)
+    ).first()
+    
+    if not pedido:
+        raise HTTPException(404, "Usuário não encontrado")
+
+    if dados.first_name: pedido.first_name = dados.first_name
+    if dados.username: pedido.username = dados.username
+    if dados.status: pedido.status = dados.status
+
+    # Lógica da Data Manual
+    if dados.custom_expiration:
+        try:
+            # O front costuma mandar "YYYY-MM-DDTHH:MM..."
+            # Vamos tentar converter com segurança
+            nova_data = datetime.fromisoformat(dados.custom_expiration.replace("Z", ""))
+            
+            # SALVA NAS DUAS COLUNAS (ESPELHAMENTO)
+            pedido.data_expiracao = nova_data
+            pedido.custom_expiration = nova_data
+        except:
+            # Se vier vazio ou inválido, pode ser uma intenção de tornar Vitalício
+            pass 
+
+    db.commit()
+    return {"status": "success", "msg": "Dados atualizados!"}
 
 # =========================================================
 # 🛡️ GESTÃO DE ADMINISTRADORES
@@ -704,30 +748,38 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         agora = datetime.utcnow()
         data_final = None # Se ficar None, é vitalício
         
-        # Busca o plano original para saber a duração
+       # -----------------------------------------------------------
+        # 🗓️ CÁLCULO DE DATAS INTELIGENTE (ESPELHAMENTO)
+        # -----------------------------------------------------------
+        agora = datetime.utcnow()
+        data_final = None 
+        
+        # 1. Pega a duração configurada no Plano (Prioridade)
         if pedido.plano_id:
             plano_db = db.query(PlanoConfig).filter(PlanoConfig.id == pedido.plano_id).first()
-            if plano_db and plano_db.dias_duracao > 0:
-                # Adiciona os dias configurados (Ex: 1 dia, 30 dias)
+            if plano_db and plano_db.dias_duracao and plano_db.dias_duracao > 0:
                 data_final = agora + timedelta(days=plano_db.dias_duracao)
         
-        # Se não achou pelo ID, tenta fallback pelo nome (lógica antiga de segurança)
-        if not data_final:
-            nome = (pedido.plano_nome or "").lower()
-            if "24" in nome or "diario" in nome or "1 dia" in nome:
-                data_final = agora + timedelta(days=1)
-            elif "semanal" in nome:
-                data_final = agora + timedelta(days=7)
-            elif "trimestral" in nome:
-                data_final = agora + timedelta(days=90)
-            elif "mensal" in nome:
-                data_final = agora + timedelta(days=30)
-            # Se for "vital" ou "mega", data_final continua None (Vitalício)
+        # 2. Fallback pelo nome (Caso não ache o ID)
+        if not data_final and pedido.plano_nome:
+            nome = pedido.plano_nome.lower()
+            if "vital" not in nome and "mega" not in nome:
+                dias = 30 # Padrão
+                if "diario" in nome or "24" in nome: dias = 1
+                elif "semanal" in nome: dias = 7
+                elif "trimestral" in nome: dias = 90
+                elif "anual" in nome: dias = 365
+                data_final = agora + timedelta(days=dias)
 
+        # 3. ATUALIZA O BANCO (GRAVA NAS DUAS COLUNAS!)
         pedido.status = "paid"
         pedido.mensagem_enviada = True
         pedido.data_aprovacao = agora
-        pedido.data_expiracao = data_final # <--- SALVA A DATA AQUI
+        
+        # AQUI RESOLVE O "VITALÍCIO":
+        pedido.data_expiracao = data_final      # Para o futuro
+        pedido.custom_expiration = data_final   # Para o Frontend V1 (AGORA VAI APARECER!)
+        
         db.commit()
         
         # Entrega o Acesso
