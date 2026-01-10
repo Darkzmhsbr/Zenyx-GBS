@@ -10,17 +10,17 @@ if DATABASE_URL.startswith("postgres://"):
 engine = create_engine(DATABASE_URL)
 
 def adicionar_colunas():
-    print("🔄 Iniciando atualização do banco de dados...")
+    print("🔄 Iniciando atualização do banco de dados (Zenyx V2)...")
     with engine.connect() as conn:
         try:
             comandos = [
-                # --- FLUXO DE MENSAGENS ---
+                # --- FLUXO DE MENSAGENS (ANTIGO/FIXO) ---
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS autodestruir_1 BOOLEAN DEFAULT FALSE;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_texto TEXT;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS msg_2_media VARCHAR;",
                 "ALTER TABLE bot_flows ADD COLUMN IF NOT EXISTS mostrar_planos_2 BOOLEAN DEFAULT TRUE;",
                 
-                # --- REMARKETING AVANÇADO (CRÍTICO) ---
+                # --- REMARKETING AVANÇADO ---
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS target VARCHAR DEFAULT 'todos';",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS type VARCHAR DEFAULT 'massivo';",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS plano_id INTEGER;",
@@ -30,14 +30,28 @@ def adicionar_colunas():
                 # --- RECORRÊNCIA ---
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS dia_atual INTEGER DEFAULT 0;",
                 "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS data_inicio TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
-                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS proxima_execucao TIMESTAMP WITHOUT TIME ZONE;"
+                "ALTER TABLE remarketing_campaigns ADD COLUMN IF NOT EXISTS proxima_execucao TIMESTAMP WITHOUT TIME ZONE;",
+                
+                # --- [NOVO] TABELA DE FLUXO DINÂMICO (V2) ---
+                # Cria a tabela de passos se ela não existir
+                """
+                CREATE TABLE IF NOT EXISTS bot_flow_steps (
+                    id SERIAL PRIMARY KEY,
+                    bot_id INTEGER REFERENCES bots(id),
+                    step_order INTEGER DEFAULT 1,
+                    msg_texto TEXT,
+                    msg_media VARCHAR,
+                    btn_texto VARCHAR DEFAULT 'Próximo ▶️',
+                    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now()
+                );
+                """
             ]
 
             for cmd in comandos:
                 try:
                     conn.execute(text(cmd))
                 except Exception as e_cmd:
-                    print(f"⚠️ Aviso (Coluna pode já existir): {e_cmd}")
+                    print(f"⚠️ Aviso (Comando pode já ter sido aplicado): {e_cmd}")
 
             conn.commit()
             print("✅ Banco de dados atualizado com sucesso!")
