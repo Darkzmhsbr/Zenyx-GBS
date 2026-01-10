@@ -48,6 +48,11 @@ class Bot(Base):
     token = Column(String, unique=True, index=True)
     id_canal_vip = Column(String)
     status = Column(String, default="desconectado")
+
+    # --- NOVOS CAMPOS QUE FALTAVAM ---
+    admin_principal_id = Column(String, nullable=True)
+    id_canal_vip = Column(String, nullable=True)
+    username = Column(String, nullable=True) # <--- ADICIONE ESTA LINHA OBRIGATORIAMENTE
     
     # NOVO CAMPO: Admin Principal para notificações
     admin_principal_id = Column(String, nullable=True) 
@@ -127,7 +132,7 @@ class RemarketingCampaign(Base):
     # Configurações
     type = Column(String, default="massivo") 
     target = Column(String, default="todos") 
-    config = Column(Text) 
+    config = Column(Text) # JSON com a msg, media, etc
     status = Column(String, default="concluido")
     
     # Controle de execução (Recorrência)
@@ -135,10 +140,10 @@ class RemarketingCampaign(Base):
     data_inicio = Column(DateTime, default=datetime.utcnow)
     proxima_execucao = Column(DateTime, nullable=True)
     
-    # Oferta e Expiração
-    plano_id = Column(Integer, nullable=True)       
-    promo_price = Column(Float, nullable=True)      
-    expiration_at = Column(DateTime, nullable=True) 
+    # --- [NOVO] Oferta e Expiração ---
+    plano_id = Column(Integer, nullable=True)       # Qual plano é a base
+    promo_price = Column(Float, nullable=True)      # Valor com desconto
+    expiration_at = Column(DateTime, nullable=True) # Data exata que expira
     
     # Métricas
     total_leads = Column(Integer, default=0)
