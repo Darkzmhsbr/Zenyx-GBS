@@ -520,40 +520,79 @@ def deletar_bot(bot_id: int, db: Session = Depends(get_db)):
 
 
 # =========================================================
-# ✏️ ROTA DE EDIÇÃO MANUAL (CRM) - CORRIGIDA
+# 🛠️ ROTAS DE GESTÃO DE USUÁRIOS (CRM)
 # =========================================================
-@app.put("/api/admin/users/{user_id}") # Verifique se o front chama por ID ou telegram_id
-def update_user_crm(user_id: str, dados: UserUpdateCRM, db: Session = Depends(get_db)):
-    # Tenta achar pelo ID numérico do banco OU pelo Telegram ID
-    pedido = db.query(Pedido).filter(
-        (Pedido.id == int(user_id) if user_id.isdigit() else False) | 
-        (Pedido.telegram_id == user_id)
-    ).first()
+
+@app.put("/api/admin/users/{user_id}")
+def atualizar_usuario(user_id: int, dados: UserUpdate, db: Session = Depends(get_db)):
+    usuario = db.query(Pedido).filter(Pedido.id == user_id).first()
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
     
-    if not pedido:
-        raise HTTPException(404, "Usuário não encontrado")
-
-    if dados.first_name: pedido.first_name = dados.first_name
-    if dados.username: pedido.username = dados.username
-    if dados.status: pedido.status = dados.status
-
-    # Lógica da Data Manual
+    if dados.role: usuario.role = dados.role
+    if dados.status: usuario.status = dados.status
+    
+    # Lógica de Data Personalizada
     if dados.custom_expiration:
-        try:
-            # O front costuma mandar "YYYY-MM-DDTHH:MM..."
-            # Vamos tentar converter com segurança
-            nova_data = datetime.fromisoformat(dados.custom_expiration.replace("Z", ""))
+        if dados.custom_expiration == "vitalicio":
+            # Define uma data muito distante (ano 3000) ou nula + flag
+            # Aqui vamos usar a convenção: nome do plano ganha (VITALÍCIO)
+            if "VITALÍCIO" not in (usuario.plano_nome or ""):
+                usuario.plano_nome = f"{usuario.plano_nome or 'Plano'} (VITALÍCIO)"
+            usuario.custom_expiration = None # Limpa data manual pois é vitalício pelo nome
+        elif dados.custom_expiration == "remover":
+            usuario.custom_expiration = None
+            # Remove tag vitalício se tiver
+            if usuario.plano_nome:
+                usuario.plano_nome = usuario.plano_nome.replace("(VITALÍCIO)", "").strip()
+        else:
+            # Data específica YYYY-MM-DD
+            try:
+                data_obj = datetime.strptime(dados.custom_expiration, "%Y-%m-%d")
+                usuario.custom_expiration = data_obj
+            except: pass
             
-            # SALVA NAS DUAS COLUNAS (ESPELHAMENTO)
-            pedido.data_expiracao = nova_data
-            pedido.custom_expiration = nova_data
-        except:
-            # Se vier vazio ou inválido, pode ser uma intenção de tornar Vitalício
-            pass 
-
     db.commit()
-    return {"status": "success", "msg": "Dados atualizados!"}
+    return {"status": "ok", "msg": "Usuário atualizado"}
 
+@app.post("/api/admin/users/{user_id}/resend-access")
+def reenviar_acesso(user_id: int, db: Session = Depends(get_db)):
+    usuario = db.query(Pedido).filter(Pedido.id == user_id).first()
+    if not usuario or usuario.status != 'paid':
+        raise HTTPException(status_code=400, detail="Usuário não encontrado ou não pagante.")
+    
+    bot_data = db.query(Bot).filter(Bot.id == usuario.bot_id).first()
+    if not bot_data:
+        raise HTTPException(status_code=404, detail="Bot não encontrado.")
+        
+    try:
+        tb = telebot.TeleBot(bot_data.token)
+        
+        # Tenta converter ID do canal
+        try: canal_id = int(str(bot_data.id_canal_vip).strip())
+        except: canal_id = bot_data.id_canal_vip
+
+        # Tenta desbanir antes (garantia)
+        try: tb.unban_chat_member(canal_id, int(usuario.telegram_id))
+        except: pass
+
+        # Gera Link Único
+        convite = tb.create_chat_invite_link(
+            chat_id=canal_id, 
+            member_limit=1, 
+            name=f"Reenvio {usuario.first_name}"
+        )
+        
+        msg = f"🔄 <b>Reenvio de Acesso</b>\n\nSeu link de acesso ao canal VIP:\n👉 {convite.invite_link}\n\n<i>Este link é único e válido apenas para você.</i>"
+        tb.send_message(int(usuario.telegram_id), msg, parse_mode="HTML")
+        
+        return {"status": "sent", "msg": "Link reenviado com sucesso!"}
+        
+    except Exception as e:
+        logger.error(f"Erro ao reenviar acesso: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro no Telegram: {str(e)}")
+
+        
 # =========================================================
 # 🛡️ GESTÃO DE ADMINISTRADORES
 # =========================================================
