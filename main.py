@@ -2357,4 +2357,39 @@ async def tg_wh(token: str, req: Request, db: Session = Depends(get_db)):
 
 @app.get("/")
 def home():
+
     return {"status": "Zenyx SaaS Online - Banco Atualizado"}
+@app.get("/admin/fix-usernames")
+def fix_bot_usernames(db: Session = Depends(get_db)):
+    """
+    Atualiza o username de todos os bots que não têm.
+    Execute UMA VEZ apenas.
+    """
+    import telebot
+    
+    bots = db.query(Bot).all()
+    updated = []
+    errors = []
+    
+    for bot in bots:
+        if not bot.username or bot.username == "":
+            try:
+                tb = telebot.TeleBot(bot.token)
+                bot_info = tb.get_me()
+                
+                if hasattr(bot_info, 'username'):
+                    bot.username = bot_info.username
+                    updated.append(f"{bot.nome} → @{bot_info.username}")
+                else:
+                    errors.append(f"{bot.nome} → Sem username no Telegram")
+            except Exception as e:
+                errors.append(f"{bot.nome} → Erro: {str(e)}")
+    
+    db.commit()
+    
+    return {
+        "status": "ok",
+        "updated": updated,
+        "errors": errors,
+        "total_fixed": len(updated)
+    }
