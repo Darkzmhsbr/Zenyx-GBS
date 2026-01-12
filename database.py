@@ -3,6 +3,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.pool import QueuePool
+from sqlalchemy.sql import func
 from datetime import datetime
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -152,7 +153,7 @@ class BotFlowStep(Base):
     bot = relationship("Bot", back_populates="steps")
 
 # =========================================================
-# 🛒 PEDIDOS
+# 🛒 PEDIDOS (ATUALIZADO COM CAMPOS DE FUNIL)
 # =========================================================
 class Pedido(Base):
     __tablename__ = "pedidos"
@@ -180,3 +181,51 @@ class Pedido(Base):
     mensagem_enviada = Column(Boolean, default=False)
     
     created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # ============================================================
+    # 🔥 NOVOS CAMPOS - FUNIL DE VENDAS
+    # ============================================================
+    status_funil = Column(String(20), default='meio')
+    funil_stage = Column(String(20), default='lead_quente')
+    
+    primeiro_contato = Column(DateTime(timezone=True))
+    escolheu_plano_em = Column(DateTime(timezone=True))
+    gerou_pix_em = Column(DateTime(timezone=True))
+    pagou_em = Column(DateTime(timezone=True))
+    
+    dias_ate_compra = Column(Integer, default=0)
+    ultimo_remarketing = Column(DateTime(timezone=True))
+    total_remarketings = Column(Integer, default=0)
+    
+    origem = Column(String(50), default='bot')
+
+
+# =========================================================
+# 🎯 NOVA TABELA: LEADS (TOPO DO FUNIL)
+# =========================================================
+class Lead(Base):
+    """
+    Tabela de Leads (TOPO do funil)
+    Armazena usuários que APENAS deram /start no bot
+    """
+    __tablename__ = "leads"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, nullable=False)  # Telegram ID
+    nome = Column(String)
+    username = Column(String)
+    bot_id = Column(Integer, ForeignKey('bots.id'))
+    
+    # Classificação
+    status = Column(String(20), default='topo')
+    funil_stage = Column(String(20), default='lead_frio')
+    
+    # Timestamps
+    primeiro_contato = Column(DateTime(timezone=True), server_default=func.now())
+    ultimo_contato = Column(DateTime(timezone=True))
+    
+    # Métricas
+    total_remarketings = Column(Integer, default=0)
+    ultimo_remarketing = Column(DateTime(timezone=True))
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
