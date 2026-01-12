@@ -3028,50 +3028,44 @@ async def tg_wh(token: str, req: Request, db: Session = Depends(get_db)):
 def home():
 
     return {"status": "Zenyx SaaS Online - Banco Atualizado"}
-@app.get("/admin/clean-duplicates-funil")
-def limpar_duplicatas_funil(db: Session = Depends(get_db)):
-    """Limpa duplicados em LEADS e PEDIDOS"""
+@app.get("/admin/clean-leads-to-pedidos")
+def limpar_leads_que_viraram_pedidos(db: Session = Depends(get_db)):
+    """
+    Remove da tabela LEADS os usuários que já geraram PEDIDOS.
+    Evita duplicação entre TOPO (leads) e TODOS (pedidos).
+    """
     try:
+        total_removidos = 0
         bots = db.query(Bot).all()
-        total_leads_removidos = 0
-        total_pedidos_removidos = 0
         
         for bot in bots:
-            # Limpar LEADS duplicados
-            leads_dup = db.query(Lead.user_id, func.count(Lead.id).label('total')).filter(
-                Lead.bot_id == bot.id
-            ).group_by(Lead.user_id).having(func.count(Lead.id) > 1).all()
-            
-            for user_id, _ in leads_dup:
-                leads = db.query(Lead).filter(
-                    Lead.user_id == user_id, Lead.bot_id == bot.id
-                ).order_by(Lead.primeiro_contato.desc()).all()
-                
-                for lead in leads[1:]:
-                    db.delete(lead)
-                    total_leads_removidos += 1
-            
-            # Limpar PEDIDOS duplicados
-            pedidos_dup = db.query(Pedido.telegram_id, func.count(Pedido.id).label('total')).filter(
+            # Buscar todos os telegram_ids que existem em PEDIDOS
+            pedidos_ids = db.query(Pedido.telegram_id).filter(
                 Pedido.bot_id == bot.id
-            ).group_by(Pedido.telegram_id).having(func.count(Pedido.id) > 1).all()
+            ).distinct().all()
             
-            for telegram_id, _ in pedidos_dup:
-                pedidos = db.query(Pedido).filter(
-                    Pedido.telegram_id == telegram_id, Pedido.bot_id == bot.id
-                ).order_by(Pedido.created_at.desc()).all()
+            pedidos_ids = [str(pid[0]) for pid in pedidos_ids if pid[0]]
+            
+            # Deletar LEADS que têm user_id igual a algum telegram_id dos pedidos
+            for telegram_id in pedidos_ids:
+                leads_para_deletar = db.query(Lead).filter(
+                    Lead.bot_id == bot.id,
+                    Lead.user_id == telegram_id
+                ).all()
                 
-                for pedido in pedidos[1:]:
-                    db.delete(pedido)
-                    total_pedidos_removidos += 1
+                for lead in leads_para_deletar:
+                    db.delete(lead)
+                    total_removidos += 1
         
         db.commit()
+        
         return {
             "status": "ok",
-            "leads_removidos": total_leads_removidos,
-            "pedidos_removidos": total_pedidos_removidos,
-            "total": total_leads_removidos + total_pedidos_removidos
+            "leads_removidos": total_removidos,
+            "mensagem": f"Removidos {total_removidos} leads que viraram pedidos"
         }
+    
     except Exception as e:
         db.rollback()
+        logger.error(f"Erro: {e}")
         return {"status": "error", "mensagem": str(e)}
