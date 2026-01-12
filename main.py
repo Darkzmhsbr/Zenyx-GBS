@@ -17,9 +17,11 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
+from database import Lead  # Não esqueça de importar Lead!
+
 
 # Importa o banco e o script de reparo
-from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, BotFlowStep, Pedido, SystemConfig, RemarketingCampaign, BotAdmin, engine
+from database import SessionLocal, init_db, Bot, PlanoConfig, BotFlow, BotFlowStep, Pedido, SystemConfig, RemarketingCampaign, BotAdmin, Lead, engine
 import update_db 
 
 from migration_v3 import executar_migracao_v3
@@ -48,6 +50,169 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# ============================================================
+# 👇 COLE TODAS AS 5 FUNÇÕES AQUI (DEPOIS DO get_db)
+# ============================================================
+
+# FUNÇÃO 1: CRIAR OU ATUALIZAR LEAD (TOPO)
+def criar_ou_atualizar_lead(
+    db: Session,
+    user_id: str,
+    nome: str,
+    username: str,
+    bot_id: int
+):
+    """
+    Cria ou atualiza um Lead quando usuário dá /start
+    """
+    lead = db.query(Lead).filter(
+        Lead.user_id == user_id,
+        Lead.bot_id == bot_id
+    ).first()
+    
+    agora = datetime.utcnow()
+    
+    if lead:
+        lead.ultimo_contato = agora
+        lead.nome = nome
+        lead.username = username
+        logger.info(f"🔄 Lead atualizado: {nome} (ID: {user_id})")
+    else:
+        lead = Lead(
+            user_id=user_id,
+            nome=nome,
+            username=username,
+            bot_id=bot_id,
+            primeiro_contato=agora,
+            ultimo_contato=agora,
+            status='topo',
+            funil_stage='lead_frio'
+        )
+        db.add(lead)
+        logger.info(f"✅ Novo LEAD criado: {nome} (TOPO - deu /start)")
+    
+    db.commit()
+    db.refresh(lead)
+    return lead
+
+
+# FUNÇÃO 2: MOVER LEAD PARA PEDIDO (MEIO)
+def mover_lead_para_pedido(
+    db: Session,
+    user_id: str,
+    bot_id: int,
+    pedido_id: int
+):
+    """
+    Quando um Lead gera PIX, ele vira Pedido (MEIO)
+    """
+    lead = db.query(Lead).filter(
+        Lead.user_id == user_id,
+        Lead.bot_id == bot_id
+    ).first()
+    
+    pedido = db.query(Pedido).filter(Pedido.id == pedido_id).first()
+    
+    if lead and pedido:
+        pedido.primeiro_contato = lead.primeiro_contato
+        pedido.escolheu_plano_em = datetime.utcnow()
+        pedido.gerou_pix_em = datetime.utcnow()
+        pedido.status_funil = 'meio'
+        pedido.funil_stage = 'lead_quente'
+        
+        db.delete(lead)
+        db.commit()
+        logger.info(f"📊 Lead movido para MEIO (Pedido): {pedido.first_name}")
+    
+    return pedido
+
+
+# FUNÇÃO 3: MARCAR COMO PAGO (FUNDO)
+def marcar_como_pago(
+    db: Session,
+    pedido_id: int
+):
+    """
+    Marca pedido como PAGO (FUNDO do funil)
+    """
+    pedido = db.query(Pedido).filter(Pedido.id == pedido_id).first()
+    
+    if not pedido:
+        return None
+    
+    agora = datetime.utcnow()
+    pedido.pagou_em = agora
+    pedido.status_funil = 'fundo'
+    pedido.funil_stage = 'cliente'
+    
+    if pedido.primeiro_contato:
+        dias = (agora - pedido.primeiro_contato).days
+        pedido.dias_ate_compra = dias
+        logger.info(f"✅ PAGAMENTO APROVADO! {pedido.first_name} - Dias até compra: {dias}")
+    else:
+        pedido.dias_ate_compra = 0
+    
+    db.commit()
+    db.refresh(pedido)
+    return pedido
+
+
+# FUNÇÃO 4: MARCAR COMO EXPIRADO
+def marcar_como_expirado(
+    db: Session,
+    pedido_id: int
+):
+    """
+    Marca pedido como EXPIRADO (PIX venceu)
+    """
+    pedido = db.query(Pedido).filter(Pedido.id == pedido_id).first()
+    
+    if pedido:
+        pedido.status_funil = 'expirado'
+        pedido.funil_stage = 'lead_quente'
+        db.commit()
+        logger.info(f"⏰ PIX EXPIRADO: {pedido.first_name}")
+    
+    return pedido
+
+
+# FUNÇÃO 5: REGISTRAR REMARKETING
+def registrar_remarketing(
+    db: Session,
+    user_id: str,
+    bot_id: int
+):
+    """
+    Registra que usuário recebeu remarketing
+    """
+    agora = datetime.utcnow()
+    
+    # Atualiza Lead (se for TOPO)
+    lead = db.query(Lead).filter(
+        Lead.user_id == user_id,
+        Lead.bot_id == bot_id
+    ).first()
+    
+    if lead:
+        lead.ultimo_remarketing = agora
+        lead.total_remarketings += 1
+        db.commit()
+        logger.info(f"📧 Remarketing registrado (TOPO): {lead.nome}")
+        return
+    
+    # Atualiza Pedido (se for MEIO/EXPIRADO)
+    pedido = db.query(Pedido).filter(
+        Pedido.telegram_id == user_id,
+        Pedido.bot_id == bot_id
+    ).first()
+    
+    if pedido:
+        pedido.ultimo_remarketing = agora
+        pedido.total_remarketings += 1
+        db.commit()
+        logger.info(f"📧 Remarketing registrado (MEIO): {pedido.first_name}")
+
 
 # =========================================================
 # 2. AUTO-REPARO DO BANCO DE DADOS (LISTA MESTRA DE CORREÇÃO)
