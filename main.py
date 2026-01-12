@@ -2526,37 +2526,72 @@ async def tg_wh(token: str, req: Request, db: Session = Depends(get_db)):
 def home():
 
     return {"status": "Zenyx SaaS Online - Banco Atualizado"}
-@app.get("/admin/fix-usernames")
-def fix_bot_usernames(db: Session = Depends(get_db)):
+@app.get("/admin/clean-duplicates")
+def limpar_duplicatas(db: Session = Depends(get_db)):
     """
-    Atualiza o username de todos os bots que não têm.
-    Execute UMA VEZ apenas.
+    Remove pedidos duplicados, mantendo apenas o mais recente de cada usuário.
+    Execute UMA VEZ apenas para limpar dados antigos.
     """
-    import telebot
     
-    bots = db.query(Bot).all()
-    updated = []
-    errors = []
-    
-    for bot in bots:
-        if not bot.username or bot.username == "":
-            try:
-                tb = telebot.TeleBot(bot.token)
-                bot_info = tb.get_me()
+    try:
+        # Busca todos os bots
+        bots = db.query(Bot).all()
+        
+        total_removidos = 0
+        detalhes = []
+        
+        for bot in bots:
+            # Para cada bot, busca usuários duplicados
+            # Query: Agrupa por telegram_id e conta quantos pedidos cada um tem
+            duplicados = db.query(
+                Pedido.telegram_id,
+                func.count(Pedido.id).label('total')
+            ).filter(
+                Pedido.bot_id == bot.id
+            ).group_by(
+                Pedido.telegram_id
+            ).having(
+                func.count(Pedido.id) > 1  # Só pega quem tem mais de 1 pedido
+            ).all()
+            
+            bot_removidos = 0
+            
+            for telegram_id, total in duplicados:
+                # Busca TODOS os pedidos deste usuário neste bot
+                pedidos_usuario = db.query(Pedido).filter(
+                    Pedido.telegram_id == telegram_id,
+                    Pedido.bot_id == bot.id
+                ).order_by(Pedido.created_at.desc()).all()  # Ordena do mais recente ao mais antigo
                 
-                if hasattr(bot_info, 'username'):
-                    bot.username = bot_info.username
-                    updated.append(f"{bot.nome} → @{bot_info.username}")
-                else:
-                    errors.append(f"{bot.nome} → Sem username no Telegram")
-            except Exception as e:
-                errors.append(f"{bot.nome} → Erro: {str(e)}")
+                if len(pedidos_usuario) > 1:
+                    # MANTÉM o primeiro (mais recente)
+                    pedido_manter = pedidos_usuario[0]
+                    
+                    # DELETA os outros (duplicatas antigas)
+                    for pedido_deletar in pedidos_usuario[1:]:
+                        db.delete(pedido_deletar)
+                        bot_removidos += 1
+                    
+                    logger.info(f"✅ Bot {bot.nome}: Mantido pedido #{pedido_manter.id} para {telegram_id}, removidos {len(pedidos_usuario)-1} duplicados")
+            
+            if bot_removidos > 0:
+                detalhes.append(f"Bot '{bot.nome}': {bot_removidos} duplicatas removidas")
+                total_removidos += bot_removidos
+        
+        # Commit das alterações
+        db.commit()
+        
+        return {
+            "status": "ok",
+            "total_removidos": total_removidos,
+            "detalhes": detalhes,
+            "mensagem": f"Limpeza concluída! {total_removidos} duplicatas removidas."
+        }
     
-    db.commit()
-    
-    return {
-        "status": "ok",
-        "updated": updated,
-        "errors": errors,
-        "total_fixed": len(updated)
-    }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Erro ao limpar duplicatas: {e}")
+        return {
+            "status": "error",
+            "mensagem": str(e)
+        }
