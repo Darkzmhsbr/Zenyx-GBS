@@ -1273,9 +1273,15 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             enviar_oferta_final(bot_temp, chat_id, bot_db.fluxo, bot_db.id, db)
             bot_temp.answer_callback_query(update.callback_query.id)
 
-        # --- PROMOÇÕES (mantido igual) ---
+        # ============================================================
+        # TRECHO COMPLETO CORRIGIDO - PROMOÇÕES + CHECKOUT PADRÃO
+        # ============================================================
+
+        # --- PROMOÇÕES (CORRIGIDO) ---
         elif update.callback_query and update.callback_query.data.startswith("promo_"):
             chat_id = update.callback_query.message.chat.id
+            first_name = update.callback_query.from_user.first_name
+            username = update.callback_query.from_user.username
             campanha_uuid = update.callback_query.data.split("_")[1]
             
             campanha = db.query(RemarketingCampaign).filter(
@@ -1294,6 +1300,10 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                 return {"status": "expired"}
 
             plano = db.query(PlanoConfig).filter(PlanoConfig.id == campanha.plano_id).first()
+            if not plano:
+                bot_temp.send_message(chat_id, "❌ Plano não encontrado.")
+                return {"status": "error"}
+            
             preco_final = campanha.promo_price if campanha.promo_price else plano.preco_atual
             
             msg_aguarde = bot_temp.send_message(chat_id, f"⏳ Gerando oferta de R$ {preco_final:.2f}...")
@@ -1306,19 +1316,57 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                 provider_id = pix_data.get("id") or temp_uuid
                 final_tx_id = str(provider_id).lower()
 
-                novo_pedido = Pedido(
-                    bot_id=bot_db.id,
-                    transaction_id=final_tx_id,
-                    telegram_id=str(chat_id),
-                    first_name=update.callback_query.from_user.first_name,
-                    username=update.callback_query.from_user.username,
-                    plano_nome=f"{plano.nome_exibicao} (OFERTA)",
-                    valor=preco_final,
-                    status="pending",
-                    qr_code=qr_code_text
-                )
-                db.add(novo_pedido)
-                db.commit()
+                # ============================================================
+                # [CORREÇÃO] ANTI-DUPLICAÇÃO - VERIFICA SE USUÁRIO JÁ EXISTE
+                # ============================================================
+                pedido_existente = db.query(Pedido).filter(
+                    Pedido.telegram_id == str(chat_id),
+                    Pedido.bot_id == bot_db.id
+                ).first()
+
+                if pedido_existente:
+                    # [CORREÇÃO] ATUALIZA o pedido existente
+                    logger.info(f"📝 [BOT {bot_db.id}] Usuário {chat_id} já existe. Atualizando pedido (PROMO)...")
+                    
+                    pedido_existente.plano_nome = f"{plano.nome_exibicao} (OFERTA)"
+                    pedido_existente.plano_id = plano.id
+                    pedido_existente.valor = preco_final
+                    pedido_existente.status = "pending"
+                    pedido_existente.transaction_id = final_tx_id
+                    pedido_existente.qr_code = qr_code_text
+                    pedido_existente.data_aprovacao = None
+                    pedido_existente.created_at = datetime.utcnow()
+                    
+                    # Se tinha custom_expiration e agora é vitalício, remove
+                    if plano.dias_duracao == 99999:
+                        pedido_existente.custom_expiration = None
+                    
+                    db.commit()
+                    db.refresh(pedido_existente)
+                    
+                    logger.info(f"✅ [BOT {bot_db.id}] Pedido atualizado para {chat_id} (PROMO)")
+                else:
+                    # [MANTÉM] Se não existe, cria um novo
+                    logger.info(f"🆕 [BOT {bot_db.id}] Criando primeiro pedido para {chat_id} (PROMO)...")
+                    
+                    novo_pedido = Pedido(
+                        bot_id=bot_db.id,
+                        transaction_id=final_tx_id,
+                        telegram_id=str(chat_id),
+                        first_name=first_name,
+                        username=username,
+                        plano_nome=f"{plano.nome_exibicao} (OFERTA)",
+                        plano_id=plano.id,
+                        valor=preco_final,
+                        status="pending",
+                        qr_code=qr_code_text,
+                        created_at=datetime.utcnow()
+                    )
+                    db.add(novo_pedido)
+                    db.commit()
+                    db.refresh(novo_pedido)
+                    
+                    logger.info(f"✅ [BOT {bot_db.id}] Pedido criado para {chat_id} (PROMO)")
 
                 try: 
                     bot_temp.delete_message(chat_id, msg_aguarde.message_id)
@@ -1347,15 +1395,17 @@ Copie o código abaixo para garantir sua vaga:
             return {"status": "processed"}
 
         # ============================================================
-        # 🛒 CHECKOUT PADRÃO (SEM PROMOÇÃO)
+        # 🛒 CHECKOUT PADRÃO (CORRIGIDO COM ANTI-DUPLICAÇÃO)
         # ============================================================
         elif update.callback_query and update.callback_query.data.startswith("checkout_"):
             chat_id = update.callback_query.message.chat.id
+            first_name = update.callback_query.from_user.first_name
+            username = update.callback_query.from_user.username
             plano_id = update.callback_query.data.split("_")[1]
             
             plano = db.query(PlanoConfig).filter(PlanoConfig.id == plano_id).first()
             if not plano:
-                bot_temp.send_message(chat_id, "Plano não encontrado.")
+                bot_temp.send_message(chat_id, "❌ Plano não encontrado.")
                 return {"status": "error"}
 
             msg_aguarde = bot_temp.send_message(chat_id, "⏳ Gerando seu PIX...")
@@ -1368,26 +1418,71 @@ Copie o código abaixo para garantir sua vaga:
                 provider_id = pix_data.get("id") or temp_uuid
                 final_tx_id = str(provider_id).lower()
 
-                novo_pedido = Pedido(
-                    bot_id=bot_db.id,
-                    transaction_id=final_tx_id, 
-                    telegram_id=str(chat_id),
-                    first_name=update.callback_query.from_user.first_name,
-                    username=update.callback_query.from_user.username,
-                    plano_nome=plano.nome_exibicao,
-                    valor=plano.preco_atual,
-                    status="pending",
-                    qr_code=qr_code_text
-                )
-                db.add(novo_pedido)
-                db.commit()
+                # ============================================================
+                # [CORREÇÃO] ANTI-DUPLICAÇÃO - VERIFICA SE USUÁRIO JÁ EXISTE
+                # ============================================================
+                pedido_existente = db.query(Pedido).filter(
+                    Pedido.telegram_id == str(chat_id),
+                    Pedido.bot_id == bot_db.id
+                ).first()
 
-                # Notifica admin sobre novo lead
-                try:
-                    msg_lead = f"🆕 *Novo Lead (PIX Gerado)*\n👤 {update.callback_query.from_user.first_name}\n💰 R$ {plano.preco_atual:.2f}"
-                    notificar_admin_principal(bot_db, msg_lead)
-                except Exception as e:
-                    logger.error(f"Erro ao notificar lead: {e}")
+                if pedido_existente:
+                    # [CORREÇÃO] ATUALIZA o pedido existente
+                    logger.info(f"📝 [BOT {bot_db.id}] Usuário {chat_id} já existe. Atualizando pedido...")
+                    
+                    pedido_existente.plano_nome = plano.nome_exibicao
+                    pedido_existente.plano_id = plano.id
+                    pedido_existente.valor = plano.preco_atual
+                    pedido_existente.status = "pending"
+                    pedido_existente.transaction_id = final_tx_id
+                    pedido_existente.qr_code = qr_code_text
+                    pedido_existente.data_aprovacao = None
+                    pedido_existente.created_at = datetime.utcnow()
+                    
+                    # Se tinha custom_expiration e agora é vitalício, remove
+                    if plano.dias_duracao == 99999:
+                        pedido_existente.custom_expiration = None
+                    
+                    db.commit()
+                    db.refresh(pedido_existente)
+                    
+                    logger.info(f"✅ [BOT {bot_db.id}] Pedido atualizado para {chat_id}")
+                    
+                    # [NOVO] Notifica admin sobre lead atualizado
+                    try:
+                        msg_lead = f"🔄 *Lead Atualizado (PIX Gerado)*\n👤 {first_name}\n💰 R$ {plano.preco_atual:.2f}"
+                        notificar_admin_principal(bot_db, msg_lead)
+                    except Exception as e:
+                        logger.error(f"Erro ao notificar lead: {e}")
+                else:
+                    # [MANTÉM] Se não existe, cria um novo
+                    logger.info(f"🆕 [BOT {bot_db.id}] Criando primeiro pedido para {chat_id}...")
+                    
+                    novo_pedido = Pedido(
+                        bot_id=bot_db.id,
+                        transaction_id=final_tx_id, 
+                        telegram_id=str(chat_id),
+                        first_name=first_name,
+                        username=username,
+                        plano_nome=plano.nome_exibicao,
+                        plano_id=plano.id,
+                        valor=plano.preco_atual,
+                        status="pending",
+                        qr_code=qr_code_text,
+                        created_at=datetime.utcnow()
+                    )
+                    db.add(novo_pedido)
+                    db.commit()
+                    db.refresh(novo_pedido)
+                    
+                    logger.info(f"✅ [BOT {bot_db.id}] Pedido criado para {chat_id}")
+
+                    # [MANTÉM] Notifica admin sobre novo lead
+                    try:
+                        msg_lead = f"🆕 *Novo Lead (PIX Gerado)*\n👤 {first_name}\n💰 R$ {plano.preco_atual:.2f}"
+                        notificar_admin_principal(bot_db, msg_lead)
+                    except Exception as e:
+                        logger.error(f"Erro ao notificar lead: {e}")
 
                 try: 
                     bot_temp.delete_message(chat_id, msg_aguarde.message_id)
@@ -1423,13 +1518,85 @@ Copie o código abaixo para garantir sua vaga:
 # 👥 ROTAS DE CRM (BASE DE CONTATOS CORRIGIDA + FILTROS INTELIGENTES)
 # =========================================================
 @app.get("/api/admin/contacts")
-def listar_contatos(bot_id: Optional[int] = None, status: str = "todos", db: Session = Depends(get_db)):
-    q = db.query(Pedido)
-    if bot_id: q = q.filter(Pedido.bot_id == bot_id)
-    if status == "pagantes": q = q.filter(Pedido.status.in_(['paid', 'active', 'approved']))
-    elif status == "pendentes": q = q.filter(Pedido.status == "pending")
-    elif status == "expirados": q = q.filter(Pedido.status == "expired")
-    return q.order_by(desc(Pedido.created_at)).all()
+def listar_contatos(
+    bot_id: Optional[int] = None, 
+    status: str = "todos",
+    page: int = 1,        # [NOVO] Número da página (começa em 1)
+    per_page: int = 50,   # [NOVO] Quantidade por página (padrão 50)
+    db: Session = Depends(get_db)
+):
+    """
+    Lista contatos com paginação.
+    
+    Parâmetros:
+    - bot_id: ID do bot (opcional, filtra por bot)
+    - status: todos, pagantes, pendentes, expirados
+    - page: Número da página (1, 2, 3...)
+    - per_page: Registros por página (padrão 50, máximo 100)
+    
+    Retorna:
+    {
+        "data": [...],
+        "total": 150,
+        "page": 1,
+        "per_page": 50,
+        "total_pages": 3
+    }
+    """
+    
+    # Limita per_page a no máximo 100
+    per_page = min(per_page, 100)
+    
+    # Query base
+    query = db.query(Pedido)
+    
+    # Filtra por bot se especificado
+    if bot_id:
+        query = query.filter(Pedido.bot_id == bot_id)
+    
+    # Filtra por status
+    if status == "pagantes":
+        query = query.filter(Pedido.status.in_(["paid", "active", "approved"]))
+    elif status == "pendentes":
+        query = query.filter(Pedido.status == "pending")
+    elif status == "expirados":
+        query = query.filter(Pedido.status == "expired")
+    # Se status == "todos", não filtra
+    
+    # [NOVO] Conta total de registros (ANTES da paginação)
+    total_count = query.count()
+    
+    # [NOVO] Calcula total de páginas
+    total_pages = (total_count + per_page - 1) // per_page  # Divisão com arredondamento para cima
+    
+    # [NOVO] Aplica paginação (OFFSET e LIMIT)
+    offset = (page - 1) * per_page
+    contatos = query.order_by(Pedido.created_at.desc()).offset(offset).limit(per_page).all()
+    
+    # Formata resposta
+    result = []
+    for pedido in contatos:
+        result.append({
+            "id": pedido.id,
+            "telegram_id": pedido.telegram_id,
+            "first_name": pedido.first_name,
+            "username": pedido.username,
+            "plano_nome": pedido.plano_nome,
+            "valor": pedido.valor,
+            "status": pedido.status,
+            "role": getattr(pedido, 'role', 'user'),  # Seguro se o campo não existir
+            "custom_expiration": pedido.custom_expiration,
+            "created_at": pedido.created_at
+        })
+    
+    # [NOVO] Retorna com metadados de paginação
+    return {
+        "data": result,
+        "total": total_count,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages
+    }
 
 # [NOVA ROTA] Atualização Manual de Usuário
 @app.put("/api/admin/users/{user_id}")
