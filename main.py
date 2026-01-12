@@ -1175,11 +1175,31 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             
             return {"status": "member_checked"}
         
-        # --- 1. COMANDO /START ---
+        # ============================================================
+        # CRIAR LEAD QUANDO USUÁRIO DÁ /START
+        # ============================================================
+
         if update.message and update.message.text == "/start":
+            user = update.message.from_user
             chat_id = update.message.chat.id
-            fluxo = bot_db.fluxo
             
+            # Criar Lead (TOPO do funil)
+            try:
+                db_session = SessionLocal()
+                criar_ou_atualizar_lead(
+                    db=db_session,
+                    user_id=str(user.id),
+                    nome=user.first_name or "Sem nome",
+                    username=user.username or "",
+                    bot_id=bot_db.id
+                )
+                logger.info(f"✅ [BOT {bot_db.id}] Lead criado: {user.first_name} (ID: {user.id})")
+                db_session.close()
+            except Exception as e:
+                logger.error(f"❌ Erro ao criar lead: {str(e)}")
+            
+            # Buscar fluxo
+            fluxo = db.query(BotFlow).filter(BotFlow.bot_id == bot_db.id).first()
             texto = fluxo.msg_boas_vindas if fluxo else f"Olá! Eu sou o {bot_db.nome}."
             btn_txt = fluxo.btn_text_1 if (fluxo and fluxo.btn_text_1) else "🔓 DESBLOQUEAR ACESSO"
             
@@ -1195,9 +1215,9 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                         bot_temp.send_photo(chat_id, media, caption=texto, reply_markup=markup)
                 except Exception as e:
                     logger.error(f"Erro mídia 1: {e}")
-                    bot_temp.send_message(chat_id, texto, reply_markup=markup_step if passo.mostrar_botao else None)
+                    bot_temp.send_message(chat_id, texto, reply_markup=markup)
             else:
-                bot_temp.send_message(chat_id, texto, reply_markup=markup_step if passo.mostrar_botao else None)
+                bot_temp.send_message(chat_id, texto, reply_markup=markup)
 
         # ============================================================
         # TRECHO 1: CALLBACK "passo_2"
