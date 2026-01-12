@@ -643,10 +643,10 @@ def listar_bots(db: Session = Depends(get_db)):
             Pedido.bot_id == bot.id
         ).scalar() or 0
         
-        # [CORRIGIDO] Soma vendas aprovadas (múltiplos status possíveis)
+        # [CORRIGIDO V2] Soma TODAS as vendas pagas (incluindo expiradas)
         vendas_aprovadas = db.query(Pedido).filter(
             Pedido.bot_id == bot.id,
-            Pedido.status.in_(["approved", "paid", "active"])  # Aceita múltiplos status
+            Pedido.status.in_(["approved", "paid", "active", "expired"])  # ✅ CORRETO - Inclui expired
         ).all()
         revenue = sum([v.valor for v in vendas_aprovadas]) if vendas_aprovadas else 0.0
         
