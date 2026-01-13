@@ -2050,22 +2050,26 @@ class IndividualRemarketingRequest(BaseModel):
     campaign_history_id: int # ID do histórico para copiar a msg
 
 # ============================================================
-# CORREÇÃO REAL: ROTA SEND-INDIVIDUAL 
-# (Substitua a partir da linha 2070 no main.py)
+# 🔥 CORREÇÃO: Rota /api/admin/remarketing/send-individual
+# LOCALIZAÇÃO: Linha 2075
+# PROBLEMA: Estava usando 'telegram' mas o projeto usa 'telebot'
 # ============================================================
 
 @app.post("/api/admin/remarketing/send-individual")
-async def send_individual_remarketing(
+def send_individual_remarketing(
     payload: dict,
     db: Session = Depends(get_db)
 ):
     """
     🔥 [CORRIGIDO] Envia campanha individual para um usuário específico
+    Agora usa telebot (pyTelegramBotAPI) em vez de python-telegram-bot
     """
     try:
         bot_id = payload.get("bot_id")
         user_telegram_id = str(payload.get("user_telegram_id"))
         campaign_history_id = payload.get("campaign_history_id")
+        
+        logger.info(f"📨 Tentando enviar campanha individual - Bot: {bot_id}, User: {user_telegram_id}, Campaign: {campaign_history_id}")
         
         # Validações
         if not all([bot_id, user_telegram_id, campaign_history_id]):
@@ -2089,7 +2093,12 @@ async def send_individual_remarketing(
         
         # Parsear config da campanha
         try:
-            config = json.loads(campaign.config) if isinstance(campaign.config, str) else campaign.config
+            if isinstance(campaign.config, str):
+                config = json.loads(campaign.config)
+            else:
+                config = campaign.config
+            
+            logger.info(f"Config parseado: {config}")
         except Exception as e:
             logger.error(f"Erro ao parsear config da campanha: {e}")
             raise HTTPException(status_code=400, detail="Configuração da campanha inválida")
@@ -2118,37 +2127,42 @@ async def send_individual_remarketing(
                     "dias": plano.dias_duracao
                 }
         
-        # Enviar mensagem
+        # 🔥 [CORRIGIDO] Enviar mensagem usando TELEBOT
         try:
-            bot_instance = telegram.Bot(token=bot.token)
+            # Criar instância do bot usando telebot.TeleBot (não telegram.Bot)
+            bot_instance = telebot.TeleBot(bot.token)
             
             # Montar texto com oferta se houver
             texto_final = mensagem
             if plan_data:
-                texto_final += f"\n\n💎 **Oferta Especial**\n"
+                texto_final += f"\n\n💎 <b>Oferta Especial</b>\n"
                 texto_final += f"{plan_data['nome']} - R$ {plan_data['preco']:.2f}"
             
             # Enviar mídia ou texto
             if media_url:
-                if media_url.lower().endswith(('.mp4', '.avi', '.mov')):
-                    await bot_instance.send_video(
+                # Detectar tipo de mídia
+                if media_url.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                    # Vídeo
+                    bot_instance.send_video(
                         chat_id=user_telegram_id,
                         video=media_url,
                         caption=texto_final,
-                        parse_mode='Markdown'
+                        parse_mode='HTML'
                     )
                 else:
-                    await bot_instance.send_photo(
+                    # Foto
+                    bot_instance.send_photo(
                         chat_id=user_telegram_id,
                         photo=media_url,
                         caption=texto_final,
-                        parse_mode='Markdown'
+                        parse_mode='HTML'
                     )
             else:
-                await bot_instance.send_message(
+                # Apenas texto
+                bot_instance.send_message(
                     chat_id=user_telegram_id,
                     text=texto_final,
-                    parse_mode='Markdown'
+                    parse_mode='HTML'
                 )
             
             logger.info(f"✅ Mensagem individual enviada para {user_telegram_id}")
@@ -2158,7 +2172,7 @@ async def send_individual_remarketing(
                 "message": f"Mensagem enviada com sucesso para {user_telegram_id}"
             }
             
-        except telegram.error.TelegramError as e:
+        except Exception as e:
             logger.error(f"Erro ao enviar mensagem individual: {e}")
             raise HTTPException(
                 status_code=400,
