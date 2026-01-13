@@ -2050,9 +2050,9 @@ class IndividualRemarketingRequest(BaseModel):
     campaign_history_id: int # ID do histórico para copiar a msg
 
 # ============================================================
-# 🔥 CORREÇÃO: Rota /api/admin/remarketing/send-individual
+# 🔥 CORREÇÃO FINAL: Rota send-individual COM BOTÃO INLINE
 # LOCALIZAÇÃO: Linha 2075
-# PROBLEMA: Estava usando 'telegram' mas o projeto usa 'telebot'
+# ADICIONA: Botão embutido quando houver oferta
 # ============================================================
 
 @app.post("/api/admin/remarketing/send-individual")
@@ -2061,29 +2061,25 @@ def send_individual_remarketing(
     db: Session = Depends(get_db)
 ):
     """
-    🔥 [CORRIGIDO] Envia campanha individual para um usuário específico
-    Agora usa telebot (pyTelegramBotAPI) em vez de python-telegram-bot
+    🔥 [CORRIGIDO] Envia campanha individual com BOTÃO INLINE de oferta
     """
     try:
         bot_id = payload.get("bot_id")
         user_telegram_id = str(payload.get("user_telegram_id"))
         campaign_history_id = payload.get("campaign_history_id")
         
-        logger.info(f"📨 Tentando enviar campanha individual - Bot: {bot_id}, User: {user_telegram_id}, Campaign: {campaign_history_id}")
+        logger.info(f"📨 Enviando campanha - Bot: {bot_id}, User: {user_telegram_id}, Campaign: {campaign_history_id}")
         
         # Validações
         if not all([bot_id, user_telegram_id, campaign_history_id]):
-            raise HTTPException(
-                status_code=400,
-                detail="Campos obrigatórios: bot_id, user_telegram_id, campaign_history_id"
-            )
+            raise HTTPException(status_code=400, detail="Campos obrigatórios faltando")
         
         # Buscar bot
         bot = db.query(Bot).filter(Bot.id == bot_id).first()
         if not bot:
             raise HTTPException(status_code=404, detail="Bot não encontrado")
         
-        # Buscar campanha no histórico
+        # Buscar campanha
         campaign = db.query(RemarketingCampaign).filter(
             RemarketingCampaign.id == campaign_history_id
         ).first()
@@ -2091,81 +2087,77 @@ def send_individual_remarketing(
         if not campaign:
             raise HTTPException(status_code=404, detail="Campanha não encontrada")
         
-        # Parsear config da campanha
-        try:
-            if isinstance(campaign.config, str):
-                config = json.loads(campaign.config)
-            else:
-                config = campaign.config
-            
-            logger.info(f"Config parseado: {config}")
-        except Exception as e:
-            logger.error(f"Erro ao parsear config da campanha: {e}")
-            raise HTTPException(status_code=400, detail="Configuração da campanha inválida")
+        # Parsear config
+        config = json.loads(campaign.config) if isinstance(campaign.config, str) else campaign.config
         
-        # Extrair dados da campanha
         mensagem = config.get("mensagem", "")
         media_url = config.get("media_url")
         incluir_oferta = config.get("incluir_oferta", False)
         plano_oferta_id = config.get("plano_oferta_id")
         
         if not mensagem:
-            raise HTTPException(status_code=400, detail="Mensagem da campanha não encontrada")
+            raise HTTPException(status_code=400, detail="Mensagem não encontrada")
         
-        # Buscar plano se houver oferta
-        plan_data = None
+        # 🔥 [NOVO] Buscar plano e criar botão inline
+        markup = None
         if incluir_oferta and plano_oferta_id:
             plano = db.query(PlanoConfig).filter(PlanoConfig.id == int(plano_oferta_id)).first()
             if plano:
                 price_mode = config.get("price_mode", "original")
                 custom_price = config.get("custom_price", 0)
                 
-                plan_data = {
-                    "id": plano.id,
-                    "nome": plano.nome_exibicao,
-                    "preco": custom_price if price_mode == "custom" else plano.preco_atual,
-                    "dias": plano.dias_duracao
-                }
+                # Preço a usar
+                preco_final = float(custom_price) if price_mode == "custom" else plano.preco_atual
+                
+                # 🔥 CRIAR BOTÃO INLINE
+                markup = types.InlineKeyboardMarkup()
+                
+                # Texto do botão: "💎 PLANO VIP - R$ 29.90"
+                btn_text = f"💎 {plano.nome_exibicao} - R$ {preco_final:.2f}"
+                
+                # Callback data: envia o ID do plano quando clicar
+                btn_callback = f"buy_plan_{plano.id}_{user_telegram_id}"
+                
+                # Adiciona o botão
+                markup.add(types.InlineKeyboardButton(
+                    text=btn_text,
+                    callback_data=btn_callback
+                ))
         
-        # 🔥 [CORRIGIDO] Enviar mensagem usando TELEBOT
+        # 🔥 ENVIAR usando TELEBOT com BOTÃO
         try:
-            # Criar instância do bot usando telebot.TeleBot (não telegram.Bot)
             bot_instance = telebot.TeleBot(bot.token)
             
-            # Montar texto com oferta se houver
-            texto_final = mensagem
-            if plan_data:
-                texto_final += f"\n\n💎 <b>Oferta Especial</b>\n"
-                texto_final += f"{plan_data['nome']} - R$ {plan_data['preco']:.2f}"
-            
-            # Enviar mídia ou texto
+            # Enviar mídia ou texto COM O BOTÃO
             if media_url:
-                # Detectar tipo de mídia
                 if media_url.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-                    # Vídeo
+                    # Vídeo com botão
                     bot_instance.send_video(
                         chat_id=user_telegram_id,
                         video=media_url,
-                        caption=texto_final,
-                        parse_mode='HTML'
+                        caption=mensagem,
+                        parse_mode='HTML',
+                        reply_markup=markup  # 🔥 BOTÃO AQUI
                     )
                 else:
-                    # Foto
+                    # Foto com botão
                     bot_instance.send_photo(
                         chat_id=user_telegram_id,
                         photo=media_url,
-                        caption=texto_final,
-                        parse_mode='HTML'
+                        caption=mensagem,
+                        parse_mode='HTML',
+                        reply_markup=markup  # 🔥 BOTÃO AQUI
                     )
             else:
-                # Apenas texto
+                # Apenas texto com botão
                 bot_instance.send_message(
                     chat_id=user_telegram_id,
-                    text=texto_final,
-                    parse_mode='HTML'
+                    text=mensagem,
+                    parse_mode='HTML',
+                    reply_markup=markup  # 🔥 BOTÃO AQUI
                 )
             
-            logger.info(f"✅ Mensagem individual enviada para {user_telegram_id}")
+            logger.info(f"✅ Mensagem com botão enviada para {user_telegram_id}")
             
             return {
                 "success": True,
@@ -2173,16 +2165,13 @@ def send_individual_remarketing(
             }
             
         except Exception as e:
-            logger.error(f"Erro ao enviar mensagem individual: {e}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Erro ao enviar mensagem: {str(e)}"
-            )
+            logger.error(f"Erro ao enviar mensagem: {e}")
+            raise HTTPException(status_code=400, detail=f"Erro ao enviar: {str(e)}")
             
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro inesperado no envio individual: {str(e)}")
+        logger.error(f"Erro no envio individual: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # =========================================================
