@@ -2407,7 +2407,7 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
     # Salvar no banco
     nova_campanha = RemarketingCampaign(
         bot_id=bot_id,
-        campaign_id=uuid_campanha,  # ✅ UUID para busca no webhook
+        campaign_id=uuid_campanha,
         target=filtro_limpo,
         config=json.dumps({
             "mensagem": payload.mensagem,
@@ -2423,8 +2423,8 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
         sent_success=sent_count,
         blocked_count=blocked_count,
         data_envio=datetime.utcnow(),
-        plano_id=plano_db.id if plano_db else None,       # 🔥 CRÍTICO - FALTAVA ISSO!
-        promo_price=preco_final if plano_db else None,    # 🔥 CRÍTICO - FALTAVA ISSO!
+        plano_id=plano_db.id if plano_db else None,       # 🔥 CRÍTICO!
+        promo_price=preco_final if plano_db else None,    # 🔥 CRÍTICO!
         expiration_at=data_expiracao                       # 🔥 NOVO
     )
     db.add(nova_campanha)
@@ -2432,6 +2432,7 @@ def processar_envio_remarketing(bot_id: int, payload: RemarketingRequest, db: Se
     
     logger.info(f"✅ CAMPANHA SALVA - ID: {nova_campanha.id}, UUID: {uuid_campanha}, plano_id: {nova_campanha.plano_id}")
     logger.info(f"✅ FINALIZADO: {sent_count} enviados / {blocked_count} bloqueados")
+
 
 # --- ROTAS DA API ---
 
