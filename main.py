@@ -2889,121 +2889,143 @@ def delete_remarketing_history(history_id: int, db: Session = Depends(get_db)):
 # 📊 ROTA DE DASHBOARD (KPIs REAIS E CUMULATIVOS)
 # =========================================================
 # =========================================================
-# 📊 ROTA DE DASHBOARD (KPIS AVANÇADOS - ATUALIZAÇÃO MESTRE)
+# 📊 ROTA DE DASHBOARD V2 (COM FILTRO DE DATA)
 # =========================================================
 @app.get("/api/admin/dashboard/stats")
-def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db)): 
+def dashboard_stats(
+    bot_id: Optional[int] = None, 
+    start_date: Optional[str] = None, 
+    end_date: Optional[str] = None, 
+    db: Session = Depends(get_db)
+): 
     """
-    Retorna métricas completas para o Dashboard Analítico (Estilo Dark/Roxo).
-    Inclui: Faturamento, Leads, Conversão, Ticket Médio e Dados para Gráfico.
+    Dashboard V2: Suporta filtro por período personalizado.
+    Padrão: Mês atual.
     """
     try:
-        # Datas de referência
+        # 1. DEFINIÇÃO DO PERÍODO
         agora = datetime.utcnow()
-        hoje_inicio = datetime(agora.year, agora.month, agora.day)
-        mes_inicio = datetime(agora.year, agora.month, 1)
+        
+        if start_date and end_date:
+            # Se o usuário mandou datas (Filtro Personalizado)
+            # O frontend manda em formato ISO (ex: 2023-10-25T14:00:00.000Z)
+            # Vamos pegar só a data YYYY-MM-DD
+            dt_inicio = datetime.fromisoformat(start_date.replace('Z', '+00:00')).replace(hour=0, minute=0, second=0, tzinfo=None)
+            dt_fim = datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(hour=23, minute=59, second=59, tzinfo=None)
+        else:
+            # Padrão: Mês Atual (Do dia 1 até agora)
+            dt_inicio = datetime(agora.year, agora.month, 1)
+            dt_fim = agora
 
-        # 1. QUERIES BASE (Leads e Pedidos)
+        # Data de hoje (para comparação de "Vendas Hoje")
+        hoje_inicio = datetime(agora.year, agora.month, agora.day)
+
+        # 2. QUERIES BASE
         query_leads = db.query(Lead)
         query_pedidos = db.query(Pedido)
 
-        # Filtro por Bot (se selecionado)
         if bot_id:
             query_leads = query_leads.filter(Lead.bot_id == bot_id)
             query_pedidos = query_pedidos.filter(Pedido.bot_id == bot_id)
 
-        # --- KPIS DE LEADS ---
-        # Leads do Mês Atual
-        leads_mes = query_leads.filter(Lead.created_at >= mes_inicio).count()
-        # Novos Leads Hoje
+        # --- KPIS FILTRADOS PELO PERÍODO SELECIONADO ---
+        
+        # Leads no período
+        leads_periodo = query_leads.filter(
+            Lead.created_at >= dt_inicio,
+            Lead.created_at <= dt_fim
+        ).count()
+
+        # Novos Leads Hoje (Sempre fixo "Hoje" independentemente do filtro, para referência)
         leads_hoje = query_leads.filter(Lead.created_at >= hoje_inicio).count()
         
-        # --- KPIS FINANCEIROS (PEDIDOS) ---
-        # Lista de status considerados como "Venda Realizada" (Dinheiro no bolso)
+        # Status de pagamento confirmado
         status_pagos = ['paid', 'active', 'approved', 'completed', 'succeeded']
         
-        # Query base de vendas pagas
-        vendas_pagas = query_pedidos.filter(Pedido.status.in_(status_pagos))
+        # Vendas no período selecionado
+        vendas_periodo = query_pedidos.filter(
+            Pedido.status.in_(status_pagos),
+            Pedido.created_at >= dt_inicio,
+            Pedido.created_at <= dt_fim
+        )
         
-        # Total Faturamento (Acumulado)
+        # Total Faturamento (No período)
         total_revenue = db.query(func.sum(Pedido.valor)).filter(
-            Pedido.status.in_(status_pagos)
+            Pedido.status.in_(status_pagos),
+            Pedido.created_at >= dt_inicio,
+            Pedido.created_at <= dt_fim
         )
         if bot_id: total_revenue = total_revenue.filter(Pedido.bot_id == bot_id)
         valor_total_revenue = total_revenue.scalar() or 0.0
 
-        # Assinantes Ativos (Base Atual)
-        active_users = vendas_pagas.count()
+        # Assinantes (Quantidade de vendas no período)
+        total_transactions = vendas_periodo.count()
+        
+        # Assinantes Ativos Totais (Base geral, independente do filtro de data)
+        # É legal mostrar a base total mesmo filtrando datas passadas
+        total_active_users = db.query(Pedido).filter(Pedido.status.in_(status_pagos))
+        if bot_id: total_active_users = total_active_users.filter(Pedido.bot_id == bot_id)
+        count_active_users = total_active_users.count()
 
-        # Total de Transações (Quantidade de vendas pagas)
-        total_transactions = active_users 
-
-        # Ticket Médio (Faturamento / Transações)
+        # Ticket Médio (No período)
         ticket_medio = (valor_total_revenue / total_transactions) if total_transactions > 0 else 0.0
 
-        # Vendas Hoje (R$)
-        # Nota: Mantemos a lógica original que incluía 'expired' para compatibilidade, 
-        # mas para financeiro sério, recomendamos usar apenas status_pagos. 
-        # Aqui vou usar status_pagos para ser preciso no novo dashboard.
-        vendas_hoje_query = vendas_pagas.filter(Pedido.created_at >= hoje_inicio)
-        sales_today = db.query(func.sum(Pedido.valor)).filter(
+        # Vendas Hoje (Sempre fixo "Hoje")
+        sales_today_query = db.query(func.sum(Pedido.valor)).filter(
             Pedido.status.in_(status_pagos),
             Pedido.created_at >= hoje_inicio
         )
-        if bot_id: sales_today = sales_today.filter(Pedido.bot_id == bot_id)
-        valor_sales_today = sales_today.scalar() or 0.0
+        if bot_id: sales_today_query = sales_today_query.filter(Pedido.bot_id == bot_id)
+        valor_sales_today = sales_today_query.scalar() or 0.0
 
-        # Reembolsos (Placeholder - Se tiver lógica de reembolso futura, ajustamos aqui)
-        reembolsos = 0.0
-
-        # --- TAXA DE CONVERSÃO ---
-        # Fórmula: (Vendas Pagas / (Total Leads + Vendas Pagas)) * 100
-        # Usamos Leads + Vendas para ter o universo total de contatos únicos aproximado
-        total_leads_geral = query_leads.count()
-        universo_total = total_leads_geral + total_transactions
+        # Taxa de Conversão (No período)
+        universo_total = leads_periodo + total_transactions
         conversao = (total_transactions / universo_total * 100) if universo_total > 0 else 0.0
 
-        # --- DADOS DO GRÁFICO (Últimos 15 dias) ---
-        # Gera uma lista de objetos { name: "DD/MM", value: 120.00 }
+        # --- DADOS DO GRÁFICO (DIÁRIO DENTRO DO PERÍODO) ---
         chart_data = []
-        for i in range(14, -1, -1): # Do dia 14 atrás até 0 (hoje)
-            data_alvo = hoje_inicio - timedelta(days=i)
-            data_fim_alvo = data_alvo + timedelta(days=1)
+        
+        # Calcula quantos dias tem no intervalo
+        delta = (dt_fim - dt_inicio).days
+        
+        # Se o intervalo for muito grande (> 60 dias), agrupar por mês ou limitar (Opcional)
+        # Por enquanto, vamos manter diário, mas limitando o loop para não explodir
+        dias_para_grafico = min(delta + 1, 366) # Limite de 1 ano para visualização diária
+        
+        for i in range(dias_para_grafico):
+            data_loop = dt_inicio + timedelta(days=i)
+            data_loop_fim = data_loop + timedelta(days=1) # Fim do dia atual do loop
             
-            # Soma vendas daquele dia específico
+            # Soma vendas daquele dia
             soma_dia = db.query(func.sum(Pedido.valor)).filter(
                 Pedido.status.in_(status_pagos),
-                Pedido.created_at >= data_alvo,
-                Pedido.created_at < data_fim_alvo
+                Pedido.created_at >= data_loop,
+                Pedido.created_at < data_loop_fim
             )
             if bot_id: soma_dia = soma_dia.filter(Pedido.bot_id == bot_id)
             
-            valor_dia = soma_dia.scalar() or 0.0
+            val = soma_dia.scalar() or 0.0
             
             chart_data.append({
-                "name": data_alvo.strftime("%d/%m"), # Ex: 15/12
-                "value": valor_dia
+                "name": data_loop.strftime("%d/%m"), 
+                "value": val
             })
 
         return {
-            # Mantidos para compatibilidade (Antigo Frontend)
             "total_revenue": valor_total_revenue,
-            "active_users": active_users,
+            "active_users": count_active_users, # Base Total
             "sales_today": valor_sales_today,
-            
-            # Novos Campos (Novo Dashboard)
-            "leads_mes": leads_mes,
+            "leads_mes": leads_periodo,         # Agora representa Leads do FILTRO
             "leads_hoje": leads_hoje,
             "ticket_medio": ticket_medio,
             "total_transacoes": total_transactions,
-            "reembolsos": reembolsos,
+            "reembolsos": 0.0,
             "taxa_conversao": round(conversao, 2),
             "chart_data": chart_data
         }
 
     except Exception as e:
         logger.error(f"❌ Erro no dashboard stats: {str(e)}")
-        # Retorno de segurança para não quebrar o front
         return {
             "total_revenue": 0.0, "active_users": 0, "sales_today": 0.0,
             "leads_mes": 0, "leads_hoje": 0, "ticket_medio": 0.0,
