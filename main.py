@@ -2052,29 +2052,29 @@ async def get_contacts(
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================
-# 🔥 ROTA: Reenviar Acesso
-# ADICIONE ESTA ROTA NO SEU main.py
-# LOCALIZAÇÃO SUGERIDA: Após as rotas de /api/admin/contacts
+# 🔥 ROTA BACKEND: Reenviar Acesso (VERSÃO CORRIGIDA)
+# URL: /api/admin/users/{user_id}/resend-access
+# Esta URL combina com a função resendAccess do api.js
 # ============================================================
 
-@app.post("/api/admin/reenviar-acesso/{pedido_id}")
-async def reenviar_acesso(pedido_id: int, db: Session = Depends(get_db)):
+@app.post("/api/admin/users/{user_id}/resend-access")
+async def resend_user_access(user_id: int, db: Session = Depends(get_db)):
     """
     🔑 Reenvia o link de acesso VIP para um usuário que já pagou
     Usado quando há problemas na entrega automática de acesso
     """
     try:
-        # 1. Buscar pedido
-        pedido = db.query(Pedido).filter(Pedido.id == pedido_id).first()
+        # 1. Buscar pedido pelo ID
+        pedido = db.query(Pedido).filter(Pedido.id == user_id).first()
         
         if not pedido:
-            logger.error(f"❌ Pedido {pedido_id} não encontrado")
+            logger.error(f"❌ Pedido {user_id} não encontrado")
             raise HTTPException(status_code=404, detail="Pedido não encontrado")
         
         # 2. Verificar se está pago
         if pedido.status not in ["paid", "active", "approved"]:
-            logger.error(f"❌ Pedido {pedido_id} não está pago (status: {pedido.status})")
-            raise HTTPException(status_code=400, detail="Pedido não está pago")
+            logger.error(f"❌ Pedido {user_id} não está pago (status: {pedido.status})")
+            raise HTTPException(status_code=400, detail="Pedido não está pago. Altere o status para 'Ativo/Pago' primeiro.")
         
         # 3. Buscar bot
         bot_data = db.query(Bot).filter(Bot.id == pedido.bot_id).first()
@@ -2083,7 +2083,12 @@ async def reenviar_acesso(pedido_id: int, db: Session = Depends(get_db)):
             logger.error(f"❌ Bot {pedido.bot_id} não encontrado")
             raise HTTPException(status_code=404, detail="Bot não encontrado")
         
-        # 4. Gerar novo link e enviar
+        # 4. Verificar se bot tem canal configurado
+        if not bot_data.id_canal_vip:
+            logger.error(f"❌ Bot {pedido.bot_id} não tem canal VIP configurado")
+            raise HTTPException(status_code=400, detail="Bot não tem canal VIP configurado")
+        
+        # 5. Gerar novo link e enviar
         try:
             tb = telebot.TeleBot(bot_data.token)
             
@@ -2096,8 +2101,9 @@ async def reenviar_acesso(pedido_id: int, db: Session = Depends(get_db)):
             # Tenta desbanir antes (caso tenha sido banido)
             try:
                 tb.unban_chat_member(canal_id, int(pedido.telegram_id))
-            except:
-                pass
+                logger.info(f"🔓 Usuário {pedido.telegram_id} desbanido do canal")
+            except Exception as e:
+                logger.warning(f"⚠️ Não foi possível desbanir usuário: {e}")
             
             # Gera Link Único
             convite = tb.create_chat_invite_link(
@@ -2127,9 +2133,13 @@ async def reenviar_acesso(pedido_id: int, db: Session = Depends(get_db)):
                 "status": "success",
                 "message": "Acesso reenviado com sucesso!",
                 "telegram_id": pedido.telegram_id,
-                "nome": pedido.first_name
+                "nome": pedido.first_name,
+                "validade": texto_validade
             }
             
+        except telebot.apihelper.ApiTelegramException as e:
+            logger.error(f"❌ Erro da API do Telegram: {e}")
+            raise HTTPException(status_code=500, detail=f"Erro do Telegram: {str(e)}")
         except Exception as e_tg:
             logger.error(f"❌ Erro ao enviar acesso via Telegram: {e_tg}")
             raise HTTPException(status_code=500, detail=f"Erro ao enviar via Telegram: {str(e_tg)}")
