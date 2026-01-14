@@ -2888,44 +2888,128 @@ def delete_remarketing_history(history_id: int, db: Session = Depends(get_db)):
 # =========================================================
 # 📊 ROTA DE DASHBOARD (KPIs REAIS E CUMULATIVOS)
 # =========================================================
+# =========================================================
+# 📊 ROTA DE DASHBOARD (KPIS AVANÇADOS - ATUALIZAÇÃO MESTRE)
+# =========================================================
 @app.get("/api/admin/dashboard/stats")
 def dashboard_stats(bot_id: Optional[int] = None, db: Session = Depends(get_db)): 
-    """Calcula métricas. Se bot_id for passado, filtra por ele."""
-    
-    # [CORREÇÃO FINANCEIRA] - Faturamento Total
-    # Soma vendas ativas E expiradas. O dinheiro entrou, conta como receita.
-    q_revenue = db.query(func.sum(Pedido.valor)).filter(
-        Pedido.status.in_(['paid', 'active', 'approved', 'expired', 'completed', 'succeeded'])
-    )
-    
-    # Usuários Ativos (Aqui SIM ignoramos os expirados, pois queremos saber quem está no canal agora)
-    q_users = db.query(Pedido.telegram_id).filter(
-        Pedido.status.in_(['paid', 'active', 'approved', 'completed', 'succeeded'])
-    )
-    
-    # Vendas Hoje (Considera qualquer venda feita hoje, mesmo que tenha sido teste curto e expirou)
-    today = datetime.utcnow().date()
-    start_of_day = datetime.combine(today, datetime.min.time())
-    q_sales_today = db.query(func.sum(Pedido.valor)).filter(
-        Pedido.status.in_(['paid', 'active', 'approved', 'expired', 'completed', 'succeeded']),
-        Pedido.created_at >= start_of_day
-    )
+    """
+    Retorna métricas completas para o Dashboard Analítico (Estilo Dark/Roxo).
+    Inclui: Faturamento, Leads, Conversão, Ticket Médio e Dados para Gráfico.
+    """
+    try:
+        # Datas de referência
+        agora = datetime.utcnow()
+        hoje_inicio = datetime(agora.year, agora.month, agora.day)
+        mes_inicio = datetime(agora.year, agora.month, 1)
 
-    # APLICA FILTRO DE BOT (SE SELECIONADO)
-    if bot_id:
-        q_revenue = q_revenue.filter(Pedido.bot_id == bot_id)
-        q_users = q_users.filter(Pedido.bot_id == bot_id)
-        q_sales_today = q_sales_today.filter(Pedido.bot_id == bot_id)
+        # 1. QUERIES BASE (Leads e Pedidos)
+        query_leads = db.query(Lead)
+        query_pedidos = db.query(Pedido)
 
-    total_revenue = q_revenue.scalar() or 0.0
-    active_users = q_users.distinct().count()
-    sales_today = q_sales_today.scalar() or 0.0
+        # Filtro por Bot (se selecionado)
+        if bot_id:
+            query_leads = query_leads.filter(Lead.bot_id == bot_id)
+            query_pedidos = query_pedidos.filter(Pedido.bot_id == bot_id)
 
-    return {
-        "total_revenue": total_revenue,
-        "active_users": active_users,
-        "sales_today": sales_today
-    }
+        # --- KPIS DE LEADS ---
+        # Leads do Mês Atual
+        leads_mes = query_leads.filter(Lead.created_at >= mes_inicio).count()
+        # Novos Leads Hoje
+        leads_hoje = query_leads.filter(Lead.created_at >= hoje_inicio).count()
+        
+        # --- KPIS FINANCEIROS (PEDIDOS) ---
+        # Lista de status considerados como "Venda Realizada" (Dinheiro no bolso)
+        status_pagos = ['paid', 'active', 'approved', 'completed', 'succeeded']
+        
+        # Query base de vendas pagas
+        vendas_pagas = query_pedidos.filter(Pedido.status.in_(status_pagos))
+        
+        # Total Faturamento (Acumulado)
+        total_revenue = db.query(func.sum(Pedido.valor)).filter(
+            Pedido.status.in_(status_pagos)
+        )
+        if bot_id: total_revenue = total_revenue.filter(Pedido.bot_id == bot_id)
+        valor_total_revenue = total_revenue.scalar() or 0.0
+
+        # Assinantes Ativos (Base Atual)
+        active_users = vendas_pagas.count()
+
+        # Total de Transações (Quantidade de vendas pagas)
+        total_transactions = active_users 
+
+        # Ticket Médio (Faturamento / Transações)
+        ticket_medio = (valor_total_revenue / total_transactions) if total_transactions > 0 else 0.0
+
+        # Vendas Hoje (R$)
+        # Nota: Mantemos a lógica original que incluía 'expired' para compatibilidade, 
+        # mas para financeiro sério, recomendamos usar apenas status_pagos. 
+        # Aqui vou usar status_pagos para ser preciso no novo dashboard.
+        vendas_hoje_query = vendas_pagas.filter(Pedido.created_at >= hoje_inicio)
+        sales_today = db.query(func.sum(Pedido.valor)).filter(
+            Pedido.status.in_(status_pagos),
+            Pedido.created_at >= hoje_inicio
+        )
+        if bot_id: sales_today = sales_today.filter(Pedido.bot_id == bot_id)
+        valor_sales_today = sales_today.scalar() or 0.0
+
+        # Reembolsos (Placeholder - Se tiver lógica de reembolso futura, ajustamos aqui)
+        reembolsos = 0.0
+
+        # --- TAXA DE CONVERSÃO ---
+        # Fórmula: (Vendas Pagas / (Total Leads + Vendas Pagas)) * 100
+        # Usamos Leads + Vendas para ter o universo total de contatos únicos aproximado
+        total_leads_geral = query_leads.count()
+        universo_total = total_leads_geral + total_transactions
+        conversao = (total_transactions / universo_total * 100) if universo_total > 0 else 0.0
+
+        # --- DADOS DO GRÁFICO (Últimos 15 dias) ---
+        # Gera uma lista de objetos { name: "DD/MM", value: 120.00 }
+        chart_data = []
+        for i in range(14, -1, -1): # Do dia 14 atrás até 0 (hoje)
+            data_alvo = hoje_inicio - timedelta(days=i)
+            data_fim_alvo = data_alvo + timedelta(days=1)
+            
+            # Soma vendas daquele dia específico
+            soma_dia = db.query(func.sum(Pedido.valor)).filter(
+                Pedido.status.in_(status_pagos),
+                Pedido.created_at >= data_alvo,
+                Pedido.created_at < data_fim_alvo
+            )
+            if bot_id: soma_dia = soma_dia.filter(Pedido.bot_id == bot_id)
+            
+            valor_dia = soma_dia.scalar() or 0.0
+            
+            chart_data.append({
+                "name": data_alvo.strftime("%d/%m"), # Ex: 15/12
+                "value": valor_dia
+            })
+
+        return {
+            # Mantidos para compatibilidade (Antigo Frontend)
+            "total_revenue": valor_total_revenue,
+            "active_users": active_users,
+            "sales_today": valor_sales_today,
+            
+            # Novos Campos (Novo Dashboard)
+            "leads_mes": leads_mes,
+            "leads_hoje": leads_hoje,
+            "ticket_medio": ticket_medio,
+            "total_transacoes": total_transactions,
+            "reembolsos": reembolsos,
+            "taxa_conversao": round(conversao, 2),
+            "chart_data": chart_data
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Erro no dashboard stats: {str(e)}")
+        # Retorno de segurança para não quebrar o front
+        return {
+            "total_revenue": 0.0, "active_users": 0, "sales_today": 0.0,
+            "leads_mes": 0, "leads_hoje": 0, "ticket_medio": 0.0,
+            "total_transacoes": 0, "reembolsos": 0.0, "taxa_conversao": 0.0,
+            "chart_data": []
+        }
 # =========================================================
 # 💸 WEBHOOK DE PAGAMENTO (BLINDADO E TAGARELA)
 # =========================================================
