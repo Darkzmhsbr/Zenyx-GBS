@@ -1802,41 +1802,63 @@ def listar_leads(
 # ============================================================
 # ROTA 2: ESTATÍSTICAS DO FUNIL
 # ============================================================
+# ============================================================
+# 🔥 ROTA ATUALIZADA: /api/admin/contacts/funnel-stats
+# SUBSTITUA a rota existente por esta versão
+# Calcula estatísticas baseando-se no campo 'status' (não status_funil)
+# ============================================================
+
 @app.get("/api/admin/contacts/funnel-stats")
 def obter_estatisticas_funil(
     bot_id: Optional[int] = None,
     db: Session = Depends(get_db)
 ):
     """
-    Retorna contadores de cada estágio do funil
+    🔥 [CORRIGIDO] Retorna contadores de cada estágio do funil
+    TOPO = Leads (tabela Lead)
+    MEIO = Pedidos com status 'pending' (gerou PIX mas não pagou)
+    FUNDO = Pedidos com status 'paid/active/approved' (pagou)
+    EXPIRADO = Pedidos com status 'expired'
     """
     try:
-        # Contar TOPO (tabela leads)
+        # ============================================================
+        # TOPO: Contar LEADS (tabela Lead)
+        # ============================================================
         query_topo = db.query(Lead)
         if bot_id:
             query_topo = query_topo.filter(Lead.bot_id == bot_id)
         topo = query_topo.count()
         
-        # Contar MEIO (pedidos com status_funil='meio')
-        query_meio = db.query(Pedido).filter(Pedido.status_funil == 'meio')
+        # ============================================================
+        # MEIO: Pedidos com status PENDING (gerou PIX, não pagou)
+        # ============================================================
+        query_meio = db.query(Pedido).filter(Pedido.status == 'pending')
         if bot_id:
             query_meio = query_meio.filter(Pedido.bot_id == bot_id)
         meio = query_meio.count()
         
-        # Contar FUNDO (pedidos com status_funil='fundo')
-        query_fundo = db.query(Pedido).filter(Pedido.status_funil == 'fundo')
+        # ============================================================
+        # FUNDO: Pedidos PAGOS (paid/active/approved)
+        # ============================================================
+        query_fundo = db.query(Pedido).filter(
+            Pedido.status.in_(['paid', 'active', 'approved'])
+        )
         if bot_id:
             query_fundo = query_fundo.filter(Pedido.bot_id == bot_id)
         fundo = query_fundo.count()
         
-        # Contar EXPIRADOS (pedidos com status_funil='expirado')
-        query_expirados = db.query(Pedido).filter(Pedido.status_funil == 'expirado')
+        # ============================================================
+        # EXPIRADOS: Pedidos com status EXPIRED
+        # ============================================================
+        query_expirados = db.query(Pedido).filter(Pedido.status == 'expired')
         if bot_id:
             query_expirados = query_expirados.filter(Pedido.bot_id == bot_id)
         expirados = query_expirados.count()
         
         # Total
         total = topo + meio + fundo + expirados
+        
+        logger.info(f"📊 Estatísticas do funil: TOPO={topo}, MEIO={meio}, FUNDO={fundo}, EXPIRADOS={expirados}")
         
         return {
             "topo": topo,
@@ -1857,6 +1879,12 @@ def obter_estatisticas_funil(
 # Procure a rota @app.get("/api/admin/contacts") no seu main.py
 # e SUBSTITUA por esta versão atualizada:
 
+# ============================================================
+# 🔥 ROTA ATUALIZADA: /api/admin/contacts
+# SUBSTITUA a rota existente por esta versão
+# ADICIONA SUPORTE PARA FILTROS: meio, fundo, expirado
+# ============================================================
+
 @app.get("/api/admin/contacts")
 async def get_contacts(
     status: str = "todos",
@@ -1866,27 +1894,26 @@ async def get_contacts(
     db: Session = Depends(get_db)
 ):
     """
-    🔥 [CORRIGIDO] Retorna contatos únicos (sem duplicatas)
+    🔥 [ATUALIZADO] Retorna contatos únicos (sem duplicatas)
+    NOVOS FILTROS: meio, fundo, expirado
     """
     try:
         offset = (page - 1) * per_page
         all_contacts = []
         
-        # FILTRO: TODOS - Busca LEADS + PEDIDOS (SEM DUPLICATAS)
+        # ============================================================
+        # FILTRO: TODOS
+        # ============================================================
         if status == "todos":
-            # Dicionário para garantir unicidade por telegram_id
             contatos_unicos = {}
             
-            # 1. Buscar LEADS (tabela Lead)
+            # 1. Buscar LEADS
             query_leads = db.query(Lead)
             if bot_id:
                 query_leads = query_leads.filter(Lead.bot_id == bot_id)
-            
             leads = query_leads.all()
-            
             logger.info(f"📊 Busca TODOS: {len(leads)} leads encontrados")
             
-            # Adicionar leads ao dicionário
             for lead in leads:
                 telegram_id = str(lead.user_id)
                 contatos_unicos[telegram_id] = {
@@ -1902,22 +1929,30 @@ async def get_contacts(
                     "role": "user",
                     "custom_expiration": None,
                     "created_at": lead.created_at or datetime.utcnow(),
-                    "origem": "lead"
+                    "origem": "lead",
+                    "status_funil": "topo"
                 }
             
-            # 2. Buscar PEDIDOS (tabela Pedido) - SOBRESCREVE leads
+            # 2. Buscar PEDIDOS - SOBRESCREVE leads
             query_pedidos = db.query(Pedido)
             if bot_id:
                 query_pedidos = query_pedidos.filter(Pedido.bot_id == bot_id)
-            
             pedidos = query_pedidos.all()
-            
             logger.info(f"📊 Busca TODOS: {len(pedidos)} pedidos encontrados")
             
-            # Adicionar/sobrescrever pedidos no dicionário
-            # 🔥 Se telegram_id já existe (lead), SOBRESCREVE
             for pedido in pedidos:
                 telegram_id = str(pedido.telegram_id)
+                
+                # Determina status_funil baseado no status do pagamento
+                if pedido.status in ["paid", "active", "approved"]:
+                    status_funil = "fundo"
+                elif pedido.status == "pending":
+                    status_funil = "meio"
+                elif pedido.status == "expired":
+                    status_funil = "expirado"
+                else:
+                    status_funil = "meio"
+                
                 contatos_unicos[telegram_id] = {
                     "id": pedido.id,
                     "telegram_id": telegram_id,
@@ -1931,18 +1966,14 @@ async def get_contacts(
                     "role": "user",
                     "custom_expiration": pedido.custom_expiration,
                     "created_at": pedido.created_at or datetime.utcnow(),
-                    "origem": "pedido"
+                    "origem": "pedido",
+                    "status_funil": status_funil
                 }
             
-            # Converter dicionário para lista
             all_contacts = list(contatos_unicos.values())
-            
             logger.info(f"📊 Busca TODOS: {len(all_contacts)} contatos ÚNICOS (sem duplicatas)")
             
-            # Ordenar por data de criação (mais recentes primeiro)
             all_contacts.sort(key=lambda x: x["created_at"], reverse=True)
-            
-            # Paginar
             total = len(all_contacts)
             pag_contacts = all_contacts[offset:offset + per_page]
             
@@ -1954,7 +1985,114 @@ async def get_contacts(
                 "total_pages": (total + per_page - 1) // per_page
             }
         
-        # FILTRO: PAGANTES
+        # ============================================================
+        # 🔥 [NOVO] FILTRO: MEIO (Leads Quentes - PIX gerado mas não pago)
+        # ============================================================
+        elif status == "meio":
+            query = db.query(Pedido).filter(Pedido.status == "pending")
+            if bot_id:
+                query = query.filter(Pedido.bot_id == bot_id)
+            
+            total = query.count()
+            pedidos = query.offset(offset).limit(per_page).all()
+            
+            logger.info(f"🔥 MEIO: {total} leads quentes (pending)")
+            
+            contacts = [{
+                "id": p.id,
+                "telegram_id": p.telegram_id,
+                "first_name": p.first_name,
+                "username": p.username,
+                "plano_nome": p.plano_nome,
+                "valor": p.valor,
+                "status": p.status,
+                "role": "user",
+                "custom_expiration": p.custom_expiration,
+                "created_at": p.created_at,
+                "status_funil": "meio"
+            } for p in pedidos]
+            
+            return {
+                "data": contacts,
+                "total": total,
+                "page": page,
+                "per_page": per_page,
+                "total_pages": (total + per_page - 1) // per_page
+            }
+        
+        # ============================================================
+        # 🔥 [NOVO] FILTRO: FUNDO (Clientes - Pagos)
+        # ============================================================
+        elif status == "fundo":
+            query = db.query(Pedido).filter(Pedido.status.in_(["paid", "active", "approved"]))
+            if bot_id:
+                query = query.filter(Pedido.bot_id == bot_id)
+            
+            total = query.count()
+            pedidos = query.offset(offset).limit(per_page).all()
+            
+            logger.info(f"✅ FUNDO: {total} clientes pagos")
+            
+            contacts = [{
+                "id": p.id,
+                "telegram_id": p.telegram_id,
+                "first_name": p.first_name,
+                "username": p.username,
+                "plano_nome": p.plano_nome,
+                "valor": p.valor,
+                "status": p.status,
+                "role": "user",
+                "custom_expiration": p.custom_expiration,
+                "created_at": p.created_at,
+                "status_funil": "fundo"
+            } for p in pedidos]
+            
+            return {
+                "data": contacts,
+                "total": total,
+                "page": page,
+                "per_page": per_page,
+                "total_pages": (total + per_page - 1) // per_page
+            }
+        
+        # ============================================================
+        # 🔥 [ATUALIZADO] FILTRO: EXPIRADO
+        # ============================================================
+        elif status == "expirado" or status == "expirados":
+            query = db.query(Pedido).filter(Pedido.status == "expired")
+            if bot_id:
+                query = query.filter(Pedido.bot_id == bot_id)
+            
+            total = query.count()
+            pedidos = query.offset(offset).limit(per_page).all()
+            
+            logger.info(f"❄️ EXPIRADOS: {total} pedidos expirados")
+            
+            contacts = [{
+                "id": p.id,
+                "telegram_id": p.telegram_id,
+                "first_name": p.first_name,
+                "username": p.username,
+                "plano_nome": p.plano_nome,
+                "valor": p.valor,
+                "status": p.status,
+                "role": "user",
+                "custom_expiration": p.custom_expiration,
+                "created_at": p.created_at,
+                "status_funil": "expirado"
+            } for p in pedidos]
+            
+            return {
+                "data": contacts,
+                "total": total,
+                "page": page,
+                "per_page": per_page,
+                "total_pages": (total + per_page - 1) // per_page
+            }
+        
+        # ============================================================
+        # FILTRO: PAGANTES (mantido para compatibilidade)
+        # ============================================================
         elif status == "pagantes":
             query = db.query(Pedido).filter(Pedido.status.in_(["paid", "active", "approved"]))
             if bot_id:
@@ -1984,39 +2122,11 @@ async def get_contacts(
                 "total_pages": (total + per_page - 1) // per_page
             }
         
-        # FILTRO: PENDENTES
+        # ============================================================
+        # FILTRO: PENDENTES (mantido para compatibilidade)
+        # ============================================================
         elif status == "pendentes":
             query = db.query(Pedido).filter(Pedido.status == "pending")
-            if bot_id:
-                query = query.filter(Pedido.bot_id == bot_id)
-            
-            total = query.count()
-            pedidos = query.offset(offset).limit(per_page).all()
-            
-            contacts = [{
-                "id": p.id,
-                "telegram_id": p.telegram_id,
-                "first_name": p.first_name,
-                "username": p.username,
-                "plano_nome": p.plano_nome,
-                "valor": p.valor,
-                "status": p.status,
-                "role": "user",
-                "custom_expiration": p.custom_expiration,
-                "created_at": p.created_at
-            } for p in pedidos]
-            
-            return {
-                "data": contacts,
-                "total": total,
-                "page": page,
-                "per_page": per_page,
-                "total_pages": (total + per_page - 1) // per_page
-            }
-        
-        # FILTRO: EXPIRADOS
-        elif status == "expirados":
-            query = db.query(Pedido).filter(Pedido.status == "expired")
             if bot_id:
                 query = query.filter(Pedido.bot_id == bot_id)
             
