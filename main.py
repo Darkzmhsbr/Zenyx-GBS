@@ -796,30 +796,58 @@ def remover_admin(bot_id: int, telegram_id: str, db: Session = Depends(get_db)):
 # =========================================================
 # 🤖 LISTAR BOTS (COM KPI TOTAIS E USERNAME CORRIGIDO)
 # =========================================================
+# ============================================================
+# 🔥 ROTA CORRIGIDA: /api/admin/bots
+# SUBSTITUA a rota existente no main.py
+# CORRIGE: Conta LEADS + PEDIDOS (sem duplicatas)
+# ============================================================
+
 @app.get("/api/admin/bots")
 def listar_bots(db: Session = Depends(get_db)):
     """
-    Lista todos os bots com estatísticas corrigidas.
+    🔥 [CORRIGIDO] Lista todos os bots com estatísticas corretas
     
     CORREÇÕES:
-    - Leads: Conta usuários ÚNICOS (DISTINCT telegram_id)
-    - Revenue: Soma apenas pedidos com status 'approved' ou 'paid'
+    - Leads: Conta LEADS (tabela Lead) + PEDIDOS (tabela Pedido) SEM DUPLICATAS
+    - Revenue: Soma apenas pedidos com status 'approved', 'paid', 'active'
     - Username: Garante que sempre retorna o username
     """
+    from sqlalchemy import func
+    
     bots = db.query(Bot).all()
     
     result = []
     for bot in bots:
-        # [CORRIGIDO] Conta USUÁRIOS ÚNICOS, não pedidos duplicados
-        from sqlalchemy import func
-        leads_count = db.query(func.count(func.distinct(Pedido.telegram_id))).filter(
-            Pedido.bot_id == bot.id
-        ).scalar() or 0
+        # ============================================================
+        # 🔥 [CORRIGIDO] Conta LEADS + PEDIDOS (sem duplicatas)
+        # Usa a mesma lógica da página Contatos (filtro TODOS)
+        # ============================================================
         
-        # [CORRIGIDO V2] Soma TODAS as vendas pagas (incluindo expiradas)
+        # 1. Buscar todos os telegram_ids de LEADS
+        leads_ids = set()
+        leads_query = db.query(Lead.user_id).filter(Lead.bot_id == bot.id).all()
+        for lead in leads_query:
+            leads_ids.add(str(lead.user_id))
+        
+        # 2. Buscar todos os telegram_ids de PEDIDOS
+        pedidos_ids = set()
+        pedidos_query = db.query(Pedido.telegram_id).filter(Pedido.bot_id == bot.id).all()
+        for pedido in pedidos_query:
+            pedidos_ids.add(str(pedido.telegram_id))
+        
+        # 3. União dos sets (elimina duplicatas automaticamente)
+        # Se um lead virou pedido, conta apenas 1 vez
+        contatos_unicos = leads_ids.union(pedidos_ids)
+        leads_count = len(contatos_unicos)
+        
+        logger.info(f"📊 Bot {bot.nome}: {len(leads_ids)} leads + {len(pedidos_ids)} pedidos = {leads_count} contatos únicos")
+        
+        # ============================================================
+        # 💰 [MANTIDO] Revenue: Soma vendas aprovadas
+        # ============================================================
         vendas_aprovadas = db.query(Pedido).filter(
             Pedido.bot_id == bot.id,
-            Pedido.status.in_(["approved", "paid", "active", "expired"])  # ✅ CORRETO - Inclui expired
+            Pedido.status.in_(["approved", "paid", "active"])
         ).all()
         revenue = sum([v.valor for v in vendas_aprovadas]) if vendas_aprovadas else 0.0
         
@@ -827,12 +855,12 @@ def listar_bots(db: Session = Depends(get_db)):
             "id": bot.id,
             "nome": bot.nome,
             "token": bot.token,
-            "username": bot.username or None,  # Retorna None se vazio
+            "username": bot.username or None,
             "id_canal_vip": bot.id_canal_vip,
             "admin_principal_id": bot.admin_principal_id,
             "status": bot.status,
-            "leads": leads_count,        # [CORRIGIDO] Usuários únicos
-            "revenue": revenue,          # [CORRIGIDO] Soma de vendas aprovadas
+            "leads": leads_count,        # 🔥 [CORRIGIDO] Leads + Pedidos únicos
+            "revenue": revenue,
             "created_at": bot.created_at
         })
     
