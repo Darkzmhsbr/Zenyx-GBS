@@ -2052,19 +2052,84 @@ async def get_contacts(
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================
-# 🔥 ROTA BACKEND: Reenviar Acesso (VERSÃO CORRIGIDA)
-# URL: /api/admin/users/{user_id}/resend-access
-# Esta URL combina com a função resendAccess do api.js
+# 🔥 ROTAS COMPLETAS - Adicione no main.py
+# LOCAL: Após as rotas de /api/admin/contacts (linha ~2040)
 # ============================================================
 
+# ============================================================
+# ROTA 1: Atualizar Usuário (UPDATE)
+# ============================================================
+@app.put("/api/admin/users/{user_id}")
+async def update_user(user_id: int, data: dict, db: Session = Depends(get_db)):
+    """
+    ✏️ Atualiza informações de um usuário (status, role, custom_expiration)
+    """
+    try:
+        # 1. Buscar pedido
+        pedido = db.query(Pedido).filter(Pedido.id == user_id).first()
+        
+        if not pedido:
+            logger.error(f"❌ Pedido {user_id} não encontrado")
+            raise HTTPException(status_code=404, detail="Pedido não encontrado")
+        
+        # 2. Atualizar campos
+        if "status" in data:
+            pedido.status = data["status"]
+            logger.info(f"✅ Status atualizado para: {data['status']}")
+        
+        if "role" in data:
+            pedido.role = data["role"]
+            logger.info(f"✅ Role atualizado para: {data['role']}")
+        
+        if "custom_expiration" in data:
+            if data["custom_expiration"] == "remover" or data["custom_expiration"] == "":
+                pedido.custom_expiration = None
+                logger.info(f"✅ Data de expiração removida (Vitalício)")
+            else:
+                # Converter string para datetime
+                try:
+                    pedido.custom_expiration = datetime.strptime(data["custom_expiration"], "%Y-%m-%d")
+                    logger.info(f"✅ Data de expiração atualizada: {data['custom_expiration']}")
+                except:
+                    # Se já for datetime, usa direto
+                    pedido.custom_expiration = data["custom_expiration"]
+        
+        # 3. Salvar no banco
+        db.commit()
+        db.refresh(pedido)
+        
+        logger.info(f"✅ Usuário {user_id} atualizado com sucesso!")
+        
+        return {
+            "status": "success",
+            "message": "Usuário atualizado com sucesso!",
+            "data": {
+                "id": pedido.id,
+                "telegram_id": pedido.telegram_id,
+                "status": pedido.status,
+                "role": pedido.role,
+                "custom_expiration": pedido.custom_expiration.isoformat() if pedido.custom_expiration else None
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erro ao atualizar usuário: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# ROTA 2: Reenviar Acesso
+# ============================================================
 @app.post("/api/admin/users/{user_id}/resend-access")
 async def resend_user_access(user_id: int, db: Session = Depends(get_db)):
     """
     🔑 Reenvia o link de acesso VIP para um usuário que já pagou
-    Usado quando há problemas na entrega automática de acesso
     """
     try:
-        # 1. Buscar pedido pelo ID
+        # 1. Buscar pedido
         pedido = db.query(Pedido).filter(Pedido.id == user_id).first()
         
         if not pedido:
@@ -2074,7 +2139,10 @@ async def resend_user_access(user_id: int, db: Session = Depends(get_db)):
         # 2. Verificar se está pago
         if pedido.status not in ["paid", "active", "approved"]:
             logger.error(f"❌ Pedido {user_id} não está pago (status: {pedido.status})")
-            raise HTTPException(status_code=400, detail="Pedido não está pago. Altere o status para 'Ativo/Pago' primeiro.")
+            raise HTTPException(
+                status_code=400, 
+                detail="Pedido não está pago. Altere o status para 'Ativo/Pago' primeiro."
+            )
         
         # 3. Buscar bot
         bot_data = db.query(Bot).filter(Bot.id == pedido.bot_id).first()
