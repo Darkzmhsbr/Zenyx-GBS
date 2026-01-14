@@ -1866,32 +1866,33 @@ async def get_contacts(
     db: Session = Depends(get_db)
 ):
     """
-    🔥 [CORRIGIDO] Agora retorna LEADS + PEDIDOS quando status='todos'
+    🔥 [CORRIGIDO] Retorna contatos únicos (sem duplicatas)
     """
     try:
         offset = (page - 1) * per_page
         all_contacts = []
         
-        # FILTRO: TODOS - Busca LEADS + PEDIDOS
+        # FILTRO: TODOS - Busca LEADS + PEDIDOS (SEM DUPLICATAS)
         if status == "todos":
-            # 1. Busca PEDIDOS primeiro
-            pedidos = query_pedidos.all()
-
-            # 2. Coletar IDs dos usuários que JÁ TEM pedido
-            telegram_ids_com_pedido = {p.telegram_id for p in pedidos}
-
-            # 3. Busca LEADS - EXCLUINDO quem já tem pedido
-            query_leads = query_leads.filter(~Lead.user_id.in_(telegram_ids_com_pedido))
-            leads = query_leads.all()
-
-            # Resultado: Cada usuário aparece 1x!
+            # Dicionário para garantir unicidade por telegram_id
+            contatos_unicos = {}
             
-            # Normalizar leads para o formato de contato
+            # 1. Buscar LEADS (tabela Lead)
+            query_leads = db.query(Lead)
+            if bot_id:
+                query_leads = query_leads.filter(Lead.bot_id == bot_id)
+            
+            leads = query_leads.all()
+            
+            logger.info(f"📊 Busca TODOS: {len(leads)} leads encontrados")
+            
+            # Adicionar leads ao dicionário
             for lead in leads:
-                all_contacts.append({
+                telegram_id = str(lead.user_id)
+                contatos_unicos[telegram_id] = {
                     "id": lead.id,
-                    "telegram_id": lead.user_id,
-                    "user_id": lead.user_id,
+                    "telegram_id": telegram_id,
+                    "user_id": telegram_id,
                     "first_name": lead.nome or "Sem nome",
                     "nome": lead.nome or "Sem nome",
                     "username": lead.username or "sem_username",
@@ -1900,23 +1901,27 @@ async def get_contacts(
                     "status": "pending",
                     "role": "user",
                     "custom_expiration": None,
-                    "created_at": lead.created_at,
+                    "created_at": lead.created_at or datetime.utcnow(),
                     "origem": "lead"
-                })
+                }
             
-            # 2. Buscar PEDIDOS (tabela Pedido)
+            # 2. Buscar PEDIDOS (tabela Pedido) - SOBRESCREVE leads
             query_pedidos = db.query(Pedido)
             if bot_id:
                 query_pedidos = query_pedidos.filter(Pedido.bot_id == bot_id)
             
             pedidos = query_pedidos.all()
             
-            # Normalizar pedidos para o formato de contato
+            logger.info(f"📊 Busca TODOS: {len(pedidos)} pedidos encontrados")
+            
+            # Adicionar/sobrescrever pedidos no dicionário
+            # 🔥 Se telegram_id já existe (lead), SOBRESCREVE
             for pedido in pedidos:
-                all_contacts.append({
+                telegram_id = str(pedido.telegram_id)
+                contatos_unicos[telegram_id] = {
                     "id": pedido.id,
-                    "telegram_id": pedido.telegram_id,
-                    "user_id": pedido.telegram_id,
+                    "telegram_id": telegram_id,
+                    "user_id": telegram_id,
                     "first_name": pedido.first_name or "Sem nome",
                     "nome": pedido.first_name or "Sem nome",
                     "username": pedido.username or "sem_username",
@@ -1925,9 +1930,14 @@ async def get_contacts(
                     "status": pedido.status,
                     "role": "user",
                     "custom_expiration": pedido.custom_expiration,
-                    "created_at": pedido.created_at,
+                    "created_at": pedido.created_at or datetime.utcnow(),
                     "origem": "pedido"
-                })
+                }
+            
+            # Converter dicionário para lista
+            all_contacts = list(contatos_unicos.values())
+            
+            logger.info(f"📊 Busca TODOS: {len(all_contacts)} contatos ÚNICOS (sem duplicatas)")
             
             # Ordenar por data de criação (mais recentes primeiro)
             all_contacts.sort(key=lambda x: x["created_at"], reverse=True)
