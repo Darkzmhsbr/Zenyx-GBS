@@ -529,6 +529,11 @@ class PlanoCreate(BaseModel):
     preco: float
     dias_duracao: int
 
+# --- Adicione logo após a classe PlanoCreate ---
+class PlanoUpdate(BaseModel):
+    nome_exibicao: Optional[str] = None
+    preco: Optional[float] = None
+    dias_duracao: Optional[int] = None
 class FlowUpdate(BaseModel):
     msg_boas_vindas: str
     media_url: Optional[str] = None
@@ -922,6 +927,30 @@ def del_plano(pid: int, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Erro ao deletar plano {pid}: {e}")
         raise HTTPException(status_code=400, detail=f"Erro ao deletar: {str(e)}")
+
+# --- ROTA NOVA: ATUALIZAR PLANO ---
+@app.put("/api/admin/plans/{plan_id}")
+def atualizar_plano(plan_id: int, dados: PlanoUpdate, db: Session = Depends(get_db)):
+    plano = db.query(PlanoConfig).filter(PlanoConfig.id == plan_id).first()
+    if not plano:
+        raise HTTPException(status_code=404, detail="Plano não encontrado")
+    
+    if dados.nome_exibicao is not None:
+        plano.nome_exibicao = dados.nome_exibicao
+    
+    if dados.preco is not None:
+        plano.preco_atual = dados.preco
+        plano.preco_cheio = dados.preco * 2 # Atualiza o preço "de/por" automaticamente
+        
+    if dados.dias_duracao is not None:
+        plano.dias_duracao = dados.dias_duracao
+        # Atualiza a key interna para manter consistência
+        plano.key_id = f"plan_{plano.bot_id}_{dados.dias_duracao}d"
+        plano.descricao = f"Acesso de {dados.dias_duracao} dias"
+
+    db.commit()
+    db.refresh(plano)
+    return {"status": "success", "msg": "Plano atualizado"}
 
 @app.get("/api/admin/bots/{bot_id}/flow")
 def obter_fluxo(bot_id: int, db: Session = Depends(get_db)):
