@@ -2051,6 +2051,95 @@ async def get_contacts(
         logger.error(f"Erro ao buscar contatos: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============================================================
+# 🔥 ROTA: Reenviar Acesso
+# ADICIONE ESTA ROTA NO SEU main.py
+# LOCALIZAÇÃO SUGERIDA: Após as rotas de /api/admin/contacts
+# ============================================================
+
+@app.post("/api/admin/reenviar-acesso/{pedido_id}")
+async def reenviar_acesso(pedido_id: int, db: Session = Depends(get_db)):
+    """
+    🔑 Reenvia o link de acesso VIP para um usuário que já pagou
+    Usado quando há problemas na entrega automática de acesso
+    """
+    try:
+        # 1. Buscar pedido
+        pedido = db.query(Pedido).filter(Pedido.id == pedido_id).first()
+        
+        if not pedido:
+            logger.error(f"❌ Pedido {pedido_id} não encontrado")
+            raise HTTPException(status_code=404, detail="Pedido não encontrado")
+        
+        # 2. Verificar se está pago
+        if pedido.status not in ["paid", "active", "approved"]:
+            logger.error(f"❌ Pedido {pedido_id} não está pago (status: {pedido.status})")
+            raise HTTPException(status_code=400, detail="Pedido não está pago")
+        
+        # 3. Buscar bot
+        bot_data = db.query(Bot).filter(Bot.id == pedido.bot_id).first()
+        
+        if not bot_data:
+            logger.error(f"❌ Bot {pedido.bot_id} não encontrado")
+            raise HTTPException(status_code=404, detail="Bot não encontrado")
+        
+        # 4. Gerar novo link e enviar
+        try:
+            tb = telebot.TeleBot(bot_data.token)
+            
+            # Tratamento do ID do Canal
+            try: 
+                canal_id = int(str(bot_data.id_canal_vip).strip())
+            except: 
+                canal_id = bot_data.id_canal_vip
+            
+            # Tenta desbanir antes (caso tenha sido banido)
+            try:
+                tb.unban_chat_member(canal_id, int(pedido.telegram_id))
+            except:
+                pass
+            
+            # Gera Link Único
+            convite = tb.create_chat_invite_link(
+                chat_id=canal_id,
+                member_limit=1,
+                name=f"Reenvio {pedido.first_name}"
+            )
+            
+            # Formata data de validade
+            texto_validade = "VITALÍCIO ♾️"
+            if pedido.custom_expiration:
+                texto_validade = pedido.custom_expiration.strftime("%d/%m/%Y")
+            
+            # Envia mensagem
+            msg_cliente = (
+                f"✅ <b>Acesso Reenviado!</b>\n"
+                f"📅 Validade: <b>{texto_validade}</b>\n\n"
+                f"Seu acesso exclusivo:\n👉 {convite.invite_link}\n\n"
+                f"<i>Use este link para entrar no grupo VIP.</i>"
+            )
+            
+            tb.send_message(int(pedido.telegram_id), msg_cliente, parse_mode="HTML")
+            
+            logger.info(f"✅ Acesso reenviado para {pedido.first_name} (ID: {pedido.telegram_id})")
+            
+            return {
+                "status": "success",
+                "message": "Acesso reenviado com sucesso!",
+                "telegram_id": pedido.telegram_id,
+                "nome": pedido.first_name
+            }
+            
+        except Exception as e_tg:
+            logger.error(f"❌ Erro ao enviar acesso via Telegram: {e_tg}")
+            raise HTTPException(status_code=500, detail=f"Erro ao enviar via Telegram: {str(e_tg)}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erro ao reenviar acesso: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --- ROTAS FLOW V2 (HÍBRIDO) ---
 @app.get("/api/admin/bots/{bot_id}/flow")
 def get_flow(bot_id: int, db: Session = Depends(get_db)):
