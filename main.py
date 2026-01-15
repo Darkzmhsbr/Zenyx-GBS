@@ -735,24 +735,42 @@ def toggle_bot(bot_id: int, db: Session = Depends(get_db)):
     return {"status": novo_status}
 
 # --- NOVA ROTA: EXCLUIR BOT ---
+# --- NOVA ROTA: EXCLUIR BOT (COM LIMPEZA TOTAL) ---
 @app.delete("/api/admin/bots/{bot_id}")
 def deletar_bot(bot_id: int, db: Session = Depends(get_db)):
     bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
     if not bot_db:
         raise HTTPException(status_code=404, detail="Bot não encontrado")
     
-    # 1. Tenta remover o Webhook do Telegram para limpar
     try:
-        tb = telebot.TeleBot(bot_db.token)
-        tb.delete_webhook()
-    except:
-        pass # Se der erro (ex: token inválido), continua e apaga do banco
-    
-    # 2. Apaga do Banco de Dados
-    db.delete(bot_db)
-    db.commit()
-    
-    return {"status": "deleted", "msg": "Bot removido com sucesso"}
+        # 1. Tenta remover o Webhook do Telegram para limpar no servidor deles
+        try:
+            tb = telebot.TeleBot(bot_db.token)
+            tb.delete_webhook()
+        except:
+            pass # Se der erro (ex: token inválido), continua e apaga do banco
+        
+        # 2. LIMPEZA PESADA (Exclui manualmente os dependentes para evitar erro de integridade)
+        # Apaga PEDIDOS vinculados
+        db.query(Pedido).filter(Pedido.bot_id == bot_id).delete(synchronize_session=False)
+        
+        # Apaga LEADS vinculados
+        db.query(Lead).filter(Lead.bot_id == bot_id).delete(synchronize_session=False)
+        
+        # Apaga CAMPANHAS de Remarketing vinculadas
+        db.query(RemarketingCampaign).filter(RemarketingCampaign.bot_id == bot_id).delete(synchronize_session=False)
+        
+        # 3. Apaga o Bot (Planos, Fluxos e Admins já caem por cascade)
+        db.delete(bot_db)
+        db.commit()
+        
+        logger.info(f"🗑️ Bot {bot_id} e todos os seus dados foram excluídos com sucesso.")
+        return {"status": "deleted", "msg": "Bot e todos os dados vinculados removidos com sucesso"}
+        
+    except Exception as e:
+        db.rollback() # Desfaz se der erro no meio do caminho
+        logger.error(f"Erro ao deletar bot {bot_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro interno ao excluir bot: {str(e)}")
 
 # =========================================================
 # 🛡️ GESTÃO DE ADMINISTRADORES (FASE 1)

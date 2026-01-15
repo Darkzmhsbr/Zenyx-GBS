@@ -53,10 +53,16 @@ class Bot(Base):
     status = Column(String, default="ativo")
     created_at = Column(DateTime, default=datetime.utcnow)
     
+    # --- RELACIONAMENTOS (CASCADE) ---
     planos = relationship("PlanoConfig", back_populates="bot", cascade="all, delete-orphan")
     fluxo = relationship("BotFlow", back_populates="bot", uselist=False, cascade="all, delete-orphan")
     steps = relationship("BotFlowStep", back_populates="bot", cascade="all, delete-orphan")
     admins = relationship("BotAdmin", back_populates="bot", cascade="all, delete-orphan")
+    
+    # 🔥 NOVOS RELACIONAMENTOS PARA EXCLUSÃO AUTOMÁTICA (Pediu para apagar bot, apaga tudo)
+    pedidos = relationship("Pedido", backref="bot_ref", cascade="all, delete-orphan")
+    leads = relationship("Lead", backref="bot_ref", cascade="all, delete-orphan")
+    campanhas = relationship("RemarketingCampaign", backref="bot_ref", cascade="all, delete-orphan")
 
 class BotAdmin(Base):
     __tablename__ = "bot_admins"
@@ -125,7 +131,7 @@ class BotFlow(Base):
     btn_text_1 = Column(String, default="🔓 DESBLOQUEAR")
     autodestruir_1 = Column(Boolean, default=False)
     
-    # 🔥 NOVO CAMPO: Mostrar Planos na Msg 1 (ADICIONADO AQUI)
+    # 🔥 NOVO CAMPO: Mostrar Planos na Msg 1
     mostrar_planos_1 = Column(Boolean, default=False)
     
     # Passo Final (Fixo)
