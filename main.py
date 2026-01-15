@@ -1635,7 +1635,11 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
             preco_final = campanha.promo_price if campanha.promo_price else plano.preco_atual
             logger.info(f"💰 [WEBHOOK] Preço final: R$ {preco_final:.2f}")
             
-            msg_aguarde = bot_temp.send_message(chat_id, f"⏳ Gerando oferta de R$ {preco_final:.2f}...")
+            # --- MENSAGEM DE AGUARDE (ATUALIZADA) ---
+            msg_aguarde = bot_temp.send_message(
+                chat_id, 
+                "🛑♻️ Seu 𝗣𝗮𝗴𝗮𝗺𝗲𝗻o está sendo 𝗚𝗘𝗥𝗔𝗗o ... Com 𝗣𝗿𝗼𝘁𝗲ç𝗮̃o & 𝗦𝗲𝗴𝘂𝗿a𝗻ç𝗮 de Compra! 🔐👩🏻‍💻 Aguarde um instante."
+            )
             
             temp_uuid = str(uuid.uuid4())
             pix_data = gerar_pix_pushinpay(preco_final, temp_uuid)
@@ -1734,7 +1738,11 @@ Copie o código abaixo para garantir sua vaga:
                 bot_temp.send_message(chat_id, "❌ Plano não encontrado.")
                 return {"status": "error"}
 
-            msg_aguarde = bot_temp.send_message(chat_id, "⏳ Gerando seu PIX...")
+            # --- MENSAGEM DE AGUARDE (ATUALIZADA) ---
+            msg_aguarde = bot_temp.send_message(
+                chat_id, 
+                "🛑♻️ Seu 𝗣𝗮𝗴𝗮𝗺𝗲𝗻o está sendo 𝗚𝗘𝗥𝗔𝗗o ... Com 𝗣𝗿𝗼𝘁𝗲ç𝗮̃o & 𝗦𝗲𝗴𝘂𝗿a𝗻ç𝗮 de Compra! 🔐👩🏻‍💻 Aguarde um instante."
+            )
             
             temp_uuid = str(uuid.uuid4())
             pix_data = gerar_pix_pushinpay(plano.preco_atual, temp_uuid)
