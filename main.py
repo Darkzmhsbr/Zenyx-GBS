@@ -1223,6 +1223,99 @@ async def webhook_pix(request: Request, db: Session = Depends(get_db)):
         return {"status": "error"}
 
 # =========================================================
+# 🧠 FUNÇÕES AUXILIARES DE FLUXO (RECURSIVIDADE)
+# =========================================================
+
+def enviar_oferta_final(bot_temp, chat_id, fluxo, bot_id, db):
+    """Envia a mensagem final de oferta/checkout"""
+    try:
+        texto = fluxo.msg_2_texto if fluxo.msg_2_texto else "Confira nossos planos:"
+        media = fluxo.msg_2_media
+        
+        # Cria botões de planos (Checkout) se configurado
+        mk = types.InlineKeyboardMarkup()
+        if fluxo.mostrar_planos_2:
+            planos = db.query(PlanoConfig).filter(PlanoConfig.bot_id == bot_id).all()
+            for p in planos:
+                mk.add(types.InlineKeyboardButton(
+                    f"💎 {p.nome_exibicao} - R$ {p.preco_atual:.2f}", 
+                    callback_data=f"checkout_{p.id}"
+                ))
+        
+        # Envia
+        if media:
+            try:
+                if media.lower().endswith(('.mp4', '.mov', '.avi')):
+                    bot_temp.send_video(chat_id, media, caption=texto, reply_markup=mk)
+                else:
+                    bot_temp.send_photo(chat_id, media, caption=texto, reply_markup=mk)
+            except Exception as e:
+                logger.error(f"Erro media oferta: {e}")
+                bot_temp.send_message(chat_id, texto, reply_markup=mk)
+        else:
+            bot_temp.send_message(chat_id, texto, reply_markup=mk)
+            
+    except Exception as e:
+        logger.error(f"Erro ao enviar oferta final: {e}")
+
+def enviar_passo_automatico(bot_temp, chat_id, passo_atual, bot_db, db):
+    """
+    Envia um passo e, se não tiver botão e tiver delay, 
+    agenda e envia o PRÓXIMO (ou a oferta) automaticamente.
+    """
+    try:
+        # 1. Configura botão se houver
+        markup_step = types.InlineKeyboardMarkup()
+        if passo_atual.mostrar_botao:
+            # Verifica se existe um PRÓXIMO passo depois deste
+            prox = db.query(BotFlowStep).filter(
+                BotFlowStep.bot_id == bot_db.id, 
+                BotFlowStep.step_order == passo_atual.step_order + 1
+            ).first()
+            
+            callback = f"next_step_{passo_atual.step_order}" if prox else "go_checkout"
+            markup_step.add(types.InlineKeyboardButton(text=passo_atual.btn_texto, callback_data=callback))
+
+        # 2. Envia a mensagem deste passo
+        sent_msg = None
+        if passo_atual.msg_media:
+            try:
+                if passo_atual.msg_media.lower().endswith(('.mp4', '.mov')):
+                    sent_msg = bot_temp.send_video(chat_id, passo_atual.msg_media, caption=passo_atual.msg_texto, reply_markup=markup_step if passo_atual.mostrar_botao else None)
+                else:
+                    sent_msg = bot_temp.send_photo(chat_id, passo_atual.msg_media, caption=passo_atual.msg_texto, reply_markup=markup_step if passo_atual.mostrar_botao else None)
+            except:
+                sent_msg = bot_temp.send_message(chat_id, passo_atual.msg_texto, reply_markup=markup_step if passo_atual.mostrar_botao else None)
+        else:
+            sent_msg = bot_temp.send_message(chat_id, passo_atual.msg_texto, reply_markup=markup_step if passo_atual.mostrar_botao else None)
+
+        # 3. Lógica Automática (Sem botão + Delay)
+        if not passo_atual.mostrar_botao and passo_atual.delay_seconds > 0:
+            logger.info(f"⏳ [BOT {bot_db.id}] Passo {passo_atual.step_order}: Aguardando {passo_atual.delay_seconds}s...")
+            time.sleep(passo_atual.delay_seconds)
+            
+            # Auto-destruir este passo (se configurado)
+            if passo_atual.autodestruir and sent_msg:
+                try:
+                    bot_temp.delete_message(chat_id, sent_msg.message_id)
+                except: pass
+            
+            # 🔥 DECISÃO: Chama o próximo passo OU a Oferta Final
+            proximo_passo = db.query(BotFlowStep).filter(
+                BotFlowStep.bot_id == bot_db.id, 
+                BotFlowStep.step_order == passo_atual.step_order + 1
+            ).first()
+            
+            if proximo_passo:
+                enviar_passo_automatico(bot_temp, chat_id, proximo_passo, bot_db, db)
+            else:
+                # FIM DA LINHA -> Manda Oferta
+                enviar_oferta_final(bot_temp, chat_id, bot_db.fluxo, bot_db.id, db)
+
+    except Exception as e:
+        logger.error(f"Erro no passo automático {passo_atual.step_order}: {e}")
+
+# =========================================================
 # 🚀 WEBHOOK GERAL DO BOT (CORREÇÃO DEFINITIVA - FLOW V2)
 # =========================================================
 @app.post("/webhook/{bot_token}")
@@ -1363,9 +1456,8 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                     bot_temp.send_message(chat_id, texto, reply_markup=markup)
 
         # ============================================================
-        # TRECHO 1: CALLBACK "passo_2"
+        # TRECHO 1: CALLBACK "passo_2" (BOAS VINDAS -> PASSO 1)
         # ============================================================
-
         elif update.callback_query and update.callback_query.data == "passo_2":
             chat_id = update.callback_query.message.chat.id
             msg_id = update.callback_query.message.message_id
@@ -1387,31 +1479,20 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                     BotFlowStep.step_order == 2
                 ).first()
                 
-                # Define o callback do botão
-                if segundo_passo:
-                    next_callback = "next_step_1"
-                    logger.info(f"🔗 [BOT {bot_db.id}] Há mais passos. Botão vai chamar: {next_callback}")
-                else:
-                    next_callback = "go_checkout"
-                    logger.info(f"🔗 [BOT {bot_db.id}] Último passo. Botão vai chamar: {next_callback}")
+                # Define callback do botão (caso tenha botão)
+                next_callback = "next_step_1" if segundo_passo else "go_checkout"
                 
-                # Auto-destruir mensagem de boas-vindas (se configurado)
+                # Auto-destruir mensagem de boas-vindas
                 if bot_db.fluxo.autodestruir_1:
-                    try:
-                        bot_temp.delete_message(chat_id, msg_id)
-                        logger.info(f"💣 [BOT {bot_db.id}] Mensagem de boas-vindas auto-destruída")
-                    except:
-                        pass
+                    try: bot_temp.delete_message(chat_id, msg_id)
+                    except: pass
                 
-                # [NOVO V3] Só cria botão se mostrar_botao = True
+                # Cria botão se necessário
                 markup_step = types.InlineKeyboardMarkup()
                 if primeiro_passo.mostrar_botao:
-                    markup_step.add(types.InlineKeyboardButton(
-                        text=primeiro_passo.btn_texto, 
-                        callback_data=next_callback
-                    ))
+                    markup_step.add(types.InlineKeyboardButton(text=primeiro_passo.btn_texto, callback_data=next_callback))
 
-                # Envia o PASSO 1 e SALVA o message_id
+                # Envia o PASSO 1
                 sent_msg = None
                 if primeiro_passo.msg_media:
                     try:
@@ -1442,66 +1523,45 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
                         reply_markup=markup_step if primeiro_passo.mostrar_botao else None
                     )
                 
-                # [NOVO V4] Se não tem botão e tem delay, agenda próxima mensagem
+                # --- LÓGICA AUTOMÁTICA (DELAY + SEM BOTÃO) ---
                 if not primeiro_passo.mostrar_botao and primeiro_passo.delay_seconds > 0:
-                    logger.info(f"⏰ [BOT {bot_db.id}] Aguardando {primeiro_passo.delay_seconds}s antes de enviar próximo passo...")
+                    logger.info(f"⏰ [BOT {bot_db.id}] Aguardando {primeiro_passo.delay_seconds}s...")
                     time.sleep(primeiro_passo.delay_seconds)
                     
-                    # [CORREÇÃO V4.1] Auto-destruir antes de enviar a próxima
                     if primeiro_passo.autodestruir and sent_msg:
-                        try:
-                            bot_temp.delete_message(chat_id, sent_msg.message_id)
-                            logger.info(f"💣 [BOT {bot_db.id}] Mensagem do passo 1 auto-destruída")
-                        except:
-                            pass
+                        try: bot_temp.delete_message(chat_id, sent_msg.message_id)
+                        except: pass
                     
-                    # Busca o segundo passo
-                    segundo_passo = db.query(BotFlowStep).filter(
-                        BotFlowStep.bot_id == bot_db.id, 
-                        BotFlowStep.step_order == 2
-                    ).first()
-                    
+                    # 🔥 CORREÇÃO AQUI: Verifica se existe o passo 2.
+                    # Se SIM, manda ele. Se NÃO, manda a Oferta Final.
                     if segundo_passo:
                         enviar_passo_automatico(bot_temp, chat_id, segundo_passo, bot_db, db)
+                    else:
+                        enviar_oferta_final(bot_temp, chat_id, bot_db.fluxo, bot_db.id, db)
             else:
-                # Se não tem passos intermediários, vai direto pro checkout
-                logger.info(f"⚠️ [BOT {bot_db.id}] Nenhum passo intermediário configurado, indo direto para oferta")
+                # Se não tem nenhum passo intermediário
                 enviar_oferta_final(bot_temp, chat_id, bot_db.fluxo, bot_db.id, db)
             
             bot_temp.answer_callback_query(update.callback_query.id)
 
 
         # ============================================================
-        # TRECHO 2: CALLBACK "next_step_"
+        # TRECHO 2: CALLBACK "next_step_" (PASSO X -> PASSO Y)
         # ============================================================
-
         elif update.callback_query and update.callback_query.data.startswith("next_step_"):
             chat_id = update.callback_query.message.chat.id
             msg_id = update.callback_query.message.message_id
             
-            # Extrai o número do passo ATUAL
-            try:
-                passo_atual_order = int(update.callback_query.data.split("_")[2])
-            except: 
-                passo_atual_order = 1
+            try: passo_atual_order = int(update.callback_query.data.split("_")[2])
+            except: passo_atual_order = 1
             
-            logger.info(f"🎯 [BOT {bot_db.id}] Usuário clicou em next_step_{passo_atual_order}")
+            # Auto-destruir passo anterior
+            passo_anterior = db.query(BotFlowStep).filter(BotFlowStep.bot_id == bot_db.id, BotFlowStep.step_order == passo_atual_order).first()
+            if passo_anterior and passo_anterior.autodestruir:
+                try: bot_temp.delete_message(chat_id, msg_id)
+                except: pass
             
-            # [NOVO V3] Busca o passo ATUAL para verificar auto-destruir
-            passo_atual = db.query(BotFlowStep).filter(
-                BotFlowStep.bot_id == bot_db.id, 
-                BotFlowStep.step_order == passo_atual_order
-            ).first()
-            
-            # [NOVO V3] Auto-destruir o passo atual (se configurado)
-            if passo_atual and passo_atual.autodestruir:
-                try:
-                    bot_temp.delete_message(chat_id, msg_id)
-                    logger.info(f"💣 [BOT {bot_db.id}] Mensagem do passo {passo_atual_order} auto-destruída")
-                except:
-                    pass
-            
-            # Busca o PRÓXIMO passo (atual + 1)
+            # Busca o PRÓXIMO passo (Alvo)
             proximo_passo = db.query(BotFlowStep).filter(
                 BotFlowStep.bot_id == bot_db.id, 
                 BotFlowStep.step_order == passo_atual_order + 1
@@ -1509,96 +1569,51 @@ async def receber_update_telegram(bot_token: str, request: Request, db: Session 
 
             if proximo_passo:
                 logger.info(f"✅ [BOT {bot_db.id}] Enviando passo {proximo_passo.step_order}: {proximo_passo.msg_texto[:30]}...")
-                
-                # Verifica se existe um passo DEPOIS deste
+
+                # Verifica se existe um DEPOIS desse
                 passo_seguinte = db.query(BotFlowStep).filter(
                     BotFlowStep.bot_id == bot_db.id, 
                     BotFlowStep.step_order == proximo_passo.step_order + 1
                 ).first()
                 
-                # Define o callback do botão
-                if passo_seguinte:
-                    next_callback = f"next_step_{proximo_passo.step_order}"
-                    logger.info(f"🔗 [BOT {bot_db.id}] Há mais passos. Próximo botão vai chamar: {next_callback}")
-                else:
-                    next_callback = "go_checkout"
-                    logger.info(f"🔗 [BOT {bot_db.id}] Último passo. Próximo botão vai chamar: {next_callback}")
+                next_callback = f"next_step_{proximo_passo.step_order}" if passo_seguinte else "go_checkout"
                 
-                # [NOVO V3] Só cria botão se mostrar_botao = True
                 markup_step = types.InlineKeyboardMarkup()
                 if proximo_passo.mostrar_botao:
-                    markup_step.add(types.InlineKeyboardButton(
-                        text=proximo_passo.btn_texto, 
-                        callback_data=next_callback
-                    ))
+                    markup_step.add(types.InlineKeyboardButton(text=proximo_passo.btn_texto, callback_data=next_callback))
 
-                # Envia a mensagem do PRÓXIMO PASSO e SALVA o message_id
+                # Envia
                 sent_msg = None
                 if proximo_passo.msg_media:
                     try:
                         if proximo_passo.msg_media.lower().endswith(('.mp4', '.mov')):
-                            sent_msg = bot_temp.send_video(
-                                chat_id, 
-                                proximo_passo.msg_media, 
-                                caption=proximo_passo.msg_texto, 
-                                reply_markup=markup_step if proximo_passo.mostrar_botao else None
-                            )
+                            sent_msg = bot_temp.send_video(chat_id, proximo_passo.msg_media, caption=proximo_passo.msg_texto, reply_markup=markup_step if proximo_passo.mostrar_botao else None)
                         else:
-                            sent_msg = bot_temp.send_photo(
-                                chat_id, 
-                                proximo_passo.msg_media, 
-                                caption=proximo_passo.msg_texto, 
-                                reply_markup=markup_step if proximo_passo.mostrar_botao else None
-                            )
+                            sent_msg = bot_temp.send_photo(chat_id, proximo_passo.msg_media, caption=proximo_passo.msg_texto, reply_markup=markup_step if proximo_passo.mostrar_botao else None)
                     except:
-                        sent_msg = bot_temp.send_message(
-                            chat_id, 
-                            proximo_passo.msg_texto, 
-                            reply_markup=markup_step if proximo_passo.mostrar_botao else None
-                        )
+                        sent_msg = bot_temp.send_message(chat_id, proximo_passo.msg_texto, reply_markup=markup_step if proximo_passo.mostrar_botao else None)
                 else:
-                    sent_msg = bot_temp.send_message(
-                        chat_id, 
-                        proximo_passo.msg_texto, 
-                        reply_markup=markup_step if proximo_passo.mostrar_botao else None
-                    )
+                    sent_msg = bot_temp.send_message(chat_id, proximo_passo.msg_texto, reply_markup=markup_step if proximo_passo.mostrar_botao else None)
                 
-                # [NOVO V4] Se não tem botão e tem delay, agenda próxima mensagem
+                # --- LÓGICA AUTOMÁTICA ---
                 if not proximo_passo.mostrar_botao and proximo_passo.delay_seconds > 0:
-                    logger.info(f"⏰ [BOT {bot_db.id}] Aguardando {proximo_passo.delay_seconds}s antes de enviar próximo passo...")
+                    logger.info(f"⏰ [BOT {bot_db.id}] Passo {proximo_passo.step_order}: Aguardando {proximo_passo.delay_seconds}s...")
                     time.sleep(proximo_passo.delay_seconds)
                     
-                    # [CORREÇÃO V4.1] Auto-destruir antes de enviar a próxima
                     if proximo_passo.autodestruir and sent_msg:
-                        try:
-                            bot_temp.delete_message(chat_id, sent_msg.message_id)
-                            logger.info(f"💣 [BOT {bot_db.id}] Mensagem do passo {proximo_passo.step_order} auto-destruída")
-                        except:
-                            pass
+                        try: bot_temp.delete_message(chat_id, sent_msg.message_id)
+                        except: pass
                     
-                    # Busca o passo seguinte
-                    passo_seguinte = db.query(BotFlowStep).filter(
-                        BotFlowStep.bot_id == bot_db.id, 
-                        BotFlowStep.step_order == proximo_passo.step_order + 1
-                    ).first()
-                    
+                    # 🔥 CORREÇÃO AQUI: Verifica se existe o passo SEGUINTE.
+                    # Se SIM, manda ele. Se NÃO, manda a Oferta Final.
                     if passo_seguinte:
                         enviar_passo_automatico(bot_temp, chat_id, passo_seguinte, bot_db, db)
                     else:
-                        # Não tem mais passos, vai pro checkout
                         enviar_oferta_final(bot_temp, chat_id, bot_db.fluxo, bot_db.id, db)
             else:
-                # Não tem mais passos, vai para checkout
-                logger.info(f"⚠️ [BOT {bot_db.id}] Não há mais passos, indo para checkout")
+                # Segurança: Se clicou em next_step mas não tem passo, vai pro checkout
                 enviar_oferta_final(bot_temp, chat_id, bot_db.fluxo, bot_db.id, db)
             
-            bot_temp.answer_callback_query(update.callback_query.id)
-
-        # --- IR PARA CHECKOUT ---
-        elif update.callback_query and update.callback_query.data == "go_checkout":
-            chat_id = update.callback_query.message.chat.id
-            logger.info(f"🎯 [BOT {bot_db.id}] Indo para checkout final")
-            enviar_oferta_final(bot_temp, chat_id, bot_db.fluxo, bot_db.id, db)
             bot_temp.answer_callback_query(update.callback_query.id)
 
         # ============================================================
