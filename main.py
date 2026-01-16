@@ -1211,141 +1211,167 @@ def remover_passo_flow(bot_id: int, sid: int, db: Session = Depends(get_db)):
 # 💰 ROTA WEBHOOK PIX (LÓGICA BLINDADA - ADAPTADA PARA SAAS)
 # =========================================================
 # =========================================================
-# 💳 WEBHOOK PIX (PUSHIN PAY) - VERSÃO FINAL (BUMP + ADMIN)
+# 💳 WEBHOOK PIX (PUSHIN PAY) - VERSÃO BLINDADA (FUSÃO FINAL)
 # =========================================================
 @app.post("/webhook/pix")
 async def webhook_pix(request: Request, db: Session = Depends(get_db)):
+    print("🔔 WEBHOOK PIX CHEGOU!") 
     try:
-        payload = await request.json()
-        print("🔔 WEBHOOK PIX CHEGOU!")
+        # 1. PEGA O CORPO BRUTO (Mais seguro contra erros de parsing)
+        body_bytes = await request.body()
+        body_str = body_bytes.decode("utf-8")
         
-        # O payload pode vir como lista ou objeto único
-        if isinstance(payload, list):
-            transactions = payload
-        else:
-            transactions = [payload]
-            
-        for tx in transactions:
-            tx_status = tx.get("status")
-            tx_id = str(tx.get("id")) # ID da transação no PushinPay
-            
-            # Procura o pedido pelo transaction_id
-            pedido = db.query(Pedido).filter(Pedido.transaction_id == tx_id).first()
-            
-            if not pedido:
-                logger.warning(f"⚠️ Pedido não encontrado para TXID: {tx_id}")
-                continue
-                
-            # Atualiza status se mudou para APROVADO
-            if tx_status == "approved" and pedido.status != "approved":
-                pedido.status = "approved"
-                pedido.data_aprovacao = datetime.utcnow()
-                
-                # Calcula expiração
-                plano = db.query(PlanoConfig).filter(PlanoConfig.id == pedido.plano_id).first()
-                dias = plano.dias_duracao if plano else 30
-                
-                if dias == 99999: # Vitalício
-                    pedido.data_expiracao = None
-                    validade_str = "Vitalício ♾️"
-                else:
-                    pedido.data_expiracao = datetime.utcnow() + timedelta(days=dias)
-                    validade_str = pedido.data_expiracao.strftime("%d/%m/%Y")
-                
-                db.commit()
-                print(f"✅ Pedido {pedido.txid} APROVADO! Validade: {pedido.data_expiracao}")
-                
-                # -------------------------------------------------------
-                # 🚀 ENTREGA DO PRODUTO E NOTIFICAÇÕES
-                # -------------------------------------------------------
-                try:
-                    bot_db = db.query(Bot).filter(Bot.id == pedido.bot_id).first()
-                    if bot_db:
-                        bot_tele = telebot.TeleBot(bot_db.token)
-                        
-                        # --- 1. NOTIFICAÇÃO AO ADMIN (O TRECHO QUE FALTOU) ---
-                        if bot_db.admin_principal_id:
-                            msg_admin = (
-                                f"💰 *VENDA NO BOT {bot_db.nome}*\n"
-                                f"👤 {pedido.first_name} (@{pedido.username})\n"
-                                f"💎 {pedido.plano_nome}\n"
-                                f"💵 R$ {pedido.valor:.2f}\n"
-                                f"📅 Vence em: {validade_str}"
-                            )
-                            try: 
-                                bot_tele.send_message(bot_db.admin_principal_id, msg_admin, parse_mode="Markdown")
-                                logger.info("🔔 Admin notificado da venda!")
-                            except Exception as e_adm: 
-                                logger.error(f"❌ Erro ao notificar admin: {e_adm}")
+        # Tratamento de JSON ou Form Data
+        try:
+            data = json.loads(body_str)
+            # PushinPay as vezes manda lista
+            if isinstance(data, list):
+                data = data[0]
+        except:
+            try:
+                parsed = urllib.parse.parse_qs(body_str)
+                data = {k: v[0] for k, v in parsed.items()}
+            except:
+                logger.error(f"❌ Não foi possível ler o corpo do webhook: {body_str}")
+                return {"status": "ignored"}
 
-                        # --- 2. Tenta Desbanir/Aprovar ---
-                        try:
-                            canals = bot_db.id_canal_vip.replace(" ", "").split(",")
-                            for c_id in canals:
-                                try:
-                                    bot_tele.unban_chat_member(c_id, int(pedido.telegram_id))
-                                    logger.info(f"🔓 Usuário {pedido.telegram_id} desbanido do canal {c_id}")
-                                except Exception as e:
-                                    logger.error(f"⚠️ Erro ao desbanir {c_id}: {e}")
-                        except:
-                            pass
+        # 2. EXTRAÇÃO E NORMALIZAÇÃO DO ID
+        # Tenta pegar o ID de várias formas possíveis que o gateway manda
+        raw_tx_id = data.get("id") or data.get("external_reference") or data.get("uuid")
+        tx_id = str(raw_tx_id).lower() if raw_tx_id else None
+        
+        # Status
+        status_pix = str(data.get("status", "")).lower()
+        
+        if status_pix not in ["paid", "approved", "completed", "succeeded"]:
+            return {"status": "ignored"}
 
-                        # --- 3. Mensagem de Sucesso (Plano Principal) ---
-                        msg_sucesso = f"""✅ **PAGAMENTO APROVADO!**
-                        
-🎉 Seu acesso ao plano **{pedido.plano_nome}** foi liberado.
-📅 Validade: {validade_str}
+        # 3. BUSCA O PEDIDO
+        # Tenta pelo txid (novo) ou transaction_id (antigo)
+        pedido = db.query(Pedido).filter((Pedido.txid == tx_id) | (Pedido.transaction_id == tx_id)).first()
 
-👇 **CLIQUE ABAIXO PARA ENTRAR:**
-"""
-                        # Botão de Acesso
-                        markup = None
-                        link_final = pedido.link_acesso or (plano.link_acesso if hasattr(plano, 'link_acesso') else None)
-                        
-                        if not link_final and bot_db.id_canal_vip:
-                             # Fallback: se não tiver link, o usuário tenta entrar direto se o canal for público ou ele já tiver o link
-                             pass
+        if not pedido:
+            print(f"❌ Pedido {tx_id} não encontrado no banco.")
+            return {"status": "ok", "msg": "Order not found"}
 
-                        if link_final:
-                             markup = types.InlineKeyboardMarkup()
-                             markup.add(types.InlineKeyboardButton("🔗 ACESSAR CANAL VIP", url=link_final))
-                        
-                        bot_tele.send_message(pedido.telegram_id, msg_sucesso, parse_mode="Markdown", reply_markup=markup)
-                        
-                        # --- 4. ENTREGA DO ORDER BUMP (SE TIVER) ---
-                        if pedido.tem_order_bump:
-                            logger.info(f"🎁 [PIX] Pedido tem Order Bump. Processando entrega extra...")
-                            
-                            bump_config = db.query(OrderBumpConfig).filter(OrderBumpConfig.bot_id == bot_db.id).first()
-                            
-                            if bump_config and bump_config.link_acesso:
-                                msg_bump = f"""🎁 **BÔNUS LIBERADO!**
+        if pedido.status == "approved" or pedido.status == "paid":
+             # Já foi processado, só retorna OK para o gateway parar de mandar
+            return {"status": "ok", "msg": "Already paid"}
+
+        # --- 4. CÁLCULO DA DATA DE EXPIRAÇÃO (LÓGICA DA VERSÃO ANTIGA) ---
+        now = datetime.utcnow()
+        data_validade = None # Se ficar None, é Vitalício
+        
+        # A) Tenta pegar a duração direto da configuração do plano no banco
+        if pedido.plano_id:
+            pid = int(pedido.plano_id) if str(pedido.plano_id).isdigit() else None
+            if pid:
+                plano_db = db.query(PlanoConfig).filter(PlanoConfig.id == pid).first()
+                if plano_db and plano_db.dias_duracao and plano_db.dias_duracao < 90000:
+                    data_validade = now + timedelta(days=plano_db.dias_duracao)
+
+        # B) Fallback: Tenta pelo nome se falhar o ID
+        if not data_validade and pedido.plano_nome:
+            nm = pedido.plano_nome.lower()
+            if "vital" not in nm and "mega" not in nm and "eterno" not in nm:
+                dias = 30 # Padrão
+                if "24" in nm or "diario" in nm or "1 dia" in nm: dias = 1
+                elif "semanal" in nm: dias = 7
+                elif "trimestral" in nm: dias = 90
+                elif "anual" in nm: dias = 365
+                data_validade = now + timedelta(days=dias)
+
+        # 5. ATUALIZA O PEDIDO COM A DATA CALCULADA
+        pedido.status = "approved" # Forçamos approved para liberar
+        pedido.data_aprovacao = now
+        pedido.data_expiracao = data_validade     
+        pedido.custom_expiration = data_validade  # IMPORTANTE PARA O DASHBOARD
+        pedido.mensagem_enviada = True
+        db.commit()
+        
+        texto_validade = data_validade.strftime("%d/%m/%Y") if data_validade else "VITALÍCIO ♾️"
+        print(f"✅ Pedido {tx_id} APROVADO! Validade: {texto_validade}")
+        
+        # 6. ENTREGA O ACESSO, BUMP E NOTIFICA ADMIN
+        try:
+            bot_data = db.query(Bot).filter(Bot.id == pedido.bot_id).first()
+            if bot_data:
+                tb = telebot.TeleBot(bot_data.token)
+                
+                # --- A) ENTREGA PRODUTO PRINCIPAL ---
+                try: 
+                    # Tenta limpar ID do canal
+                    canal_id = bot_data.id_canal_vip
+                    if str(canal_id).replace("-","").isdigit():
+                         canal_id = int(str(canal_id).strip())
+
+                    # Tenta desbanir antes (Kick Suave)
+                    try: tb.unban_chat_member(canal_id, int(pedido.telegram_id))
+                    except: pass
+
+                    # Gera Link Único (Melhor que link fixo)
+                    link_acesso = None
+                    try:
+                        convite = tb.create_chat_invite_link(
+                            chat_id=canal_id, 
+                            member_limit=1, 
+                            name=f"Venda {pedido.first_name}"
+                        )
+                        link_acesso = convite.invite_link
+                    except Exception as e_link:
+                        logger.warning(f"Não foi possível gerar link único: {e_link}. Usando link do banco se houver.")
+                        link_acesso = pedido.link_acesso # Tenta usar um salvo se falhar a geração
+
+                    if link_acesso:
+                        msg_cliente = (
+                            f"✅ <b>Pagamento Confirmado!</b>\n"
+                            f"📅 Validade: <b>{texto_validade}</b>\n\n"
+                            f"Seu acesso exclusivo:\n👉 {link_acesso}"
+                        )
+                        tb.send_message(int(pedido.telegram_id), msg_cliente, parse_mode="HTML")
+                    else:
+                        # Fallback se não conseguir gerar link
+                        tb.send_message(int(pedido.telegram_id), f"✅ Pagamento Confirmado!\nVocê já pode acessar o canal VIP.", parse_mode="HTML")
+
+                except Exception as e_main:
+                    logger.error(f"Erro na entrega principal: {e_main}")
+
+                # --- B) ENTREGA DO ORDER BUMP (NOVO!) ---
+                if pedido.tem_order_bump:
+                    logger.info(f"🎁 [PIX] Entregando Order Bump para {pedido.telegram_id}")
+                    try:
+                        bump_config = db.query(OrderBumpConfig).filter(OrderBumpConfig.bot_id == bot_data.id).first()
+                        if bump_config and bump_config.link_acesso:
+                            msg_bump = f"""🎁 **BÔNUS LIBERADO!**
 
 Você também garantiu acesso ao: 
 👉 **{bump_config.nome_produto}**
 
 🔗 **Acesse seu conteúdo extra abaixo:**
 {bump_config.link_acesso}"""
-                                
-                                try:
-                                    bot_tele.send_message(pedido.telegram_id, msg_bump, parse_mode="Markdown")
-                                    logger.info(f"✅ Link do Order Bump enviado para {pedido.telegram_id}")
-                                except Exception as e:
-                                    logger.error(f"❌ Erro ao enviar link do Bump: {e}")
+                            tb.send_message(int(pedido.telegram_id), msg_bump, parse_mode="Markdown")
+                    except Exception as e_bump:
+                        logger.error(f"Erro ao entregar Bump: {e_bump}")
 
-                except Exception as e_bot:
-                    logger.error(f"❌ Erro ao processar entrega no Telegram: {e_bot}")
-            
-            elif tx_status == "paid" and pedido.status != "approved":
-                # Fallback: Se cair 'paid' antes de 'approved', podemos aprovar também ou apenas marcar pago
-                # Aqui optei por marcar 'paid' e esperar o 'approved' para liberar, ou liberar direto se preferir.
-                pedido.status = "paid"
-                db.commit()
+                # --- C) NOTIFICAÇÃO AO ADMIN (RECUPERADO!) ---
+                if bot_data.admin_principal_id:
+                    msg_admin = (
+                        f"💰 *VENDA NO BOT {bot_data.nome}*\n"
+                        f"👤 {pedido.first_name} (@{pedido.username})\n"
+                        f"💎 {pedido.plano_nome}\n"
+                        f"💵 R$ {pedido.valor:.2f}\n"
+                        f"📅 Vence em: {texto_validade}"
+                    )
+                    try: tb.send_message(bot_data.admin_principal_id, msg_admin, parse_mode="Markdown")
+                    except: print("Erro ao notificar admin")
+
+        except Exception as e_tg:
+            print(f"❌ Erro Telegram/Entrega: {e_tg}")
 
         return {"status": "received"}
 
     except Exception as e:
-        logger.error(f"❌ Erro crítico no webhook pix: {e}")
+        print(f"❌ ERRO CRÍTICO NO WEBHOOK: {e}")
         return {"status": "error"}
 
 # =========================================================
