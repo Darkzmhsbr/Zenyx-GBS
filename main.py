@@ -427,7 +427,7 @@ def gerar_pix_pushinpay(valor_float: float, transaction_id: str):
     }
     
     # URL DO RAILWAY FIXA (Garante que o Webhook chegue)
-    seus_dominio = "zenyx-gbs-testes-production.up.railway.app" 
+    seus_dominio = "zenyx-gbs-production.up.railway.app" 
     
     payload = {
         "value": int(valor_float * 100), 
@@ -762,7 +762,7 @@ def update_bot(bot_id: int, dados: BotUpdate, db: Session = Depends(get_db)):
                 old_tb.delete_webhook()
             except: pass
 
-            public_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "https://zenyx-gbs-testes-production.up.railway.app")
+            public_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "https://zenyx-gbs-production.up.railway.app")
             if public_url.startswith("https://"): public_url = public_url.replace("https://", "")
             
             webhook_url = f"https://{public_url}/webhook/{dados.token}"
