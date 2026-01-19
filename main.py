@@ -2778,25 +2778,25 @@ def del_step(bot_id: int, sid: int, db: Session = Depends(get_db)):
 
 # --- ROTA DE REENVIO INDIVIDUAL (VIA HISTÓRICO) ---
 # =========================================================
-# FUNÇÃO DE BACKGROUND (CORRIGIDA: SESSÃO INDEPENDENTE)
+# FUNÇÃO DE BACKGROUND (CORRIGIDA: INCLUI TABELA LEADS)
 # =========================================================
 def processar_envio_remarketing(campaign_db_id: int, bot_id: int, payload: RemarketingRequest):
     """
     Executa o envio em background usando uma NOVA sessão de banco (SessionLocal).
-    Isso impede que os dados fiquem zerados por queda de conexão.
+    CORREÇÃO: Agora busca usuários na tabela LEAD (Topo) e PEDIDO (Meio/Fundo/Expirado).
     """
-    # 🔥 CRIA NOVA SESSÃO DEDICADA (O SEGREDO PARA SALVAR OS DADOS)
+    # 🔥 CRIA NOVA SESSÃO DEDICADA
     db = SessionLocal() 
     
     try:
-        # 1. Recupera a Campanha criada na rota e o Bot
+        # 1. Recupera a Campanha e o Bot
         campanha = db.query(RemarketingCampaign).filter(RemarketingCampaign.id == campaign_db_id).first()
         bot_db = db.query(Bot).filter(Bot.id == bot_id).first()
         
         if not campanha or not bot_db:
             return
 
-        logger.info(f"🚀 INICIANDO DISPARO BACKGROUND | Bot: {bot_db.nome}")
+        logger.info(f"🚀 INICIANDO DISPARO BACKGROUND | Bot: {bot_db.nome} | Target: {payload.target}")
 
         # 2. Configura Oferta (se houver)
         uuid_campanha = campanha.campaign_id
@@ -2826,38 +2826,72 @@ def processar_envio_remarketing(campaign_db_id: int, bot_id: int, payload: Remar
                     elif payload.expiration_mode == "hours": data_expiracao = agora + timedelta(hours=val)
                     elif payload.expiration_mode == "days": data_expiracao = agora + timedelta(days=val)
 
-        # 3. Define Lista de IDs
+        # 3. Define Lista de IDs (CORREÇÃO AQUI)
         bot_sender = telebot.TeleBot(bot_db.token)
-        target = str(payload.target).lower()
+        target = str(payload.target).lower().strip()
         lista_final_ids = []
 
         if payload.is_test:
+            # Lógica de Teste
             if payload.specific_user_id: 
                 lista_final_ids = [str(payload.specific_user_id).strip()]
             else:
                 adm = db.query(BotAdmin).filter(BotAdmin.bot_id == bot_id).first()
                 if adm: lista_final_ids = [str(adm.telegram_id).strip()]
         else:
-            q_todos = db.query(Pedido.telegram_id).filter(Pedido.bot_id == bot_id).distinct()
-            ids_todos = {str(r[0]).strip() for r in q_todos.all() if r[0]}
+            # --- BUSCA INTELIGENTE EM TODAS AS TABELAS ---
             
-            q_pagos = db.query(Pedido.telegram_id).filter(Pedido.bot_id == bot_id, func.lower(Pedido.status).in_(['paid', 'active', 'approved', 'completed', 'succeeded'])).distinct()
-            ids_pagantes = {str(r[0]).strip() for r in q_pagos.all() if r[0]}
+            # A) Busca na tabela PEDIDOS (Quem já gerou pix, pagou ou expirou)
+            # Trazemos o ID e o Status para filtrar na memória
+            q_pedidos = db.query(Pedido.telegram_id, Pedido.status).filter(Pedido.bot_id == bot_id).all()
             
-            q_expirados = db.query(Pedido.telegram_id).filter(Pedido.bot_id == bot_id, func.lower(Pedido.status) == 'expired').distinct()
-            ids_expirados = {str(r[0]).strip() for r in q_expirados.all() if r[0]}
+            ids_pagantes = set()    # Fundo
+            ids_expirados = set()   # Expirados
+            ids_pendentes = set()   # Meio
+            ids_pedidos_all = set() # Todos que tem pedido
+            
+            for p in q_pedidos:
+                if not p.telegram_id: continue
+                tid = str(p.telegram_id).strip()
+                ids_pedidos_all.add(tid)
+                
+                st = str(p.status).lower() if p.status else ""
+                if st in ['paid', 'active', 'approved', 'completed', 'succeeded']:
+                    ids_pagantes.add(tid)
+                elif st == 'expired':
+                    ids_expirados.add(tid)
+                else:
+                    ids_pendentes.add(tid) # Pending
+            
+            # B) Busca na tabela LEADS (Quem só deu /start - TOPO)
+            q_leads = db.query(Lead.user_id).filter(Lead.bot_id == bot_id).all()
+            ids_leads = {str(l.user_id).strip() for l in q_leads if l.user_id}
 
-            if target in ['pendentes', 'leads', 'nao_pagantes']:
-                lista_final_ids = list(ids_todos - ids_pagantes - ids_expirados)
-            elif target in ['pagantes', 'ativos']:
+            # C) Aplica o Filtro conforme o Target selecionado
+            if target == 'topo': 
+                # TOPO = Leads que NÃO são pagantes (para não incomodar cliente ativo)
+                # Se quiser mandar pra TUDO que é lead mesmo se pagou, use apenas list(ids_leads)
+                lista_final_ids = list(ids_leads - ids_pagantes)
+                
+            elif target == 'meio' or target == 'pendentes':
+                # MEIO = Gerou PIX mas não pagou (Pendentes)
+                lista_final_ids = list(ids_pendentes)
+                
+            elif target == 'fundo' or target == 'pagantes' or target == 'clientes':
+                # FUNDO = Pagantes Ativos
                 lista_final_ids = list(ids_pagantes)
-            elif target in ['expirados', 'ex_assinantes']:
+                
+            elif target == 'expirado' or target == 'expirados':
+                # EXPIRADOS = Expirou e não pagou depois (remove pagantes pra garantir)
                 lista_final_ids = list(ids_expirados - ids_pagantes)
-            else:
-                lista_final_ids = list(ids_todos)
+                
+            else: 
+                # TODOS (target == 'todos')
+                # União de Leads + Todos os Pedidos
+                uniao_total = ids_leads.union(ids_pedidos_all)
+                lista_final_ids = list(uniao_total)
 
         # Atualiza Total Previsto no Banco
-        # USAMOS UPDATE DIRETO PARA GARANTIR GRAVAÇÃO
         db.query(RemarketingCampaign).filter(RemarketingCampaign.id == campaign_db_id).update({"total_leads": len(lista_final_ids)})
         db.commit()
 
@@ -2873,6 +2907,8 @@ def processar_envio_remarketing(campaign_db_id: int, bot_id: int, payload: Remar
         # 5. Loop de Envio (HTML)
         sent_count = 0
         blocked_count = 0
+
+        logger.info(f"📤 Iniciando envio para {len(lista_final_ids)} usuários...")
 
         for uid in lista_final_ids:
             if not uid or len(uid) < 5: continue
@@ -2896,19 +2932,20 @@ def processar_envio_remarketing(campaign_db_id: int, bot_id: int, payload: Remar
                 
             except Exception as e:
                 err = str(e).lower()
-                if "blocked" in err or "kicked" in err or "deactivated" in err or "not found" in err:
+                # Considera bloqueado erros comuns de privacidade ou bloqueio
+                if "blocked" in err or "kicked" in err or "deactivated" in err or "not found" in err or "initiate" in err:
                     blocked_count += 1
+                # Outros erros (timeout, etc) não contam como blocked, mas falha no envio
 
         
-        # 6. ATUALIZAÇÃO FINAL NO BANCO (JSON HÍBRIDO + UPDATE DIRETO)
-        
+        # 6. ATUALIZAÇÃO FINAL NO BANCO
         config_completa = {
-            "msg": payload.mensagem,          # Chave curta (Legado)
-            "mensagem": payload.mensagem,     # Chave longa (Frontend)
-            "media": payload.media_url,       # Chave curta
-            "media_url": payload.media_url,   # Chave longa
-            "offer": payload.incluir_oferta,  # Chave curta
-            "incluir_oferta": payload.incluir_oferta, # Chave longa
+            "msg": payload.mensagem,          
+            "mensagem": payload.mensagem,     
+            "media": payload.media_url,       
+            "media_url": payload.media_url,   
+            "offer": payload.incluir_oferta,  
+            "incluir_oferta": payload.incluir_oferta, 
             "plano_id": payload.plano_oferta_id,
             "plano_oferta_id": payload.plano_oferta_id,
             "custom_price": preco_final,
@@ -2917,7 +2954,6 @@ def processar_envio_remarketing(campaign_db_id: int, bot_id: int, payload: Remar
             "expiration_value": payload.expiration_value
         }
         
-        # MÁGICA: Update direto no banco para não perder os dados
         update_data = {
             "status": "concluido",
             "sent_success": sent_count,
@@ -2931,14 +2967,14 @@ def processar_envio_remarketing(campaign_db_id: int, bot_id: int, payload: Remar
             update_data["promo_price"] = preco_final
 
         db.query(RemarketingCampaign).filter(RemarketingCampaign.id == campaign_db_id).update(update_data)
-        db.commit() # 🔥 Commit na sessão dedicada salva os números reais!
+        db.commit() 
         
         logger.info(f"✅ FINALIZADO: {sent_count} envios / {blocked_count} bloqueados")
 
     except Exception as e:
         logger.error(f"Erro na thread de remarketing: {e}")
     finally:
-        db.close() # Fecha a conexão dedicada
+        db.close()
 
 @app.post("/api/admin/remarketing/send")
 def enviar_remarketing(payload: RemarketingRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
